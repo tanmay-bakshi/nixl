@@ -27,13 +27,125 @@
 #include <cstring>
 #include <filesystem>
 #include <iomanip>
+#include <iterator>
 #include <limits>
 #include <memory>
+#include <set>
 #include <sstream>
 #include <tuple>
+#include <utility>
 
 #include <openssl/evp.h>
 #include <ucp/api/ucp.h>
+
+nixl_status_t
+nixlUcxGetTransportModuleRequirements(
+    const std::vector<nixl_xfer_attestation_transport_t> &transports,
+    std::vector<nixlUcxTransportModuleRequirement> &requirements,
+    std::string &error) {
+    static const std::set<std::string> core_transports = {
+        "posix",
+        "self",
+        "sysv",
+        "tcp",
+    };
+    static const std::set<std::string> mlx5_transports = {
+        "dc_mlx5",
+        "gga_mlx5",
+        "rc_mlx5",
+        "ud_mlx5",
+    };
+
+    std::set<std::pair<std::string, std::string>> canonical_requirements;
+    for (const auto &transport : transports) {
+        const std::string &name = transport.transport;
+        if (core_transports.find(name) != core_transports.end()) {
+            continue;
+        }
+
+        if (name == "cuda_copy" || name == "cuda_ipc") {
+            canonical_requirements.emplace("libuct_cuda", "libuct_cuda.so");
+            continue;
+        }
+
+        if (name == "gdr_copy") {
+            canonical_requirements.emplace("libuct_cuda", "libuct_cuda.so");
+            canonical_requirements.emplace(
+                "libuct_cuda_gdrcopy", "libuct_cuda_gdrcopy.so");
+            continue;
+        }
+
+        if (name == "rc_gda") {
+            canonical_requirements.emplace("libuct_ib", "libuct_ib.so");
+            canonical_requirements.emplace("libuct_ib_mlx5", "libuct_ib_mlx5.so");
+            canonical_requirements.emplace(
+                "libuct_ib_mlx5_gda", "libuct_ib_mlx5_gda.so");
+            continue;
+        }
+
+        if (mlx5_transports.find(name) != mlx5_transports.end()) {
+            canonical_requirements.emplace("libuct_ib", "libuct_ib.so");
+            canonical_requirements.emplace("libuct_ib_mlx5", "libuct_ib_mlx5.so");
+            continue;
+        }
+
+        if (name == "rc_verbs" || name == "ud_verbs") {
+            canonical_requirements.emplace("libuct_ib", "libuct_ib.so");
+            continue;
+        }
+
+        if (name == "srd") {
+            canonical_requirements.emplace("libuct_ib", "libuct_ib.so");
+            canonical_requirements.emplace("libuct_ib_efa", "libuct_ib_efa.so");
+            continue;
+        }
+
+        if (name == "cma" || name == "knem" || name == "xpmem") {
+            canonical_requirements.emplace("libuct_" + name, "libuct_" + name + ".so");
+            continue;
+        }
+
+        requirements.clear();
+        error = "selected UCX transport has no runtime module identity rule: " + name;
+        return NIXL_ERR_BACKEND;
+    }
+
+    requirements.clear();
+    requirements.reserve(canonical_requirements.size());
+    for (const auto &[component, soname] : canonical_requirements) {
+        requirements.push_back({
+            .component = component,
+            .soname = soname,
+        });
+    }
+    error.clear();
+    return NIXL_SUCCESS;
+}
+
+nixl_status_t
+nixlUcxCanonicalizeLoadedPath(const std::string &component,
+                              const std::string &loaded_path,
+                              std::string &canonical_path,
+                              std::string &error) {
+    canonical_path.clear();
+    const std::filesystem::path unresolved_path(loaded_path);
+    if (!unresolved_path.is_absolute()) {
+        error = "loaded path is not absolute for " + component;
+        return NIXL_ERR_BACKEND;
+    }
+
+    std::error_code path_error;
+    const std::filesystem::path path =
+        std::filesystem::canonical(unresolved_path, path_error);
+    if (path_error) {
+        error = "loaded path canonicalization failed for " + component;
+        return NIXL_ERR_BACKEND;
+    }
+
+    canonical_path = path.string();
+    error.clear();
+    return NIXL_SUCCESS;
+}
 
 namespace {
 
@@ -59,6 +171,16 @@ struct runtime_artifact_resolution_t {
     nixl_status_t status = NIXL_ERR_BACKEND;
     std::vector<nixl_runtime_artifact_t> artifacts;
     std::string error;
+};
+
+struct loaded_object_t {
+    ElfW(Addr) baseAddress = 0;
+    std::string path;
+};
+
+struct loaded_object_search_t {
+    std::string soname;
+    std::vector<loaded_object_t> objects;
 };
 
 [[gnu::noinline]] void
@@ -147,34 +269,51 @@ collectBuildId(dl_phdr_info *info, size_t, void *context) {
     return 1;
 }
 
+[[nodiscard]] bool
+matchesSoname(const std::filesystem::path &path, const std::string &soname) {
+    const std::string filename = path.filename().string();
+    return filename == soname ||
+        (filename.size() > soname.size() &&
+         filename.compare(0, soname.size(), soname) == 0 &&
+         filename[soname.size()] == '.');
+}
+
+int
+collectLoadedObject(dl_phdr_info *info, size_t, void *context) {
+    auto &search = *static_cast<loaded_object_search_t *>(context);
+    if (info->dlpi_name == nullptr || info->dlpi_name[0] == '\0' ||
+        !matchesSoname(info->dlpi_name, search.soname)) {
+        return 0;
+    }
+
+    search.objects.push_back({
+        .baseAddress = info->dlpi_addr,
+        .path = info->dlpi_name,
+    });
+    return 0;
+}
+
 [[nodiscard]] nixl_status_t
-resolveRuntimeArtifact(const std::string &component,
-                       const void *symbol,
-                       const std::string &version,
-                       nixl_runtime_artifact_t &artifact,
-                       std::string &error) {
-    if (symbol == nullptr || version.empty()) {
-        error = "runtime artifact symbol or version is unavailable for " + component;
+resolveRuntimeArtifactAt(const std::string &component,
+                         ElfW(Addr) base_address,
+                         const std::string &loaded_path,
+                         const std::string &version,
+                         nixl_runtime_artifact_t &artifact,
+                         std::string &error) {
+    if (base_address == 0 || loaded_path.empty() || version.empty()) {
+        error = "runtime artifact identity is unavailable for " + component;
         return NIXL_ERR_BACKEND;
     }
 
-    Dl_info dynamic_info{};
-    if (dladdr(symbol, &dynamic_info) == 0 || dynamic_info.dli_fbase == nullptr ||
-        dynamic_info.dli_fname == nullptr || dynamic_info.dli_fname[0] == '\0') {
-        error = "dladdr failed for " + component;
-        return NIXL_ERR_BACKEND;
-    }
-
-    std::error_code path_error;
-    const std::filesystem::path path =
-        std::filesystem::canonical(dynamic_info.dli_fname, path_error);
-    if (path_error || !path.is_absolute()) {
-        error = "loaded path canonicalization failed for " + component;
-        return NIXL_ERR_BACKEND;
+    std::string canonical_path;
+    const nixl_status_t path_status =
+        nixlUcxCanonicalizeLoadedPath(component, loaded_path, canonical_path, error);
+    if (path_status != NIXL_SUCCESS) {
+        return path_status;
     }
 
     build_id_search_t search{
-        .baseAddress = reinterpret_cast<ElfW(Addr)>(dynamic_info.dli_fbase),
+        .baseAddress = base_address,
     };
     (void)dl_iterate_phdr(collectBuildId, &search);
     if (!search.objectFound || search.malformedNotes || search.buildIds.empty()) {
@@ -192,7 +331,7 @@ resolveRuntimeArtifact(const std::string &component,
 
     artifact = {
         .component = component,
-        .path = path.string(),
+        .path = std::move(canonical_path),
         .buildId = search.buildIds.front(),
         .version = version,
     };
@@ -200,7 +339,59 @@ resolveRuntimeArtifact(const std::string &component,
 }
 
 [[nodiscard]] nixl_status_t
-resolveRuntimeArtifacts(std::vector<nixl_runtime_artifact_t> &artifacts, std::string &error) {
+resolveRuntimeArtifact(const std::string &component,
+                       const void *symbol,
+                       const std::string &version,
+                       nixl_runtime_artifact_t &artifact,
+                       std::string &error) {
+    if (symbol == nullptr) {
+        error = "runtime artifact symbol is unavailable for " + component;
+        return NIXL_ERR_BACKEND;
+    }
+
+    Dl_info dynamic_info{};
+    if (dladdr(symbol, &dynamic_info) == 0 || dynamic_info.dli_fbase == nullptr ||
+        dynamic_info.dli_fname == nullptr || dynamic_info.dli_fname[0] == '\0') {
+        error = "dladdr failed for " + component;
+        return NIXL_ERR_BACKEND;
+    }
+
+    return resolveRuntimeArtifactAt(component,
+                                    reinterpret_cast<ElfW(Addr)>(dynamic_info.dli_fbase),
+                                    dynamic_info.dli_fname,
+                                    version,
+                                    artifact,
+                                    error);
+}
+
+[[nodiscard]] nixl_status_t
+resolveLoadedRuntimeArtifact(const std::string &component,
+                             const std::string &soname,
+                             const std::string &version,
+                             nixl_runtime_artifact_t &artifact,
+                             std::string &error) {
+    loaded_object_search_t search{.soname = soname};
+    (void)dl_iterate_phdr(collectLoadedObject, &search);
+    if (search.objects.empty()) {
+        error = "selected transport module is not loaded for " + component;
+        return NIXL_ERR_BACKEND;
+    }
+    if (search.objects.size() != 1) {
+        error = "selected transport module is ambiguous for " + component;
+        return NIXL_ERR_BACKEND;
+    }
+
+    return resolveRuntimeArtifactAt(component,
+                                    search.objects.front().baseAddress,
+                                    search.objects.front().path,
+                                    version,
+                                    artifact,
+                                    error);
+}
+
+[[nodiscard]] nixl_status_t
+resolveBaseRuntimeArtifacts(std::vector<nixl_runtime_artifact_t> &artifacts,
+                            std::string &error) {
     const char *ucx_version = ucp_get_version_string();
     if (ucx_version == nullptr || ucx_version[0] == '\0') {
         error = "UCX runtime version is unavailable";
@@ -256,16 +447,74 @@ resolveRuntimeArtifacts(std::vector<nixl_runtime_artifact_t> &artifacts, std::st
 }
 
 [[nodiscard]] nixl_status_t
-makeRuntimeArtifacts(std::vector<nixl_runtime_artifact_t> &artifacts, std::string &error) {
+makeBaseRuntimeArtifacts(std::vector<nixl_runtime_artifact_t> &artifacts,
+                         std::string &error) {
     static const runtime_artifact_resolution_t resolution = []() {
         runtime_artifact_resolution_t result;
-        result.status = resolveRuntimeArtifacts(result.artifacts, result.error);
+        result.status = resolveBaseRuntimeArtifacts(result.artifacts, result.error);
         return result;
     }();
 
     artifacts = resolution.artifacts;
     error = resolution.error;
     return resolution.status;
+}
+
+[[nodiscard]] nixl_status_t
+appendTransportRuntimeArtifacts(
+    const std::vector<nixl_xfer_attestation_endpoint_t> &endpoints,
+    std::vector<nixl_runtime_artifact_t> &runtime_artifacts,
+    std::string &error) {
+    const char *ucx_version = ucp_get_version_string();
+    if (ucx_version == nullptr || ucx_version[0] == '\0') {
+        error = "UCX runtime version is unavailable";
+        return NIXL_ERR_BACKEND;
+    }
+
+    std::vector<nixl_xfer_attestation_transport_t> transports;
+    for (const auto &endpoint : endpoints) {
+        transports.insert(
+            transports.end(), endpoint.transports.begin(), endpoint.transports.end());
+    }
+
+    std::vector<nixlUcxTransportModuleRequirement> requirements;
+    const nixl_status_t requirements_status =
+        nixlUcxGetTransportModuleRequirements(transports, requirements, error);
+    if (requirements_status != NIXL_SUCCESS) {
+        return requirements_status;
+    }
+
+    std::vector<nixl_runtime_artifact_t> transport_artifacts;
+    transport_artifacts.reserve(requirements.size());
+    for (const auto &requirement : requirements) {
+        nixl_runtime_artifact_t artifact;
+        const nixl_status_t status = resolveLoadedRuntimeArtifact(
+            requirement.component, requirement.soname, ucx_version, artifact, error);
+        if (status != NIXL_SUCCESS) {
+            return status;
+        }
+        transport_artifacts.push_back(std::move(artifact));
+    }
+
+    runtime_artifacts.insert(runtime_artifacts.end(),
+                             std::make_move_iterator(transport_artifacts.begin()),
+                             std::make_move_iterator(transport_artifacts.end()));
+    std::sort(runtime_artifacts.begin(),
+              runtime_artifacts.end(),
+              [](const auto &left, const auto &right) {
+                  return left.component < right.component;
+              });
+    const auto duplicate = std::adjacent_find(
+        runtime_artifacts.begin(),
+        runtime_artifacts.end(),
+        [](const auto &left, const auto &right) {
+            return left.component == right.component;
+        });
+    if (duplicate != runtime_artifacts.end()) {
+        error = "duplicate runtime artifact component: " + duplicate->component;
+        return NIXL_ERR_BACKEND;
+    }
+    return NIXL_SUCCESS;
 }
 
 void
@@ -444,7 +693,7 @@ nixlUcxAttestationState::prepare(nixl_xfer_op_t operation,
     }
 
     std::string runtime_error;
-    status = makeRuntimeArtifacts(attestation_.runtimeArtifacts, runtime_error);
+    status = makeBaseRuntimeArtifacts(baseRuntimeArtifacts_, runtime_error);
     if (status != NIXL_SUCCESS) {
         return failLocked(status, runtime_error);
     }
@@ -455,6 +704,7 @@ nixlUcxAttestationState::prepare(nixl_xfer_op_t operation,
     attestation_.submissionSealed = false;
     attestation_.completionClaimed = false;
     attestation_.endpoints.clear();
+    attestation_.runtimeArtifacts = baseRuntimeArtifacts_;
     attestation_.evidenceDigest.clear();
     attestation_.error.clear();
     return NIXL_SUCCESS;
@@ -488,6 +738,7 @@ nixlUcxAttestationState::beginSubmission() {
     attestation_.submissionSealed = false;
     attestation_.completionClaimed = false;
     attestation_.endpoints.clear();
+    attestation_.runtimeArtifacts = baseRuntimeArtifacts_;
     attestation_.evidenceDigest.clear();
     attestation_.error.clear();
     for (auto &segment : attestation_.segments) {
@@ -603,6 +854,13 @@ nixlUcxAttestationState::finishSubmission() {
                     [](const auto &endpoint) { return endpoint.flushPosted; });
     if (!all_segments_posted || !all_flushes_posted) {
         return failLocked(NIXL_ERR_BACKEND, "submission evidence is incomplete");
+    }
+
+    std::string runtime_error;
+    const nixl_status_t runtime_status = appendTransportRuntimeArtifacts(
+        attestation_.endpoints, attestation_.runtimeArtifacts, runtime_error);
+    if (runtime_status != NIXL_SUCCESS) {
+        return failLocked(runtime_status, runtime_error);
     }
 
     attestation_.submissionSealed = true;

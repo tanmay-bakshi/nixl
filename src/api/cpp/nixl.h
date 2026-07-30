@@ -36,6 +36,12 @@ class nixlAgent {
         /** @var  data  The members in agent class wrapped into single nixlAgentData member. */
         const std::unique_ptr<nixlAgentData> data;
 
+        /**
+         * @brief Progress one transfer while the caller retains the agent data lock.
+         */
+        nixl_status_t
+        getXferStatusLocked(nixlXferReqH *req_hndl) const;
+
     public:
         /*** Initialization and Registering Methods ***/
 
@@ -339,15 +345,16 @@ class nixlAgent {
         /**
          * @brief Take the sealed remote-flush attestation for the current handle generation.
          *
-         * A completion attestation can be taken once per generation. Reposting the handle
-         * creates a new generation and invalidates authority from every prior generation.
+         * This operation progresses the transfer before checking completion. A completion
+         * attestation can be taken once per generation. Reposting the handle creates a new
+         * generation and invalidates authority from every prior generation.
          *
          * @param req_hndl Transfer request handle obtained from makeXferReq/createXferReq
          * @param attestation [out] Sealed handle-bound completion evidence
          * @return nixl_status_t Error code if completion is unavailable or was already claimed
          */
         nixl_status_t
-        takeXferCompletionAttestation(const nixlXferReqH *req_hndl,
+        takeXferCompletionAttestation(nixlXferReqH *req_hndl,
                                       nixl_xfer_attestation_t &attestation) const;
 
         /**

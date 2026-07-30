@@ -65,6 +65,87 @@ makeState(size_t count = 2) {
 }
 
 void
+testTransportModuleRequirements() {
+    const std::vector<nixl_xfer_attestation_transport_t> selected_transports = {
+        {.transport = "posix", .device = "memory"},
+        {.transport = "self", .device = "memory"},
+        {.transport = "sysv", .device = "memory"},
+        {.transport = "tcp", .device = "eth0"},
+        {.transport = "cuda_copy", .device = "cuda"},
+        {.transport = "cuda_ipc", .device = "cuda"},
+        {.transport = "gdr_copy", .device = "cuda"},
+        {.transport = "dc_mlx5", .device = "mlx5_0:1"},
+        {.transport = "gga_mlx5", .device = "mlx5_0:1"},
+        {.transport = "rc_mlx5", .device = "mlx5_0:1"},
+        {.transport = "ud_mlx5", .device = "mlx5_0:1"},
+        {.transport = "rc_gda", .device = "mlx5_0:1"},
+        {.transport = "rc_verbs", .device = "mlx5_0:1"},
+        {.transport = "ud_verbs", .device = "mlx5_0:1"},
+        {.transport = "srd", .device = "efa0"},
+        {.transport = "cma", .device = "memory"},
+        {.transport = "knem", .device = "memory"},
+        {.transport = "xpmem", .device = "memory"},
+    };
+    const std::set<std::pair<std::string, std::string>> expected = {
+        {"libuct_cma", "libuct_cma.so"},
+        {"libuct_cuda", "libuct_cuda.so"},
+        {"libuct_cuda_gdrcopy", "libuct_cuda_gdrcopy.so"},
+        {"libuct_ib", "libuct_ib.so"},
+        {"libuct_ib_efa", "libuct_ib_efa.so"},
+        {"libuct_ib_mlx5", "libuct_ib_mlx5.so"},
+        {"libuct_ib_mlx5_gda", "libuct_ib_mlx5_gda.so"},
+        {"libuct_knem", "libuct_knem.so"},
+        {"libuct_xpmem", "libuct_xpmem.so"},
+    };
+
+    std::vector<nixlUcxTransportModuleRequirement> requirements;
+    std::string error;
+    require(nixlUcxGetTransportModuleRequirements(
+                selected_transports, requirements, error) == NIXL_SUCCESS,
+            "known transport module requirements were rejected");
+    std::set<std::pair<std::string, std::string>> actual;
+    for (const auto &requirement : requirements) {
+        actual.emplace(requirement.component, requirement.soname);
+    }
+    require(actual == expected, "transport module requirements changed");
+    require(error.empty(), "successful transport module requirements returned an error");
+
+    for (const auto &unsupported :
+         std::vector<nixl_xfer_attestation_transport_t>{
+             {.transport = "rocm_copy", .device = "rocm"},
+             {.transport = "foo_mlx5", .device = "mlx5_0:1"},
+         }) {
+        require(nixlUcxGetTransportModuleRequirements(
+                    {unsupported}, requirements, error) == NIXL_ERR_BACKEND,
+                "unknown transport module requirement did not fail closed");
+        require(requirements.empty(),
+                "failed transport module requirements leaked evidence");
+        require(!error.empty(),
+                "failed transport module requirements omitted an error");
+    }
+}
+
+void
+testLoadedArtifactPathsAreLoadTimeAbsolute() {
+    std::string canonical_path = "stale";
+    std::string error;
+    require(nixlUcxCanonicalizeLoadedPath(
+                "libuct_cuda", "libuct_cuda.so.0", canonical_path, error) ==
+                NIXL_ERR_BACKEND,
+            "relative loaded artifact path was accepted");
+    require(canonical_path.empty(), "relative loaded artifact path leaked stale output");
+    require(!error.empty(), "relative loaded artifact path omitted an error");
+
+    require(nixlUcxCanonicalizeLoadedPath(
+                "test-executable", "/proc/self/exe", canonical_path, error) ==
+                NIXL_SUCCESS,
+            "absolute loaded artifact path was rejected");
+    require(std::filesystem::path(canonical_path).is_absolute(),
+            "canonical loaded artifact path is not absolute");
+    require(error.empty(), "canonical loaded artifact path returned an error");
+}
+
+void
 testRuntimeArtifactsIdentifyLoadedObjects() {
     const auto state = makeState();
     const nixl_xfer_attestation_t snapshot = state->snapshot();
@@ -97,8 +178,8 @@ testRuntimeArtifactsIdentifyLoadedObjects() {
 }
 
 const std::vector<nixl_xfer_attestation_transport_t> transports = {
-    {.transport = "rc_mlx5", .device = "mlx5_1:1"},
-    {.transport = "cuda_copy", .device = "cuda"},
+    {.transport = "self", .device = "memory"},
+    {.transport = "tcp", .device = "eth0"},
 };
 
 class UnsupportedBackend final : public nixlBackendEngine {
@@ -254,6 +335,13 @@ testTakeOnceAndGenerationRollover() {
     const nixl_xfer_attestation_t before_take = state->snapshot();
     require(before_take.state == nixl_xfer_attestation_state_t::REMOTE_FLUSHED,
             "first generation did not remotely flush");
+    require(std::is_sorted(
+                before_take.runtimeArtifacts.begin(),
+                before_take.runtimeArtifacts.end(),
+                [](const auto &left, const auto &right) {
+                    return left.component < right.component;
+                }),
+            "sealed runtime artifacts are not canonical");
     require(state->beginSubmission() == NIXL_ERR_NOT_ALLOWED,
             "repost before take was accepted");
 
@@ -431,6 +519,8 @@ int
 main() {
     try {
         testUnsupportedBackendFailsClosed();
+        testTransportModuleRequirements();
+        testLoadedArtifactPathsAreLoadTimeAbsolute();
         testRuntimeArtifactsIdentifyLoadedObjects();
         testFirstFailureIsPermanent();
         testTakeOnceAndGenerationRollover();

@@ -902,7 +902,7 @@ PYBIND11_MODULE(_bindings, m) {
                  {
                      py::gil_scoped_release release;
                      status = agent.takeXferCompletionAttestation(
-                         reinterpret_cast<const nixlXferReqH *>(reqh), attestation);
+                         reinterpret_cast<nixlXferReqH *>(reqh), attestation);
                  }
                  if (status == NIXL_IN_PROG) {
                      return py::none();

@@ -24,6 +24,23 @@
 
 #include "backend/backend_aux.h"
 
+struct nixlUcxTransportModuleRequirement {
+    std::string component;
+    std::string soname;
+};
+
+[[nodiscard]] nixl_status_t
+nixlUcxGetTransportModuleRequirements(
+    const std::vector<nixl_xfer_attestation_transport_t> &transports,
+    std::vector<nixlUcxTransportModuleRequirement> &requirements,
+    std::string &error);
+
+[[nodiscard]] nixl_status_t
+nixlUcxCanonicalizeLoadedPath(const std::string &component,
+                              const std::string &loaded_path,
+                              std::string &canonical_path,
+                              std::string &error);
+
 class nixlUcxAttestationState {
 public:
     explicit nixlUcxAttestationState(uint64_t handle_identity);
@@ -84,6 +101,7 @@ private:
     sealCompletionLocked();
 
     mutable std::mutex mutex_;
+    std::vector<nixl_runtime_artifact_t> baseRuntimeArtifacts_;
     nixl_xfer_attestation_t attestation_;
 };
 

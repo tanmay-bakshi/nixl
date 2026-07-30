@@ -1122,9 +1122,7 @@ nixlAgent::postXferReq(nixlXferReqH *req_hndl,
 }
 
 nixl_status_t
-nixlAgent::getXferStatus (nixlXferReqH *req_hndl) const {
-
-    NIXL_SHARED_LOCK_GUARD(data->lock);
+nixlAgent::getXferStatusLocked(nixlXferReqH *req_hndl) const {
     // If the status is done, no need to recheck and no state changes.
     // Same for users incorrectly recalling this method in error/done.
     if (req_hndl->status == NIXL_IN_PROG) {
@@ -1156,6 +1154,13 @@ nixlAgent::getXferStatus (nixlXferReqH *req_hndl) const {
 
     // If the status is error when entering this method, it was already logged
     return req_hndl->status;
+}
+
+nixl_status_t
+nixlAgent::getXferStatus (nixlXferReqH *req_hndl) const {
+
+    NIXL_SHARED_LOCK_GUARD(data->lock);
+    return getXferStatusLocked(req_hndl);
 }
 
 nixl_status_t
@@ -1200,20 +1205,20 @@ nixlAgent::queryXferAttestation(const nixlXferReqH *req_hndl,
 }
 
 nixl_status_t
-nixlAgent::takeXferCompletionAttestation(const nixlXferReqH *req_hndl,
+nixlAgent::takeXferCompletionAttestation(nixlXferReqH *req_hndl,
                                          nixl_xfer_attestation_t &attestation) const {
     if (req_hndl == nullptr) {
         return NIXL_ERR_INVALID_PARAM;
     }
 
     NIXL_SHARED_LOCK_GUARD(data->lock);
-    if (req_hndl->status != NIXL_SUCCESS) {
-        return req_hndl->status;
+    nixl_status_t status = getXferStatusLocked(req_hndl);
+    if (status != NIXL_SUCCESS) {
+        return status;
     }
 
-    nixl_status_t status =
-        req_hndl->engine->takeXferCompletionAttestation(
-            req_hndl->backendHandle, attestation);
+    status = req_hndl->engine->takeXferCompletionAttestation(
+        req_hndl->backendHandle, attestation);
     if (status != NIXL_SUCCESS) {
         return status;
     }

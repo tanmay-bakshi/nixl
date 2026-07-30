@@ -72,6 +72,47 @@ def _assert_non_constructible_and_read_only(
         snapshot.runtimeArtifacts[0].buildId = "forged"
 
 
+def _expected_runtime_components(
+    receipt: bindings.nixlXferCompletionReceipt,
+) -> set[str]:
+    """Derive the exact loaded-artifact contract from selected UCX resources.
+
+    :param receipt: Native completion receipt to inspect.
+    :returns: Exact expected runtime artifact component names.
+    """
+    components = {"libnixl", "libucp", "ucx-plugin"}
+    for endpoint in receipt.endpoints:
+        for transport in endpoint.transports:
+            name = transport.transport
+            if name in {"posix", "self", "sysv", "tcp"}:
+                continue
+            if name in {"cuda_copy", "cuda_ipc"}:
+                components.add("libuct_cuda")
+                continue
+            if name == "gdr_copy":
+                components.update({"libuct_cuda", "libuct_cuda_gdrcopy"})
+                continue
+            if name == "rc_gda":
+                components.update(
+                    {"libuct_ib", "libuct_ib_mlx5", "libuct_ib_mlx5_gda"}
+                )
+                continue
+            if name in {"dc_mlx5", "gga_mlx5", "rc_mlx5", "ud_mlx5"}:
+                components.update({"libuct_ib", "libuct_ib_mlx5"})
+                continue
+            if name in {"rc_verbs", "ud_verbs"}:
+                components.add("libuct_ib")
+                continue
+            if name == "srd":
+                components.update({"libuct_ib", "libuct_ib_efa"})
+                continue
+            if name in {"cma", "knem", "xpmem"}:
+                components.add(f"libuct_{name}")
+                continue
+            pytest.fail(f"unexpected selected UCX transport: {name}")
+    return components
+
+
 def test_completion_receipt_waits_for_notification_terminal_status() -> None:
     """Gate unique completion authority on the whole native request handle."""
     initiator, target = _make_agents(num_threads=0)
@@ -148,12 +189,11 @@ def test_completion_receipt_waits_for_notification_terminal_status() -> None:
         assert receipt.generation == pending_snapshot.generation
         assert receipt.descriptorDigest == pending_snapshot.descriptorDigest
         assert receipt.evidenceDigest == pending_snapshot.evidenceDigest
-        assert len(receipt.runtimeArtifacts) == 3
-        assert {artifact.component for artifact in receipt.runtimeArtifacts} == {
-            "libnixl",
-            "libucp",
-            "ucx-plugin",
-        }
+        expected_components = _expected_runtime_components(receipt)
+        actual_components = [
+            artifact.component for artifact in receipt.runtimeArtifacts
+        ]
+        assert actual_components == sorted(expected_components)
         for artifact in receipt.runtimeArtifacts:
             assert os.path.realpath(artifact.path) == artifact.path
             assert len(artifact.buildId) > 0
@@ -264,6 +304,75 @@ def test_thread_pool_completion_receipt_covers_every_chunk() -> None:
             for index in range(segment_count)
         )
         assert destination_bytes == source_bytes
+    finally:
+        if handle is not None:
+            handle.release()
+        if source_registration is not None:
+            initiator.deregister_memory(source_registration)
+        if destination_registration is not None:
+            target.deregister_memory(destination_registration)
+        if initiator_connected:
+            initiator.remove_remote_agent(target.name)
+        if target_connected:
+            target.remove_remote_agent(initiator.name)
+        utils.free_passthru(source)
+        utils.free_passthru(destination)
+
+
+def test_completion_receipt_drives_native_progress() -> None:
+    """Require the take-once authority to own transport progress."""
+    initiator, target = _make_agents(num_threads=0)
+    size = 16 * 1024 * 1024
+    source = utils.malloc_passthru(size)
+    destination = utils.malloc_passthru(size)
+    handle: nixl_xfer_handle | None = None
+    source_registration: bindings.nixlRegDList | None = None
+    destination_registration: bindings.nixlRegDList | None = None
+    initiator_connected = False
+    target_connected = False
+
+    try:
+        utils.ba_buf(source, size)
+        ctypes.memset(destination, 0, size)
+        source_registration = initiator.register_memory(
+            [(source, size, 0, "source")], mem_type="DRAM"
+        )
+        destination_registration = target.register_memory(
+            [(destination, size, 0, "destination")], mem_type="DRAM"
+        )
+        initiator.add_remote_agent(target.get_agent_metadata())
+        initiator_connected = True
+        target.add_remote_agent(initiator.get_agent_metadata())
+        target_connected = True
+
+        source_descriptors = initiator.get_xfer_descs(
+            [(source, size, 0)], mem_type="DRAM"
+        )
+        destination_descriptors = initiator.get_xfer_descs(
+            [(destination, size, 0)], mem_type="DRAM"
+        )
+        notification = b"receipt-progress:" + b"x" * (4 * 1024 * 1024)
+        handle = initiator.initialize_xfer(
+            "WRITE",
+            source_descriptors,
+            destination_descriptors,
+            target.name,
+            notification,
+        )
+        assert initiator.transfer(handle) == "PROC"
+
+        deadline = time.monotonic() + 30
+        receipt = None
+        while receipt is None:
+            receipt = initiator.take_xfer_completion_receipt(handle)
+            if time.monotonic() >= deadline:
+                pytest.fail("completion receipt did not drive native progress")
+            time.sleep(0.001)
+
+        assert receipt.completionClaimed
+        assert receipt.state == bindings.NIXL_XFER_ATTESTATION_REMOTE_FLUSHED
+        assert receipt.status == bindings.NIXL_SUCCESS
+        utils.verify_transfer(source, destination, size)
     finally:
         if handle is not None:
             handle.release()
