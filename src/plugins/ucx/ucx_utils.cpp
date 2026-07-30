@@ -18,8 +18,10 @@
 #include "ucx_utils.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <exception>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -30,6 +32,44 @@
 #include "common/nixl_log.h"
 #include "config.h"
 #include "serdes/serdes.h"
+
+namespace {
+
+std::atomic<uint64_t> next_worker_identity{1};
+std::atomic<uint64_t> next_endpoint_identity{1};
+
+[[nodiscard]] uint64_t
+allocateIdentity(std::atomic<uint64_t> &next_identity) {
+    uint64_t identity = next_identity.load(std::memory_order_relaxed);
+    do {
+        if (identity == std::numeric_limits<uint64_t>::max()) {
+            throw std::overflow_error("UCX runtime identity space exhausted");
+        }
+    } while (!next_identity.compare_exchange_weak(
+        identity, identity + 1, std::memory_order_relaxed, std::memory_order_relaxed));
+    return identity;
+}
+
+[[nodiscard]] nixl_status_t
+queryRequestInfo(nixlUcxReq request, size_t buffer_size, std::string &request_info) {
+    std::vector<char> buffer(buffer_size, '\0');
+    ucp_request_attr_t attr = {
+        .field_mask =
+            UCP_REQUEST_ATTR_FIELD_INFO_STRING | UCP_REQUEST_ATTR_FIELD_INFO_STRING_SIZE,
+        .debug_string = buffer.data(),
+        .debug_string_size = buffer.size(),
+    };
+
+    const ucs_status_t status = ucp_request_query(request, &attr);
+    if (status != UCS_OK || buffer[0] == '\0') {
+        return NIXL_ERR_BACKEND;
+    }
+
+    request_info.assign(buffer.data());
+    return NIXL_SUCCESS;
+}
+
+} // namespace
 
 [[nodiscard]] nixl_b_params_t
 get_ucx_backend_common_options() {
@@ -156,9 +196,23 @@ nixlUcxEp::closeImpl(ucp_ep_close_flags_t flags) {
     std::terminate();
 }
 
-nixlUcxEp::nixlUcxEp(ucp_worker_h worker, void *addr, ucp_err_handling_mode_t err_handling_mode) {
+nixlUcxEp::nixlUcxEp(ucp_worker_h worker,
+                     uint64_t worker_identity,
+                     void *addr,
+                     ucp_err_handling_mode_t err_handling_mode)
+    : workerIdentity_(worker_identity),
+      identity_(allocateIdentity(next_endpoint_identity)) {
     ucp_ep_params_t ep_params;
+    ucp_worker_attr_t worker_attr = {
+        .field_mask = UCP_WORKER_ATTR_FIELD_MAX_INFO_STRING,
+    };
     nixl_status_t status;
+
+    const ucs_status_t worker_status = ucp_worker_query(worker, &worker_attr);
+    if (worker_status != UCS_OK || worker_attr.max_debug_string == 0) {
+        throw std::runtime_error("failed to query UCX request info capacity");
+    }
+    requestInfoSize_ = worker_attr.max_debug_string;
 
     ep_params.field_mask = UCP_EP_PARAM_FIELD_REMOTE_ADDRESS | UCP_EP_PARAM_FIELD_ERR_HANDLER |
         UCP_EP_PARAM_FIELD_ERR_HANDLING_MODE;
@@ -261,20 +315,27 @@ nixlUcxEp::read(uint64_t raddr,
                 void *laddr,
                 nixlUcxMem &mem,
                 size_t size,
-                nixlUcxReq &req) {
+                nixlUcxReq &req,
+                std::string &request_info) {
     nixl_status_t status = checkTxState();
     if (status != NIXL_SUCCESS) {
         return status;
     }
 
     ucp_request_param_t param = {
-        .op_attr_mask = UCP_OP_ATTR_FIELD_MEMH | UCP_OP_ATTR_FLAG_MULTI_SEND,
+        .op_attr_mask = UCP_OP_ATTR_FIELD_MEMH | UCP_OP_ATTR_FLAG_MULTI_SEND |
+            UCP_OP_ATTR_FLAG_NO_IMM_CMPL,
         .memh = mem.memh,
     };
 
     const ucs_status_ptr_t request = ucp_get_nbx(eph, laddr, size, raddr, rkey.get(), &param);
     if (UCS_PTR_IS_PTR(request)) {
         req = static_cast<nixlUcxReq>(request);
+        if (queryRequestInfo(req, requestInfoSize_, request_info) != NIXL_SUCCESS) {
+            ucp_request_free(request);
+            req = nullptr;
+            return NIXL_ERR_BACKEND;
+        }
         return NIXL_IN_PROG;
     }
 
@@ -287,24 +348,60 @@ nixlUcxEp::write(void *laddr,
                  uint64_t raddr,
                  const nixl::ucx::rkey &rkey,
                  size_t size,
-                 nixlUcxReq &req) {
+                 nixlUcxReq &req,
+                 std::string &request_info) {
     nixl_status_t status = checkTxState();
     if (status != NIXL_SUCCESS) {
         return status;
     }
 
     ucp_request_param_t param = {
-        .op_attr_mask = UCP_OP_ATTR_FIELD_MEMH | UCP_OP_ATTR_FLAG_MULTI_SEND,
+        .op_attr_mask = UCP_OP_ATTR_FIELD_MEMH | UCP_OP_ATTR_FLAG_MULTI_SEND |
+            UCP_OP_ATTR_FLAG_NO_IMM_CMPL,
         .memh = mem.memh,
     };
 
     const ucs_status_ptr_t request = ucp_put_nbx(eph, laddr, size, raddr, rkey.get(), &param);
     if (UCS_PTR_IS_PTR(request)) {
         req = static_cast<nixlUcxReq>(request);
+        if (queryRequestInfo(req, requestInfoSize_, request_info) != NIXL_SUCCESS) {
+            ucp_request_free(request);
+            req = nullptr;
+            return NIXL_ERR_BACKEND;
+        }
         return NIXL_IN_PROG;
     }
 
     return nixl::ucx::ucsToNixlStatus(UCS_PTR_STATUS(request));
+}
+
+nixl_status_t
+nixlUcxEp::queryTransports(
+    std::vector<nixl_xfer_attestation_transport_t> &transports) const {
+    constexpr size_t max_ucx_lanes = 64;
+    std::vector<ucp_transport_entry_t> entries(max_ucx_lanes + 1);
+    ucp_ep_attr_t attr = {
+        .field_mask = UCP_EP_ATTR_FIELD_TRANSPORTS,
+        .transports =
+            {
+                .entries = entries.data(),
+                .num_entries = static_cast<unsigned>(entries.size()),
+                .entry_size = sizeof(ucp_transport_entry_t),
+            },
+    };
+
+    const ucs_status_t status = ucp_ep_query(eph, &attr);
+    if (status != UCS_OK || attr.transports.num_entries > max_ucx_lanes) {
+        return NIXL_ERR_BACKEND;
+    }
+
+    transports.clear();
+    transports.reserve(attr.transports.num_entries);
+    for (unsigned i = 0; i < attr.transports.num_entries; ++i) {
+        transports.push_back(
+            {entries[i].transport_name, entries[i].device_name});
+    }
+    return NIXL_SUCCESS;
 }
 
 nixl_status_t
@@ -510,7 +607,8 @@ nixlUcxWorker::createUcpWorker(const nixlUcxContext &ctx) {
 
 nixlUcxWorker::nixlUcxWorker(const nixlUcxContext &ctx, ucp_err_handling_mode_t err_handling_mode)
     : worker(createUcpWorker(ctx), &ucp_worker_destroy),
-      err_handling_mode_(err_handling_mode) {}
+      err_handling_mode_(err_handling_mode),
+      identity_(allocateIdentity(next_worker_identity)) {}
 
 std::string
 nixlUcxWorker::epAddr() {
@@ -531,7 +629,8 @@ nixlUcxWorker::epAddr() {
 std::unique_ptr<nixlUcxEp>
 nixlUcxWorker::connect(void *addr, std::size_t size) {
     try {
-        return std::make_unique<nixlUcxEp>(worker.get(), addr, err_handling_mode_);
+        return std::make_unique<nixlUcxEp>(
+            worker.get(), identity_, addr, err_handling_mode_);
     }
     catch (const std::exception &e) {
         NIXL_ERROR << "UCX endpoint create failed: " << e.what();

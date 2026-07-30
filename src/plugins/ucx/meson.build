@@ -20,14 +20,18 @@ ucx_backend_includes = include_directories('.')
 ucx_backend_sources = ['config.cpp',
                        'mem_list.cpp',
                        'rkey.cpp',
+                       'ucx_attestation.cpp',
                        'ucx_backend.cpp',
                        'ucx_enums.cpp',
                        'ucx_plugin.cpp',
                        'ucx_utils.cpp']
 
+openssl_dep = dependency('openssl', modules: ['libcrypto'], required: true)
+
 ucx_backend_dependencies = [asio_dep,
                             nixl_common_dep,
                             nixl_infra,
+                            openssl_dep,
                             serdes_interface,
                             thread_dep,
                             ucx_dep]

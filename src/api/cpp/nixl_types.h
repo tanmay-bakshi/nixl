@@ -21,6 +21,7 @@
 #include <unordered_map>
 #include <optional>
 #include <chrono>
+#include <cstdint>
 
 
 /*** Forward declarations ***/
@@ -292,6 +293,108 @@ struct nixlXferTelemetry {
  *        for telemetry output.
  */
 using nixl_xfer_telem_t = nixlXferTelemetry;
+
+/**
+ * @enum nixl_xfer_attestation_state_t
+ * @brief State of the current generation of a handle-bound transfer attestation.
+ */
+enum class nixl_xfer_attestation_state_t {
+    PREPARED,
+    POSTING,
+    IN_PROGRESS,
+    REMOTE_FLUSHED,
+    FAILED,
+};
+
+/**
+ * @struct nixlXferAttestationTransport
+ * @brief Endpoint-wide transport and device context reported by the backend.
+ */
+struct nixlXferAttestationTransport {
+    std::string transport;
+    std::string device;
+
+    bool
+    operator==(const nixlXferAttestationTransport &) const = default;
+};
+
+using nixl_xfer_attestation_transport_t = nixlXferAttestationTransport;
+
+/**
+ * @struct nixlXferAttestationSegment
+ * @brief Immutable descriptor binding and selected transport evidence for one segment.
+ */
+struct nixlXferAttestationSegment {
+    size_t index = 0;
+    uintptr_t localAddress = 0;
+    uintptr_t remoteAddress = 0;
+    uint64_t localDeviceId = 0;
+    uint64_t remoteDeviceId = 0;
+    size_t length = 0;
+    size_t workerId = 0;
+    uint64_t workerIdentity = 0;
+    uint64_t endpointIdentity = 0;
+    std::string requestInfo;
+    bool posted = false;
+};
+
+using nixl_xfer_attestation_segment_t = nixlXferAttestationSegment;
+
+/**
+ * @struct nixlXferAttestationEndpoint
+ * @brief Endpoint identity, context, and remote-flush evidence for one submission.
+ */
+struct nixlXferAttestationEndpoint {
+    size_t workerId = 0;
+    uint64_t workerIdentity = 0;
+    uint64_t endpointIdentity = 0;
+    std::vector<size_t> segmentIndices;
+    std::vector<nixl_xfer_attestation_transport_t> transports;
+    bool flushPosted = false;
+    bool remoteFlushed = false;
+};
+
+using nixl_xfer_attestation_endpoint_t = nixlXferAttestationEndpoint;
+
+/**
+ * @struct nixlRuntimeArtifact
+ * @brief Identity of a loaded runtime artifact used to interpret transport evidence.
+ */
+struct nixlRuntimeArtifact {
+    std::string component;
+    std::string path;
+    std::string buildId;
+    std::string version;
+};
+
+using nixl_runtime_artifact_t = nixlRuntimeArtifact;
+
+/**
+ * @struct nixlXferAttestation
+ * @brief Handle-bound evidence for one transfer submission generation.
+ */
+struct nixlXferAttestation {
+    uint64_t handleIdentity = 0;
+    uint64_t generation = 0;
+    nixl_xfer_attestation_state_t state = nixl_xfer_attestation_state_t::PREPARED;
+    nixl_status_t status = NIXL_ERR_NOT_POSTED;
+    bool submissionSealed = false;
+    bool completionClaimed = false;
+    std::string backend;
+    std::string localAgent;
+    std::string remoteAgent;
+    nixl_xfer_op_t operation = NIXL_WRITE;
+    nixl_mem_t localMemoryType = DRAM_SEG;
+    nixl_mem_t remoteMemoryType = DRAM_SEG;
+    std::vector<nixl_xfer_attestation_segment_t> segments;
+    std::vector<nixl_xfer_attestation_endpoint_t> endpoints;
+    std::vector<nixl_runtime_artifact_t> runtimeArtifacts;
+    std::string descriptorDigest;
+    std::string evidenceDigest;
+    std::string error;
+};
+
+using nixl_xfer_attestation_t = nixlXferAttestation;
 
 /**
  * @brief A define for an empty string, that indicates the descriptor list is being

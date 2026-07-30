@@ -36,6 +36,7 @@
 
 #include "mem_list.h"
 #include "rkey.h"
+#include "ucx_attestation.h"
 #include "ucx_enums.h"
 #include "ucx_utils.h"
 
@@ -178,6 +179,12 @@ public:
     nixl_status_t
     checkXfer(nixlBackendReqH *handle) const override;
     nixl_status_t
+    queryXferAttestation(const nixlBackendReqH *handle,
+                         nixl_xfer_attestation_t &attestation) const override;
+    nixl_status_t
+    takeXferCompletionAttestation(nixlBackendReqH *handle,
+                                  nixl_xfer_attestation_t &attestation) const override;
+    nixl_status_t
     releaseReqH(nixlBackendReqH *handle) const override;
 
     unsigned
@@ -238,6 +245,13 @@ protected:
                   size_t start_idx,
                   size_t end_idx) const;
 
+    [[nodiscard]] nixl_status_t
+    prepareHandleAttestation(nixlBackendReqH *handle,
+                             const nixl_xfer_op_t &operation,
+                             const nixl_meta_dlist_t &local,
+                             const nixl_meta_dlist_t &remote,
+                             const std::string &remote_agent) const;
+
     nixlUcxEngine(const nixlBackendInitParams &init_params);
 
     notif_list_t notifList_;
@@ -276,6 +290,7 @@ private:
                        nixl_xfer_op_t operation,
                        const nixl_meta_dlist_t &local,
                        const nixl_meta_dlist_t &remote,
+                       nixlBackendReqH *handle,
                        size_t worker_id,
                        size_t start_idx,
                        size_t end_idx);

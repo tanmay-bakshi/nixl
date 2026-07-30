@@ -39,6 +39,13 @@ ucx_backend_multi = executable('ucx_backend_multi',
            cpp_args : cpp_args,
            install: true)
 
+ucx_attestation_test = executable('ucx_attestation_test',
+        'ucx_attestation_test.cpp',
+        dependencies: ucx_backend_test_dep,
+        include_directories: ucx_test_include_directories)
+
+test('ucx_attestation', ucx_attestation_test)
+
 if get_option('buildtype') != 'release'
 
     ucx_worker_bin = executable('ucx_worker_test',

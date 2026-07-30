@@ -21,7 +21,6 @@
 #include <mutex>
 #include <string>
 #include <vector>
-#include <mutex>
 
 #include "nixl_types.h"
 #include "backend_aux.h"
@@ -151,6 +150,20 @@ class nixlBackendEngine {
 
         // Use a handle to progress backend engine and see if a transfer is completed or not
         virtual nixl_status_t checkXfer(nixlBackendReqH* handle) const = 0;
+
+        // Query handle-bound transport evidence for the current submission generation
+        virtual nixl_status_t
+        queryXferAttestation(const nixlBackendReqH *,
+                             nixl_xfer_attestation_t &) const {
+            return NIXL_ERR_NOT_SUPPORTED;
+        }
+
+        // Atomically claim sealed completion evidence for the current generation
+        virtual nixl_status_t
+        takeXferCompletionAttestation(nixlBackendReqH *,
+                                      nixl_xfer_attestation_t &) const {
+            return NIXL_ERR_NOT_SUPPORTED;
+        }
 
         //Backend aborts the transfer if necessary, and destructs the relevant objects
         virtual nixl_status_t releaseReqH(nixlBackendReqH* handle) const = 0;

@@ -1,0 +1,397 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include <array>
+#include <cstdlib>
+#include <exception>
+#include <iostream>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <vector>
+
+#include "backend/backend_engine.h"
+#include "ucx_attestation.h"
+
+namespace {
+
+void
+require(bool condition, std::string_view message) {
+    if (!condition) {
+        throw std::runtime_error(std::string(message));
+    }
+}
+
+nixl_meta_dlist_t
+makeDescriptors(uintptr_t base, size_t count, size_t length) {
+    nixl_meta_dlist_t descriptors(DRAM_SEG);
+    for (size_t index = 0; index < count; ++index) {
+        descriptors.addDesc(
+            nixlMetaDesc(base + index * length, length, index, nullptr));
+    }
+    return descriptors;
+}
+
+std::unique_ptr<nixlUcxAttestationState>
+makeState(size_t count = 2) {
+    auto state = std::make_unique<nixlUcxAttestationState>(41);
+    const nixl_meta_dlist_t local = makeDescriptors(0x1000, count, 64);
+    const nixl_meta_dlist_t remote = makeDescriptors(0x8000, count, 64);
+    require(state->prepare(NIXL_WRITE, local, remote, "prefill", "decode") == NIXL_SUCCESS,
+            "failed to prepare attestation state");
+    return state;
+}
+
+const std::vector<nixl_xfer_attestation_transport_t> transports = {
+    {.transport = "rc_mlx5", .device = "mlx5_1:1"},
+    {.transport = "cuda_copy", .device = "cuda"},
+};
+
+class UnsupportedBackend final : public nixlBackendEngine {
+public:
+    explicit UnsupportedBackend(const nixlBackendInitParams &params)
+        : nixlBackendEngine(&params) {}
+
+    bool
+    supportsRemote() const override {
+        return false;
+    }
+
+    bool
+    supportsLocal() const override {
+        return false;
+    }
+
+    bool
+    supportsNotif() const override {
+        return false;
+    }
+
+    nixl_mem_list_t
+    getSupportedMems() const override {
+        return {};
+    }
+
+    nixl_status_t
+    registerMem(const nixlBlobDesc &, const nixl_mem_t &, nixlBackendMD *&) override {
+        return NIXL_ERR_NOT_SUPPORTED;
+    }
+
+    nixl_status_t
+    deregisterMem(nixlBackendMD *) override {
+        return NIXL_ERR_NOT_SUPPORTED;
+    }
+
+    nixl_status_t
+    connect(const std::string &) override {
+        return NIXL_ERR_NOT_SUPPORTED;
+    }
+
+    nixl_status_t
+    disconnect(const std::string &) override {
+        return NIXL_ERR_NOT_SUPPORTED;
+    }
+
+    nixl_status_t
+    unloadMD(nixlBackendMD *) override {
+        return NIXL_ERR_NOT_SUPPORTED;
+    }
+
+    nixl_status_t
+    prepXfer(const nixl_xfer_op_t &,
+             const nixl_meta_dlist_t &,
+             const nixl_meta_dlist_t &,
+             const std::string &,
+             nixlBackendReqH *&,
+             const nixl_opt_b_args_t *) const override {
+        return NIXL_ERR_NOT_SUPPORTED;
+    }
+
+    nixl_status_t
+    postXfer(const nixl_xfer_op_t &,
+             const nixl_meta_dlist_t &,
+             const nixl_meta_dlist_t &,
+             const std::string &,
+             nixlBackendReqH *&,
+             const nixl_opt_b_args_t *) const override {
+        return NIXL_ERR_NOT_SUPPORTED;
+    }
+
+    nixl_status_t
+    checkXfer(nixlBackendReqH *) const override {
+        return NIXL_ERR_NOT_SUPPORTED;
+    }
+
+    nixl_status_t
+    releaseReqH(nixlBackendReqH *) const override {
+        return NIXL_ERR_NOT_SUPPORTED;
+    }
+};
+
+void
+testUnsupportedBackendFailsClosed() {
+    nixl_b_params_t custom_params;
+    nixlBackendInitParams params = {
+        .localAgent = "local",
+        .type = "unsupported",
+        .customParams = &custom_params,
+        .enableProgTh = false,
+        .pthrDelay = 0,
+        .syncMode = nixl_thread_sync_t::NIXL_THREAD_SYNC_NONE,
+        .enableTelemetry_ = false,
+    };
+    UnsupportedBackend backend(params);
+    nixl_xfer_attestation_t attestation;
+    require(backend.queryXferAttestation(nullptr, attestation) == NIXL_ERR_NOT_SUPPORTED,
+            "unsupported query did not fail closed");
+    require(backend.takeXferCompletionAttestation(nullptr, attestation) ==
+                NIXL_ERR_NOT_SUPPORTED,
+            "unsupported completion take did not fail closed");
+}
+
+void
+testFirstFailureIsPermanent() {
+    auto state = makeState();
+    require(state->beginSubmission() == NIXL_SUCCESS, "submission did not begin");
+    const uint64_t generation = state->getGeneration();
+    state->fail(generation, NIXL_ERR_MISMATCH, "first failure");
+    state->fail(generation, NIXL_ERR_CANCELED, "later failure");
+    state->fail(generation - 1, NIXL_ERR_BACKEND, "stale failure");
+
+    const nixl_xfer_attestation_t snapshot = state->snapshot();
+    require(snapshot.state == nixl_xfer_attestation_state_t::FAILED,
+            "failed state was not retained");
+    require(snapshot.status == NIXL_ERR_MISMATCH, "first failure status was overwritten");
+    require(snapshot.error == "first failure", "first failure detail was overwritten");
+    require(state->beginSubmission() == NIXL_ERR_MISMATCH,
+            "failed handle accepted a repost");
+}
+
+void
+postImmediateCompletion(nixlUcxAttestationState &state,
+                        uint64_t worker_identity,
+                        uint64_t endpoint_identity) {
+    require(state.recordSegment(0,
+                                0,
+                                worker_identity,
+                                endpoint_identity,
+                                transports,
+                                "segment-0 protocol") == NIXL_SUCCESS,
+            "first segment evidence was rejected");
+    require(state.recordSegment(1,
+                                0,
+                                worker_identity,
+                                endpoint_identity,
+                                transports,
+                                "segment-1 protocol") == NIXL_SUCCESS,
+            "second segment evidence was rejected");
+    require(state.recordFlush(
+                0, worker_identity, endpoint_identity, NIXL_SUCCESS) == NIXL_SUCCESS,
+            "immediate endpoint flush was rejected");
+    require(state.finishSubmission() == NIXL_SUCCESS, "submission did not seal");
+}
+
+void
+testTakeOnceAndGenerationRollover() {
+    auto state = makeState();
+    require(state->beginSubmission() == NIXL_SUCCESS, "first submission did not begin");
+    postImmediateCompletion(*state, 101, 201);
+
+    const nixl_xfer_attestation_t before_take = state->snapshot();
+    require(before_take.state == nixl_xfer_attestation_state_t::REMOTE_FLUSHED,
+            "first generation did not remotely flush");
+    require(state->beginSubmission() == NIXL_ERR_NOT_ALLOWED,
+            "repost before take was accepted");
+
+    nixl_xfer_attestation_t first;
+    require(state->takeCompletion(first) == NIXL_SUCCESS,
+            "first completion evidence was not claimable");
+    require(first.completionClaimed, "taken completion was not marked claimed");
+    require(state->takeCompletion(first) == NIXL_ERR_NOT_ALLOWED,
+            "completion evidence was claimable twice");
+
+    require(state->beginSubmission() == NIXL_SUCCESS,
+            "claimed handle did not accept a new generation");
+    require(state->getGeneration() == first.generation + 1,
+            "submission generation did not advance");
+    postImmediateCompletion(*state, 102, 202);
+
+    nixl_xfer_attestation_t second;
+    require(state->takeCompletion(second) == NIXL_SUCCESS,
+            "second completion evidence was not claimable");
+    require(second.descriptorDigest == first.descriptorDigest,
+            "descriptor binding changed across handle reuse");
+    require(second.evidenceDigest != first.evidenceDigest,
+            "generation was not bound into transfer evidence");
+}
+
+void
+testStaleEventsPoisonCurrentGeneration() {
+    {
+        auto state = makeState();
+        require(state->beginSubmission() == NIXL_SUCCESS, "first submission did not begin");
+        postImmediateCompletion(*state, 101, 201);
+        nixl_xfer_attestation_t completion;
+        require(state->takeCompletion(completion) == NIXL_SUCCESS,
+                "first completion was not claimable");
+        require(state->beginSubmission() == NIXL_SUCCESS, "second submission did not begin");
+        state->completeFlush(completion.generation, 201);
+        const nixl_xfer_attestation_t snapshot = state->snapshot();
+        require(snapshot.state == nixl_xfer_attestation_state_t::FAILED,
+                "stale completion did not fail the current generation");
+        require(snapshot.evidenceDigest.empty(),
+                "stale completion left successful evidence");
+    }
+
+    {
+        auto state = makeState();
+        require(state->beginSubmission() == NIXL_SUCCESS, "first submission did not begin");
+        postImmediateCompletion(*state, 101, 201);
+        nixl_xfer_attestation_t completion;
+        require(state->takeCompletion(completion) == NIXL_SUCCESS,
+                "first completion was not claimable");
+        require(state->beginSubmission() == NIXL_SUCCESS, "second submission did not begin");
+        state->fail(completion.generation, NIXL_ERR_CANCELED, "old failure");
+        const nixl_xfer_attestation_t snapshot = state->snapshot();
+        require(snapshot.state == nixl_xfer_attestation_state_t::FAILED,
+                "stale failure did not fail the current generation");
+        require(snapshot.error == "stale submission failure",
+                "stale failure was not distinguished");
+    }
+}
+
+void
+testExactSegmentsAndAllFlushesBindCompletion() {
+    auto state = makeState(4);
+    require(state->beginSubmission() == NIXL_SUCCESS, "submission did not begin");
+
+    require(state->recordSegment(
+                0, 0, 101, 201, transports, "segment-0 protocol") == NIXL_SUCCESS,
+            "segment 0 evidence was rejected");
+    require(state->recordSegment(
+                1, 0, 101, 201, transports, "segment-1 protocol") == NIXL_SUCCESS,
+            "segment 1 evidence was rejected");
+    require(state->recordSegment(
+                2, 1, 102, 202, transports, "segment-2 protocol") == NIXL_SUCCESS,
+            "segment 2 evidence was rejected");
+    require(state->recordSegment(
+                3, 1, 102, 202, transports, "segment-3 protocol") == NIXL_SUCCESS,
+            "segment 3 evidence was rejected");
+    require(state->recordFlush(0, 101, 201, NIXL_IN_PROG) == NIXL_SUCCESS,
+            "first endpoint flush was rejected");
+    require(state->recordFlush(1, 102, 202, NIXL_IN_PROG) == NIXL_SUCCESS,
+            "second endpoint flush was rejected");
+    require(state->finishSubmission() == NIXL_SUCCESS, "submission did not seal");
+
+    nixl_xfer_attestation_t completion;
+    require(state->takeCompletion(completion) == NIXL_ERR_NOT_ALLOWED,
+            "completion was available before endpoint flushes");
+    state->completeFlush(state->getGeneration(), 201);
+    require(state->snapshot().state == nixl_xfer_attestation_state_t::IN_PROGRESS,
+            "one endpoint flush completed the whole submission");
+    require(state->takeCompletion(completion) == NIXL_ERR_NOT_ALLOWED,
+            "completion was available with one endpoint outstanding");
+    state->completeFlush(state->getGeneration(), 202);
+    require(state->takeCompletion(completion) == NIXL_SUCCESS,
+            "completion was unavailable after every endpoint flushed");
+
+    require(completion.segments.size() == 4, "completion lost segment evidence");
+    require(completion.endpoints.size() == 2, "completion lost endpoint evidence");
+    require(completion.endpoints[0].segmentIndices == std::vector<size_t>({0, 1}),
+            "first endpoint segment binding changed");
+    require(completion.endpoints[1].segmentIndices == std::vector<size_t>({2, 3}),
+            "second endpoint segment binding changed");
+    for (size_t index = 0; index < completion.segments.size(); ++index) {
+        require(completion.segments[index].index == index,
+                "segment order changed");
+        require(completion.segments[index].posted, "segment was not marked posted");
+    }
+}
+
+void
+testCompositePostingSealsOnlyAfterBarrier() {
+    constexpr size_t chunk_count = 4;
+    auto state = makeState(chunk_count);
+    require(state->beginSubmission() == NIXL_SUCCESS, "submission did not begin");
+
+    std::array<std::thread, chunk_count> threads;
+    std::array<nixl_status_t, chunk_count> segment_statuses;
+    std::array<nixl_status_t, chunk_count> flush_statuses;
+    for (size_t index = 0; index < chunk_count; ++index) {
+        threads[index] = std::thread([&state, &segment_statuses, &flush_statuses, index]() {
+            const uint64_t worker_identity = 100 + index;
+            const uint64_t endpoint_identity = 200 + index;
+            segment_statuses[index] =
+                state->recordSegment(index,
+                                     index,
+                                     worker_identity,
+                                     endpoint_identity,
+                                     transports,
+                                     "chunk protocol " + std::to_string(index));
+            flush_statuses[index] = state->recordFlush(
+                index, worker_identity, endpoint_identity, NIXL_SUCCESS);
+        });
+    }
+    for (auto &thread : threads) {
+        thread.join();
+    }
+    for (size_t index = 0; index < chunk_count; ++index) {
+        require(segment_statuses[index] == NIXL_SUCCESS,
+                "chunk segment evidence was rejected");
+        require(flush_statuses[index] == NIXL_SUCCESS,
+                "chunk flush evidence was rejected");
+    }
+
+    nixl_xfer_attestation_t completion;
+    const nixl_xfer_attestation_t before_seal = state->snapshot();
+    require(before_seal.state == nixl_xfer_attestation_state_t::POSTING,
+            "composite submission completed before the posting barrier");
+    require(!before_seal.submissionSealed,
+            "composite submission sealed before the posting barrier");
+    require(state->takeCompletion(completion) == NIXL_ERR_NOT_ALLOWED,
+            "unsealed composite evidence was claimable");
+
+    require(state->finishSubmission() == NIXL_SUCCESS,
+            "composite submission did not seal after the barrier");
+    require(state->takeCompletion(completion) == NIXL_SUCCESS,
+            "sealed composite completion was not claimable");
+    require(completion.endpoints.size() == chunk_count,
+            "composite completion lost chunk endpoints");
+}
+
+} // namespace
+
+int
+main() {
+    try {
+        testUnsupportedBackendFailsClosed();
+        testFirstFailureIsPermanent();
+        testTakeOnceAndGenerationRollover();
+        testStaleEventsPoisonCurrentGeneration();
+        testExactSegmentsAndAllFlushesBindCompletion();
+        testCompositePostingSealsOnlyAfterBarrier();
+    }
+    catch (const std::exception &error) {
+        std::cerr << "UCX attestation test failed: " << error.what() << '\n';
+        return EXIT_FAILURE;
+    }
+
+    std::cout << "UCX attestation state-machine tests passed\n";
+    return EXIT_SUCCESS;
+}

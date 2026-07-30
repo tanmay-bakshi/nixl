@@ -1184,6 +1184,49 @@ nixlAgent::queryXferBackend(const nixlXferReqH* req_hndl,
 }
 
 nixl_status_t
+nixlAgent::queryXferAttestation(const nixlXferReqH *req_hndl,
+                                nixl_xfer_attestation_t &attestation) const {
+    if (req_hndl == nullptr) {
+        return NIXL_ERR_INVALID_PARAM;
+    }
+
+    NIXL_SHARED_LOCK_GUARD(data->lock);
+    nixl_status_t status =
+        req_hndl->engine->queryXferAttestation(req_hndl->backendHandle, attestation);
+    if (status != NIXL_SUCCESS) {
+        return status;
+    }
+    return NIXL_SUCCESS;
+}
+
+nixl_status_t
+nixlAgent::takeXferCompletionAttestation(const nixlXferReqH *req_hndl,
+                                         nixl_xfer_attestation_t &attestation) const {
+    if (req_hndl == nullptr) {
+        return NIXL_ERR_INVALID_PARAM;
+    }
+    if (req_hndl->status != NIXL_SUCCESS) {
+        return req_hndl->status;
+    }
+
+    NIXL_SHARED_LOCK_GUARD(data->lock);
+    nixl_status_t status =
+        req_hndl->engine->takeXferCompletionAttestation(
+            req_hndl->backendHandle, attestation);
+    if (status != NIXL_SUCCESS) {
+        return status;
+    }
+
+    if (!attestation.submissionSealed ||
+        attestation.state != nixl_xfer_attestation_state_t::REMOTE_FLUSHED ||
+        attestation.status != NIXL_SUCCESS || attestation.descriptorDigest.empty() ||
+        attestation.evidenceDigest.empty()) {
+        return NIXL_ERR_NOT_ALLOWED;
+    }
+    return NIXL_SUCCESS;
+}
+
+nixl_status_t
 nixlAgent::releaseXferReq(nixlXferReqH *req_hndl) const {
 
     NIXL_SHARED_LOCK_GUARD(data->lock);

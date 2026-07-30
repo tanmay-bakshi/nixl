@@ -20,7 +20,9 @@
 #include "serdes/serdes.h"
 #include "common/nixl_log.h"
 
+#include <algorithm>
 #include <optional>
+#include <atomic>
 #include <limits>
 #include <future>
 #include <set>
@@ -35,12 +37,44 @@
  * Backend request management
 *****************************************/
 
+namespace {
+
+std::atomic<uint64_t> next_handle_identity{1};
+
+[[nodiscard]] uint64_t
+allocateHandleIdentity() {
+    uint64_t identity = next_handle_identity.load(std::memory_order_relaxed);
+    do {
+        if (identity == std::numeric_limits<uint64_t>::max()) {
+            throw std::overflow_error("UCX handle identity space exhausted");
+        }
+    } while (!next_handle_identity.compare_exchange_weak(
+        identity, identity + 1, std::memory_order_relaxed, std::memory_order_relaxed));
+    return identity;
+}
+
+} // namespace
+
 class nixlUcxBackendReqH : public nixlBackendReqH {
 private:
+    enum class pending_kind_t {
+        DATA,
+        ENDPOINT_FLUSH,
+        NOTIFICATION,
+    };
+
+    struct pending_request_t {
+        nixlUcxReq request;
+        pending_kind_t kind;
+        uint64_t endpointIdentity;
+        uint64_t generation;
+    };
+
     std::set<ucx_connection_ptr_t> connections_;
-    std::vector<nixlUcxReq> requests_;
+    std::vector<pending_request_t> requests_;
     nixlUcxWorker *worker_;
     size_t workerId_;
+    std::shared_ptr<nixlUcxAttestationState> attestation_;
 
     [[nodiscard]] nixl_status_t
     checkConnection(const nixl_status_t status = NIXL_SUCCESS) const {
@@ -62,6 +96,11 @@ protected:
         workerId_ = worker_id;
     }
 
+    void
+    setAttestationState(const std::shared_ptr<nixlUcxAttestationState> &attestation) {
+        attestation_ = attestation;
+    }
+
 public:
     // Notification to be sent after completion of all requests
     struct Notif {
@@ -75,9 +114,71 @@ public:
 
     std::optional<Notif> notif;
 
-    nixlUcxBackendReqH(nixlUcxWorker *worker, size_t worker_id)
+    nixlUcxBackendReqH(
+        nixlUcxWorker *worker,
+        size_t worker_id,
+        std::shared_ptr<nixlUcxAttestationState> attestation = nullptr)
         : worker_(worker),
-          workerId_(worker_id) {}
+          workerId_(worker_id),
+          attestation_(attestation != nullptr ?
+                           std::move(attestation) :
+                           std::make_shared<nixlUcxAttestationState>(allocateHandleIdentity())) {}
+
+    [[nodiscard]] nixl_status_t
+    prepareAttestation(nixl_xfer_op_t operation,
+                       const nixl_meta_dlist_t &local,
+                       const nixl_meta_dlist_t &remote,
+                       const std::string &local_agent,
+                       const std::string &remote_agent) {
+        return attestation_->prepare(operation, local, remote, local_agent, remote_agent);
+    }
+
+    [[nodiscard]] nixl_status_t
+    beginSubmission() {
+        if (!requests_.empty() || notif.has_value()) {
+            return NIXL_ERR_REPOST_ACTIVE;
+        }
+        return attestation_->beginSubmission();
+    }
+
+    [[nodiscard]] nixl_status_t
+    recordSegment(size_t index,
+                  nixlUcxEp &ep,
+                  const std::vector<nixl_xfer_attestation_transport_t> &transports,
+                  const std::string &request_info) {
+        return attestation_->recordSegment(index,
+                                           workerId_,
+                                           ep.getWorkerIdentity(),
+                                           ep.getIdentity(),
+                                           transports,
+                                           request_info);
+    }
+
+    [[nodiscard]] nixl_status_t
+    recordFlush(nixlUcxEp &ep, nixl_status_t status) {
+        return attestation_->recordFlush(
+            workerId_, ep.getWorkerIdentity(), ep.getIdentity(), status);
+    }
+
+    [[nodiscard]] nixl_status_t
+    finishSubmission() {
+        return attestation_->finishSubmission();
+    }
+
+    [[nodiscard]] nixl_xfer_attestation_t
+    queryAttestation() const {
+        return attestation_->snapshot();
+    }
+
+    [[nodiscard]] nixl_status_t
+    takeCompletionAttestation(nixl_xfer_attestation_t &attestation) {
+        return attestation_->takeCompletion(attestation);
+    }
+
+    [[nodiscard]] const std::shared_ptr<nixlUcxAttestationState> &
+    getAttestationState() const noexcept {
+        return attestation_;
+    }
 
     void
     reserve(size_t size) {
@@ -86,17 +187,33 @@ public:
     }
 
     [[nodiscard]] nixl_status_t
-    append(nixl_status_t status, nixlUcxReq req, const ucx_connection_ptr_t &conn) {
+    append(nixl_status_t status,
+           nixlUcxReq req,
+           const ucx_connection_ptr_t &conn,
+           pending_kind_t kind = pending_kind_t::NOTIFICATION,
+           uint64_t endpoint_identity = 0) {
         switch (status) {
         case NIXL_IN_PROG:
-            requests_.push_back(req);
+            if (req == nullptr) {
+                if (kind != pending_kind_t::NOTIFICATION) {
+                    attestation_->fail(attestation_->getGeneration(),
+                                       NIXL_ERR_BACKEND,
+                                       "UCX returned an empty in-progress request");
+                }
+                return NIXL_ERR_BACKEND;
+            }
+            requests_.push_back(
+                {req, kind, endpoint_identity, attestation_->getGeneration()});
             connections_.insert(conn);
             break;
         case NIXL_SUCCESS:
             connections_.insert(conn);
             break;
         default:
-            // Error. Release all previously initiated ops and exit:
+            if (kind != pending_kind_t::NOTIFICATION) {
+                attestation_->fail(
+                    attestation_->getGeneration(), status, "UCX request submission failed");
+            }
             release();
             return status;
         }
@@ -115,15 +232,22 @@ public:
 
     virtual void
     release() {
-        // TODO: Error log: uncompleted requests found! Cancelling ...
-        for (nixlUcxReq req : requests_) {
-            const nixl_status_t ret = nixl::ucx::ucsToNixlStatus(ucp_request_check_status(req));
+        const bool has_transport_request =
+            std::any_of(requests_.begin(), requests_.end(), [](const auto &pending) {
+                return pending.kind != pending_kind_t::NOTIFICATION;
+            });
+        if (has_transport_request) {
+            attestation_->fail(
+                attestation_->getGeneration(), NIXL_ERR_CANCELED, "transfer request was released");
+        }
+
+        for (const auto &pending : requests_) {
+            const nixl_status_t ret =
+                nixl::ucx::ucsToNixlStatus(ucp_request_check_status(pending.request));
             if (ret == NIXL_IN_PROG) {
-                // TODO: Need process this properly.
-                // it may not be enough to cancel UCX request
-                worker_->reqCancel(req);
+                worker_->reqCancel(pending.request);
             }
-            worker_->reqRelease(req);
+            worker_->reqRelease(pending.request);
         }
         requests_.clear();
         connections_.clear();
@@ -132,8 +256,11 @@ public:
     [[nodiscard]] virtual nixl_status_t
     status() {
         if (requests_.empty()) {
-            /* No pending transmissions */
             connections_.clear();
+            const nixl_xfer_attestation_t attestation = attestation_->snapshot();
+            if (attestation.state == nixl_xfer_attestation_state_t::FAILED) {
+                return attestation.status;
+            }
             return NIXL_SUCCESS;
         }
 
@@ -141,36 +268,48 @@ public:
 
         /* If last request is incomplete, return NIXL_IN_PROG early without
          * checking other requests */
-        nixlUcxReq req = requests_.back();
-        const nixl_status_t ret = nixl::ucx::ucsToNixlStatus(ucp_request_check_status(req));
+        const pending_request_t &last = requests_.back();
+        const nixl_status_t ret =
+            nixl::ucx::ucsToNixlStatus(ucp_request_check_status(last.request));
         if (ret == NIXL_IN_PROG) {
             return NIXL_IN_PROG;
-        } else if (ret != NIXL_SUCCESS) {
-            return checkConnection(ret);
         }
 
-        /* Last request completed successfully, all the others must be in the
-         * same state. TODO: remove extra checks? */
         size_t incomplete_reqs = 0;
         nixl_status_t out_ret = NIXL_SUCCESS;
-        for (nixlUcxReq req : requests_) {
-            const nixl_status_t ret = nixl::ucx::ucsToNixlStatus(ucp_request_check_status(req));
+        for (const auto &pending : requests_) {
+            const nixl_status_t ret =
+                nixl::ucx::ucsToNixlStatus(ucp_request_check_status(pending.request));
             if (ret == NIXL_SUCCESS) [[likely]] {
-                worker_->reqRelease(req);
+                if (pending.kind == pending_kind_t::ENDPOINT_FLUSH) {
+                    attestation_->completeFlush(
+                        pending.generation, pending.endpointIdentity);
+                }
+                worker_->reqRelease(pending.request);
             } else if (ret == NIXL_IN_PROG) {
                 if (out_ret == NIXL_SUCCESS) {
                     out_ret = NIXL_IN_PROG;
                 }
-                requests_[incomplete_reqs++] = req;
+                requests_[incomplete_reqs++] = pending;
             } else {
-                // Any other ret value is ERR and will be returned
-                out_ret = checkConnection(ret);
+                if (pending.kind != pending_kind_t::NOTIFICATION) {
+                    attestation_->fail(
+                        pending.generation, ret, "UCX transfer request failed");
+                }
+                if (out_ret >= NIXL_SUCCESS) {
+                    out_ret = checkConnection(ret);
+                }
+                worker_->reqRelease(pending.request);
             }
         }
 
         requests_.resize(incomplete_reqs);
         if (requests_.empty()) {
             connections_.clear();
+        }
+        const nixl_xfer_attestation_t attestation = attestation_->snapshot();
+        if (attestation.state == nixl_xfer_attestation_state_t::FAILED) {
+            return attestation.status;
         }
         return out_ret;
     }
@@ -184,6 +323,10 @@ public:
     getWorkerId() const noexcept {
         return workerId_;
     }
+
+    friend class nixlUcxEngine;
+    friend class nixlUcxThreadPoolEngine;
+    friend class nixlUcxChunkBackendReqH;
 };
 
 /****************************************
@@ -412,10 +555,12 @@ public:
     void
     startXfer(const std::shared_ptr<nixlUcxBackendSharedState> &shared_state,
               nixlUcxWorker *worker,
-              size_t worker_id) {
+              size_t worker_id,
+              const std::shared_ptr<nixlUcxAttestationState> &attestation) {
         NIXL_ASSERT(sharedState_.get() == nullptr);
         sharedState_ = shared_state;
         setWorker(worker, worker_id);
+        setAttestationState(attestation);
     }
 
     void
@@ -514,7 +659,7 @@ public:
     [[nodiscard]] nixlUcxChunkBackendReqH *
     startChunk(size_t idx, nixlUcxWorker *worker, size_t worker_id) {
         nixlUcxChunkBackendReqH *chunk = &sharedState_->chunks[idx];
-        chunk->startXfer(sharedState_, worker, worker_id);
+        chunk->startXfer(sharedState_, worker, worker_id, getAttestationState());
         return chunk;
     }
 
@@ -693,6 +838,13 @@ nixlUcxThreadPoolEngine::prepXfer(const nixl_xfer_op_t &operation,
     size_t worker_id = getWorkerId();
     const auto comp_handle = new nixlUcxCompositeBackendReqH(
         getWorker(worker_id).get(), worker_id, chunk_size, num_chunks);
+    const nixl_status_t status =
+        prepareHandleAttestation(
+            comp_handle, operation, local, remote, remote_agent);
+    if (status != NIXL_SUCCESS) {
+        delete comp_handle;
+        return status;
+    }
     NIXL_TRACE << "created " << *comp_handle;
     handle = comp_handle;
     return NIXL_SUCCESS;
@@ -1087,9 +1239,28 @@ nixl_status_t nixlUcxEngine::prepXfer (const nixl_xfer_op_t &operation,
 
     const size_t worker_id = getWorkerId(opt_args);
     /* TODO: try to get from a pool first */
-    handle = new nixlUcxBackendReqH(getWorker(worker_id).get(), worker_id);
+    const auto int_handle = new nixlUcxBackendReqH(getWorker(worker_id).get(), worker_id);
+    const nixl_status_t status =
+        prepareHandleAttestation(
+            int_handle, operation, local, remote, remote_agent);
+    if (status != NIXL_SUCCESS) {
+        delete int_handle;
+        return status;
+    }
+    handle = int_handle;
 
     return NIXL_SUCCESS;
+}
+
+nixl_status_t
+nixlUcxEngine::prepareHandleAttestation(nixlBackendReqH *handle,
+                                        const nixl_xfer_op_t &operation,
+                                        const nixl_meta_dlist_t &local,
+                                        const nixl_meta_dlist_t &remote,
+                                        const std::string &remote_agent) const {
+    const auto int_handle = static_cast<nixlUcxBackendReqH *>(handle);
+    return int_handle->prepareAttestation(
+        operation, local, remote, localAgent, remote_agent);
 }
 
 nixl_status_t nixlUcxEngine::estimateXferCost (const nixl_xfer_op_t &operation,
@@ -1154,10 +1325,13 @@ nixlUcxEngine::sendXferRangeBatch(nixlUcxEp &ep,
                                   nixl_xfer_op_t operation,
                                   const nixl_meta_dlist_t &local,
                                   const nixl_meta_dlist_t &remote,
+                                  nixlBackendReqH *handle,
                                   size_t worker_id,
                                   size_t start_idx,
                                   size_t end_idx) {
     batchResult result = {NIXL_SUCCESS, 0, nullptr};
+    const auto int_handle = static_cast<nixlUcxBackendReqH *>(handle);
+    std::vector<nixl_xfer_attestation_transport_t> transports;
 
     for (size_t i = start_idx; i < end_idx; ++i) {
         void *laddr = (void *)local[i].addr;
@@ -1173,12 +1347,37 @@ nixlUcxEngine::sendXferRangeBatch(nixlUcxEp &ep,
         }
 
         ++result.size;
-        nixlUcxReq req;
+        nixlUcxReq req = nullptr;
+        std::string request_info;
         const nixl_status_t ret = operation == NIXL_READ ?
-            ep.read(raddr, rmd->getRkey(worker_id), laddr, lmd->mem, lsize, req) :
-            ep.write(laddr, lmd->mem, raddr, rmd->getRkey(worker_id), lsize, req);
+            ep.read(
+                raddr, rmd->getRkey(worker_id), laddr, lmd->mem, lsize, req, request_info) :
+            ep.write(
+                laddr, lmd->mem, raddr, rmd->getRkey(worker_id), lsize, req, request_info);
 
         if (ret == NIXL_IN_PROG) {
+            if (transports.empty()) {
+                result.status = ep.queryTransports(transports);
+                if (result.status != NIXL_SUCCESS) {
+                    ucp_request_free(req);
+                    if (result.req != nullptr) {
+                        ucp_request_free(result.req);
+                    }
+                    result.req = nullptr;
+                    break;
+                }
+            }
+            const nixl_status_t evidence_status =
+                int_handle->recordSegment(i, ep, transports, request_info);
+            if (evidence_status != NIXL_SUCCESS) {
+                ucp_request_free(req);
+                if (result.req != nullptr) {
+                    ucp_request_free(result.req);
+                }
+                result.status = evidence_status;
+                result.req = nullptr;
+                break;
+            }
             if (result.req != nullptr) [[likely]] {
                 ucp_request_free(result.req);
             }
@@ -1223,11 +1422,21 @@ nixlUcxEngine::sendXferRange(const nixl_xfer_op_t &operation,
         const auto rmd = static_cast<nixlUcxPublicMetadata *>(remote[i].metadataP);
         auto &ep = rmd->conn->getEp(worker_id);
         const batchResult result =
-            sendXferRangeBatch(*ep, operation, local, remote, worker_id, i, end_idx);
+            sendXferRangeBatch(
+                *ep, operation, local, remote, handle, worker_id, i, end_idx);
 
         /* Append a single pending request for the entire EP batch */
-        const nixl_status_t ret = int_handle->append(result.status, result.req, rmd->conn);
+        const nixl_status_t ret = int_handle->append(
+            result.status,
+            result.req,
+            rmd->conn,
+            nixlUcxBackendReqH::pending_kind_t::DATA,
+            ep->getIdentity());
         if (ret != NIXL_SUCCESS) {
+            int_handle->getAttestationState()->fail(
+                int_handle->getAttestationState()->getGeneration(),
+                ret,
+                "UCX data submission failed");
             return ret;
         }
 
@@ -1241,9 +1450,22 @@ nixlUcxEngine::sendXferRange(const nixl_xfer_op_t &operation,
      * is actually completed.
      */
     for (auto &conn : int_handle->getConnections()) {
-        nixlUcxReq req;
-        const nixl_status_t ret = conn->getEp(worker_id)->flushEp(req);
-        if (int_handle->append(ret, req, conn) != NIXL_SUCCESS) {
+        nixlUcxReq req = nullptr;
+        auto &ep = conn->getEp(worker_id);
+        const nixl_status_t ret = ep->flushEp(req);
+        const nixl_status_t evidence_status = int_handle->recordFlush(*ep, ret);
+        if (evidence_status != NIXL_SUCCESS) {
+            return evidence_status;
+        }
+        if (int_handle->append(ret,
+                               req,
+                               conn,
+                               nixlUcxBackendReqH::pending_kind_t::ENDPOINT_FLUSH,
+                               ep->getIdentity()) != NIXL_SUCCESS) {
+            int_handle->getAttestationState()->fail(
+                int_handle->getAttestationState()->getGeneration(),
+                ret,
+                "UCX endpoint flush submission failed");
             return ret;
         }
     }
@@ -1269,9 +1491,21 @@ nixlUcxEngine::postXfer(const nixl_xfer_op_t &operation,
         return NIXL_ERR_INVALID_PARAM;
     }
 
-    // TODO: assert that handle is empty/completed, as we can't post request before completion
+    ret = int_handle->beginSubmission();
+    if (ret != NIXL_SUCCESS) {
+        return ret;
+    }
 
     ret = sendXferRange(operation, local, remote, remote_agent, handle, 0, lcnt);
+    if (ret != NIXL_SUCCESS) {
+        int_handle->getAttestationState()->fail(
+            int_handle->getAttestationState()->getGeneration(),
+            ret,
+            "UCX transfer submission failed");
+        return ret;
+    }
+
+    ret = int_handle->finishSubmission();
     if (ret != NIXL_SUCCESS) {
         return ret;
     }
@@ -1328,6 +1562,28 @@ nixl_status_t nixlUcxEngine::checkXfer (nixlBackendReqH* handle) const
     }
 
     return int_handle->status();
+}
+
+nixl_status_t
+nixlUcxEngine::queryXferAttestation(const nixlBackendReqH *handle,
+                                    nixl_xfer_attestation_t &attestation) const {
+    if (handle == nullptr) {
+        return NIXL_ERR_INVALID_PARAM;
+    }
+    const auto int_handle = static_cast<const nixlUcxBackendReqH *>(handle);
+    attestation = int_handle->queryAttestation();
+    return NIXL_SUCCESS;
+}
+
+nixl_status_t
+nixlUcxEngine::takeXferCompletionAttestation(
+    nixlBackendReqH *handle,
+    nixl_xfer_attestation_t &attestation) const {
+    if (handle == nullptr) {
+        return NIXL_ERR_INVALID_PARAM;
+    }
+    const auto int_handle = static_cast<nixlUcxBackendReqH *>(handle);
+    return int_handle->takeCompletionAttestation(attestation);
 }
 
 nixl_status_t nixlUcxEngine::releaseReqH(nixlBackendReqH* handle) const

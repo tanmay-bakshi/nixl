@@ -323,6 +323,34 @@ class nixlAgent {
                           nixlBackendH* &backend) const;
 
         /**
+         * @brief Query transport evidence for the current generation of a transfer handle.
+         *
+         * This method is diagnostic. Use @ref takeXferCompletionAttestation when the
+         * attestation authorizes a lifecycle transition.
+         *
+         * @param req_hndl Transfer request handle obtained from makeXferReq/createXferReq
+         * @param attestation [out] Current handle-bound transport evidence
+         * @return nixl_status_t Error code if the backend cannot provide authoritative evidence
+         */
+        nixl_status_t
+        queryXferAttestation(const nixlXferReqH *req_hndl,
+                             nixl_xfer_attestation_t &attestation) const;
+
+        /**
+         * @brief Take the sealed remote-flush attestation for the current handle generation.
+         *
+         * A completion attestation can be taken once per generation. Reposting the handle
+         * creates a new generation and invalidates authority from every prior generation.
+         *
+         * @param req_hndl Transfer request handle obtained from makeXferReq/createXferReq
+         * @param attestation [out] Sealed handle-bound completion evidence
+         * @return nixl_status_t Error code if completion is unavailable or was already claimed
+         */
+        nixl_status_t
+        takeXferCompletionAttestation(const nixlXferReqH *req_hndl,
+                                      nixl_xfer_attestation_t &attestation) const;
+
+        /**
          * @brief  Release the transfer request `req_hndl`. If the transfer is active,
          *         it will be canceled, or return an error if the transfer cannot be aborted.
          *

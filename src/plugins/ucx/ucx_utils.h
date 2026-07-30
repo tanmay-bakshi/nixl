@@ -18,7 +18,9 @@
 #define NIXL_SRC_UTILS_UCX_UCX_UTILS_H
 
 #include <memory>
+#include <string>
 #include <type_traits>
+#include <vector>
 
 extern "C" {
 #include <ucp/api/ucp.h>
@@ -63,6 +65,9 @@ class nixlUcxEp {
 private:
     ucp_ep_h eph{nullptr};
     nixl::ucx::ep_state_t state = nixl::ucx::ep_state_t::UNINITIALIZED;
+    const uint64_t workerIdentity_;
+    const uint64_t identity_;
+    size_t requestInfoSize_ = 0;
 
     void
     setState(nixl::ucx::ep_state_t new_state);
@@ -85,7 +90,10 @@ public:
         return nixl::ucx::toNixlStatus(state);
     }
 
-    nixlUcxEp(ucp_worker_h worker, void *addr, ucp_err_handling_mode_t err_handling_mode);
+    nixlUcxEp(ucp_worker_h worker,
+              uint64_t worker_identity,
+              void *addr,
+              ucp_err_handling_mode_t err_handling_mode);
     ~nixlUcxEp();
     nixlUcxEp(const nixlUcxEp &) = delete;
     nixlUcxEp &
@@ -111,14 +119,18 @@ public:
          void *laddr,
          nixlUcxMem &mem,
          size_t size,
-         nixlUcxReq &req);
+         nixlUcxReq &req,
+         std::string &request_info);
     [[nodiscard]] nixl_status_t
     write(void *laddr,
           nixlUcxMem &mem,
           uint64_t raddr,
           const nixl::ucx::rkey &rkey,
           size_t size,
-          nixlUcxReq &req);
+          nixlUcxReq &req,
+          std::string &request_info);
+    [[nodiscard]] nixl_status_t
+    queryTransports(std::vector<nixl_xfer_attestation_transport_t> &transports) const;
     nixl_status_t
     estimateCost(size_t size,
                  std::chrono::microseconds &duration,
@@ -130,6 +142,16 @@ public:
     [[nodiscard]] ucp_ep_h
     getEp() const noexcept {
         return eph;
+    }
+
+    [[nodiscard]] uint64_t
+    getWorkerIdentity() const noexcept {
+        return workerIdentity_;
+    }
+
+    [[nodiscard]] uint64_t
+    getIdentity() const noexcept {
+        return identity_;
     }
 };
 
@@ -254,12 +276,18 @@ public:
         return worker.get();
     }
 
+    [[nodiscard]] uint64_t
+    getIdentity() const noexcept {
+        return identity_;
+    }
+
 private:
     [[nodiscard]] static ucp_worker *
     createUcpWorker(const nixlUcxContext &);
 
     const std::unique_ptr<ucp_worker, void (*)(ucp_worker *)> worker;
     ucp_err_handling_mode_t err_handling_mode_;
+    const uint64_t identity_;
 };
 
 [[nodiscard]] nixl_b_params_t
