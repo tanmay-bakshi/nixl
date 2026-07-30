@@ -28,6 +28,9 @@ logger = get_logger(__name__)
 
 DEFAULT_COMM_PORT = nixlBind.DEFAULT_COMM_PORT
 
+nixl_xfer_attestation_snapshot = nixlBind.nixlXferAttestationSnapshot
+nixl_xfer_completion_receipt = nixlBind.nixlXferCompletionReceipt
+
 
 """
 @brief Opaque handle wrapper for a prepared transfer descriptor list.
@@ -684,6 +687,42 @@ class nixl_agent:
             for backendS, backendH in self.backends.items()
             if backendH == b_handle
         )
+
+    def query_xfer_attestation(
+        self, handle: nixl_xfer_handle
+    ) -> nixl_xfer_attestation_snapshot:
+        """Query diagnostic transport evidence for a transfer generation.
+
+        :param handle: Transfer handle owned by this agent.
+        :returns: Read-only diagnostic snapshot. A snapshot never authorizes a
+            lifecycle transition.
+        """
+        self._validate_xfer_attestation_handle(handle)
+        return handle._agent.queryXferAttestation(handle._handle)
+
+    def take_xfer_completion_receipt(
+        self, handle: nixl_xfer_handle
+    ) -> nixl_xfer_completion_receipt | None:
+        """Take unique completion authority for a successful transfer generation.
+
+        :param handle: Transfer handle owned by this agent.
+        :returns: A read-only, take-once completion receipt, or ``None`` while
+            the whole transfer handle is still in progress.
+        """
+        self._validate_xfer_attestation_handle(handle)
+        return handle._agent.takeXferCompletionAttestation(handle._handle)
+
+    def _validate_xfer_attestation_handle(self, handle: nixl_xfer_handle) -> None:
+        """Validate ownership and lifetime before a native attestation call.
+
+        :param handle: Transfer handle to validate.
+        """
+        if not isinstance(handle, nixl_xfer_handle):
+            raise TypeError("handle must be a nixl_xfer_handle")
+        if handle._agent is not self.agent:
+            raise ValueError("transfer handle belongs to a different NIXL agent")
+        if handle._released:
+            raise ValueError("transfer handle has already been released")
 
     """
     @brief  Releases a transfer handle, which internally frees the memory used for the handle.

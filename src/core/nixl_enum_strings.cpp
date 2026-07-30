@@ -17,6 +17,7 @@
 
 #include "nixl_types.h"
 
+#include <cstdint>
 #include <string>
 
 namespace nixlEnumStrings {
@@ -85,3 +86,9 @@ statusStr(const nixl_status_t &status) {
 }
 
 } // namespace nixlEnumStrings
+
+extern "C" const void *
+nixl_status_str_identity_symbol() {
+    return reinterpret_cast<const void *>(
+        reinterpret_cast<uintptr_t>(&nixlEnumStrings::statusStr));
+}

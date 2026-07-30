@@ -15,11 +15,15 @@
  * limitations under the License.
  */
 
+#include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstdlib>
 #include <exception>
+#include <filesystem>
 #include <iostream>
 #include <memory>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -50,12 +54,46 @@ makeDescriptors(uintptr_t base, size_t count, size_t length) {
 
 std::unique_ptr<nixlUcxAttestationState>
 makeState(size_t count = 2) {
+    require(nixlEnumStrings::statusStr(NIXL_SUCCESS) == "NIXL_SUCCESS",
+            "libnixl status-string symbol is unavailable");
     auto state = std::make_unique<nixlUcxAttestationState>(41);
     const nixl_meta_dlist_t local = makeDescriptors(0x1000, count, 64);
     const nixl_meta_dlist_t remote = makeDescriptors(0x8000, count, 64);
     require(state->prepare(NIXL_WRITE, local, remote, "prefill", "decode") == NIXL_SUCCESS,
             "failed to prepare attestation state");
     return state;
+}
+
+void
+testRuntimeArtifactsIdentifyLoadedObjects() {
+    const auto state = makeState();
+    const nixl_xfer_attestation_t snapshot = state->snapshot();
+    require(snapshot.runtimeArtifacts.size() == 3,
+            "runtime identity did not cover every evidence interpreter");
+
+    std::set<std::string> components;
+    for (const auto &artifact : snapshot.runtimeArtifacts) {
+        components.insert(artifact.component);
+        require(!artifact.path.empty() && std::filesystem::path(artifact.path).is_absolute(),
+                "runtime artifact path is not absolute");
+
+        std::error_code path_error;
+        const std::filesystem::path canonical_path =
+            std::filesystem::canonical(artifact.path, path_error);
+        require(!path_error && canonical_path == artifact.path,
+                "runtime artifact path is not canonical");
+        require(!artifact.version.empty(), "runtime artifact version is empty");
+        require(!artifact.buildId.empty() && artifact.buildId.size() % 2 == 0,
+                "runtime artifact build ID is empty or malformed");
+        const bool build_id_is_hex =
+            std::all_of(artifact.buildId.begin(), artifact.buildId.end(), [](char value) {
+                return std::isxdigit(static_cast<unsigned char>(value)) != 0;
+            });
+        require(build_id_is_hex, "runtime artifact build ID is not hexadecimal");
+    }
+
+    require(components == std::set<std::string>({"libnixl", "libucp", "ucx-plugin"}),
+            "runtime identity components changed");
 }
 
 const std::vector<nixl_xfer_attestation_transport_t> transports = {
@@ -255,6 +293,14 @@ testStaleEventsPoisonCurrentGeneration() {
         const nixl_xfer_attestation_t snapshot = state->snapshot();
         require(snapshot.state == nixl_xfer_attestation_state_t::FAILED,
                 "stale completion did not fail the current generation");
+        require(snapshot.generation == completion.generation + 1,
+                "stale completion changed the reused generation");
+        require(snapshot.endpoints.empty(),
+                "stale completion injected endpoint state into the reused generation");
+        require(std::none_of(snapshot.segments.begin(),
+                             snapshot.segments.end(),
+                             [](const auto &segment) { return segment.posted; }),
+                "stale completion mutated segment state in the reused generation");
         require(snapshot.evidenceDigest.empty(),
                 "stale completion left successful evidence");
     }
@@ -271,6 +317,10 @@ testStaleEventsPoisonCurrentGeneration() {
         const nixl_xfer_attestation_t snapshot = state->snapshot();
         require(snapshot.state == nixl_xfer_attestation_state_t::FAILED,
                 "stale failure did not fail the current generation");
+        require(snapshot.generation == completion.generation + 1,
+                "stale failure changed the reused generation");
+        require(snapshot.endpoints.empty(),
+                "stale failure injected endpoint state into the reused generation");
         require(snapshot.error == "stale submission failure",
                 "stale failure was not distinguished");
     }
@@ -381,6 +431,7 @@ int
 main() {
     try {
         testUnsupportedBackendFailsClosed();
+        testRuntimeArtifactsIdentifyLoadedObjects();
         testFirstFailureIsPermanent();
         testTakeOnceAndGenerationRollover();
         testStaleEventsPoisonCurrentGeneration();

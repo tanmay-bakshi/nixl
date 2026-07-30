@@ -20,6 +20,8 @@ from ._api import (
     nixl_backend_handle,
     nixl_prepped_dlist_handle,
     nixl_thread_sync_t,
+    nixl_xfer_attestation_snapshot,
+    nixl_xfer_completion_receipt,
     nixl_xfer_handle,
 )
 
@@ -32,5 +34,7 @@ __all__ = [
     "nixl_backend_handle",
     "nixl_prepped_dlist_handle",
     "nixl_thread_sync_t",
+    "nixl_xfer_attestation_snapshot",
+    "nixl_xfer_completion_receipt",
     "nixl_xfer_handle",
 ]

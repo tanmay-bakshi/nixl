@@ -86,6 +86,7 @@ main() {
     nixlUcxMem mem[2];
     std::unique_ptr<nixl::ucx::rkey> rkey[2];
     nixlUcxReq req;
+    std::string request_info;
     uint8_t *buffer[2];
     uint8_t *chk_buffer;
     nixl_status_t ret;
@@ -133,7 +134,9 @@ main() {
 #endif
 
     // Write request
-    ret = ep[0]->write(buffer[0], mem[0], (uint64_t)buffer[1], *rkey[0], buf_size / 2, req);
+    ret = ep[0]->write(
+        buffer[0], mem[0], (uint64_t)buffer[1], *rkey[0], buf_size / 2, req, request_info);
+    assert(!request_info.empty());
     completeRequest(w, std::string("WRITE"), false, ret, req);
 
     // Flush to ensure that all data is in-place
@@ -170,7 +173,10 @@ main() {
 #endif
 
     // Read request
-    ret = ep[0]->read((uint64_t)buffer[1], *rkey[0], buffer[0], mem[0], buf_size, req);
+    request_info.clear();
+    ret = ep[0]->read(
+        (uint64_t)buffer[1], *rkey[0], buffer[0], mem[0], buf_size, req, request_info);
+    assert(!request_info.empty());
     completeRequest(w, std::string("READ"), false, ret, req);
 
     // Flush to ensure that all data is in-place

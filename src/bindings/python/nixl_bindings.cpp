@@ -90,6 +90,89 @@ public:
     nixlNoTelemetryError(const char *what) : runtime_error(what) {}
 };
 
+class nixlXferAttestationSnapshot {
+public:
+    explicit nixlXferAttestationSnapshot(nixl_xfer_attestation_t attestation)
+        : attestation_(std::move(attestation)) {}
+
+    [[nodiscard]] const nixl_xfer_attestation_t &
+    get() const noexcept {
+        return attestation_;
+    }
+
+private:
+    nixl_xfer_attestation_t attestation_;
+};
+
+class nixlXferCompletionReceipt {
+public:
+    explicit nixlXferCompletionReceipt(nixl_xfer_attestation_t attestation)
+        : attestation_(std::move(attestation)) {}
+
+    [[nodiscard]] const nixl_xfer_attestation_t &
+    get() const noexcept {
+        return attestation_;
+    }
+
+private:
+    nixl_xfer_attestation_t attestation_;
+};
+
+template<typename T>
+py::tuple
+immutableTuple(const std::vector<T> &values) {
+    py::tuple result(values.size());
+    for (size_t index = 0; index < values.size(); ++index) {
+        result[index] = py::cast(values[index]);
+    }
+    return result;
+}
+
+template<typename T>
+void
+bindAttestationView(py::class_<T> &binding) {
+    binding
+        .def_property_readonly(
+            "handleIdentity", [](const T &value) { return value.get().handleIdentity; })
+        .def_property_readonly(
+            "generation", [](const T &value) { return value.get().generation; })
+        .def_property_readonly(
+            "state", [](const T &value) { return value.get().state; })
+        .def_property_readonly(
+            "status", [](const T &value) { return value.get().status; })
+        .def_property_readonly(
+            "submissionSealed", [](const T &value) { return value.get().submissionSealed; })
+        .def_property_readonly(
+            "completionClaimed", [](const T &value) { return value.get().completionClaimed; })
+        .def_property_readonly(
+            "backend", [](const T &value) { return value.get().backend; })
+        .def_property_readonly(
+            "localAgent", [](const T &value) { return value.get().localAgent; })
+        .def_property_readonly(
+            "remoteAgent", [](const T &value) { return value.get().remoteAgent; })
+        .def_property_readonly(
+            "operation", [](const T &value) { return value.get().operation; })
+        .def_property_readonly(
+            "localMemoryType", [](const T &value) { return value.get().localMemoryType; })
+        .def_property_readonly(
+            "remoteMemoryType", [](const T &value) { return value.get().remoteMemoryType; })
+        .def_property_readonly(
+            "segments",
+            [](const T &value) { return immutableTuple(value.get().segments); })
+        .def_property_readonly(
+            "endpoints",
+            [](const T &value) { return immutableTuple(value.get().endpoints); })
+        .def_property_readonly(
+            "runtimeArtifacts",
+            [](const T &value) { return immutableTuple(value.get().runtimeArtifacts); })
+        .def_property_readonly(
+            "descriptorDigest", [](const T &value) { return value.get().descriptorDigest; })
+        .def_property_readonly(
+            "evidenceDigest", [](const T &value) { return value.get().evidenceDigest; })
+        .def_property_readonly(
+            "error", [](const T &value) { return value.get().error; });
+}
+
 void
 throw_nixl_exception(const nixl_status_t &status) {
     switch (status) {
@@ -185,6 +268,22 @@ PYBIND11_MODULE(_bindings, m) {
         .value("NIXL_ERR_REPOST_ACTIVE", NIXL_ERR_REPOST_ACTIVE)
         .value("NIXL_ERR_UNKNOWN", NIXL_ERR_UNKNOWN)
         .value("NIXL_ERR_NOT_SUPPORTED", NIXL_ERR_NOT_SUPPORTED)
+        .value("NIXL_ERR_REMOTE_DISCONNECT", NIXL_ERR_REMOTE_DISCONNECT)
+        .value("NIXL_ERR_CANCELED", NIXL_ERR_CANCELED)
+        .value("NIXL_ERR_NO_TELEMETRY", NIXL_ERR_NO_TELEMETRY)
+        .export_values();
+
+    py::enum_<nixl_xfer_attestation_state_t>(m, "nixl_xfer_attestation_state_t")
+        .value("NIXL_XFER_ATTESTATION_PREPARED",
+               nixl_xfer_attestation_state_t::PREPARED)
+        .value("NIXL_XFER_ATTESTATION_POSTING",
+               nixl_xfer_attestation_state_t::POSTING)
+        .value("NIXL_XFER_ATTESTATION_IN_PROGRESS",
+               nixl_xfer_attestation_state_t::IN_PROGRESS)
+        .value("NIXL_XFER_ATTESTATION_REMOTE_FLUSHED",
+               nixl_xfer_attestation_state_t::REMOTE_FLUSHED)
+        .value("NIXL_XFER_ATTESTATION_FAILED",
+               nixl_xfer_attestation_state_t::FAILED)
         .export_values();
 
     py::class_<nixl_xfer_telem_t>(m, "nixlXferTelemetry")
@@ -201,6 +300,54 @@ PYBIND11_MODULE(_bindings, m) {
                                [](const nixl_xfer_telem_t &t) { return t.xferDuration.count(); })
         .def_readonly("totalBytes", &nixl_xfer_telem_t::totalBytes)
         .def_readonly("descCount", &nixl_xfer_telem_t::descCount);
+
+    py::class_<nixl_xfer_attestation_transport_t>(m, "nixlXferAttestationTransport")
+        .def_readonly("transport", &nixl_xfer_attestation_transport_t::transport)
+        .def_readonly("device", &nixl_xfer_attestation_transport_t::device);
+
+    py::class_<nixl_xfer_attestation_segment_t>(m, "nixlXferAttestationSegment")
+        .def_readonly("index", &nixl_xfer_attestation_segment_t::index)
+        .def_readonly("localAddress", &nixl_xfer_attestation_segment_t::localAddress)
+        .def_readonly("remoteAddress", &nixl_xfer_attestation_segment_t::remoteAddress)
+        .def_readonly("localDeviceId", &nixl_xfer_attestation_segment_t::localDeviceId)
+        .def_readonly("remoteDeviceId", &nixl_xfer_attestation_segment_t::remoteDeviceId)
+        .def_readonly("length", &nixl_xfer_attestation_segment_t::length)
+        .def_readonly("workerId", &nixl_xfer_attestation_segment_t::workerId)
+        .def_readonly("workerIdentity", &nixl_xfer_attestation_segment_t::workerIdentity)
+        .def_readonly("endpointIdentity", &nixl_xfer_attestation_segment_t::endpointIdentity)
+        .def_readonly("requestInfo", &nixl_xfer_attestation_segment_t::requestInfo)
+        .def_readonly("posted", &nixl_xfer_attestation_segment_t::posted);
+
+    py::class_<nixl_xfer_attestation_endpoint_t>(m, "nixlXferAttestationEndpoint")
+        .def_readonly("workerId", &nixl_xfer_attestation_endpoint_t::workerId)
+        .def_readonly("workerIdentity", &nixl_xfer_attestation_endpoint_t::workerIdentity)
+        .def_readonly("endpointIdentity", &nixl_xfer_attestation_endpoint_t::endpointIdentity)
+        .def_property_readonly(
+            "segmentIndices",
+            [](const nixl_xfer_attestation_endpoint_t &value) {
+                return immutableTuple(value.segmentIndices);
+            })
+        .def_property_readonly(
+            "transports",
+            [](const nixl_xfer_attestation_endpoint_t &value) {
+                return immutableTuple(value.transports);
+            })
+        .def_readonly("flushPosted", &nixl_xfer_attestation_endpoint_t::flushPosted)
+        .def_readonly("remoteFlushed", &nixl_xfer_attestation_endpoint_t::remoteFlushed);
+
+    py::class_<nixl_runtime_artifact_t>(m, "nixlRuntimeArtifact")
+        .def_readonly("component", &nixl_runtime_artifact_t::component)
+        .def_readonly("path", &nixl_runtime_artifact_t::path)
+        .def_readonly("buildId", &nixl_runtime_artifact_t::buildId)
+        .def_readonly("version", &nixl_runtime_artifact_t::version);
+
+    py::class_<nixlXferAttestationSnapshot> attestation_snapshot(
+        m, "nixlXferAttestationSnapshot");
+    bindAttestationView(attestation_snapshot);
+
+    py::class_<nixlXferCompletionReceipt> completion_receipt(
+        m, "nixlXferCompletionReceipt");
+    bindAttestationView(completion_receipt);
 
 
     py::register_exception<nixlNotPostedError>(m, "nixlNotPostedError");
@@ -735,6 +882,33 @@ PYBIND11_MODULE(_bindings, m) {
                  nixlBackendH *backend = nullptr;
                  throw_nixl_exception(agent.queryXferBackend((nixlXferReqH *)reqh, backend));
                  return (uintptr_t)backend;
+             })
+        .def("queryXferAttestation",
+             [](nixlAgent &agent, uintptr_t reqh) -> nixlXferAttestationSnapshot {
+                 nixl_xfer_attestation_t attestation;
+                 nixl_status_t status;
+                 {
+                     py::gil_scoped_release release;
+                     status = agent.queryXferAttestation(
+                         reinterpret_cast<const nixlXferReqH *>(reqh), attestation);
+                 }
+                 throw_nixl_exception(status);
+                 return nixlXferAttestationSnapshot(std::move(attestation));
+             })
+        .def("takeXferCompletionAttestation",
+             [](nixlAgent &agent, uintptr_t reqh) -> py::object {
+                 nixl_xfer_attestation_t attestation;
+                 nixl_status_t status;
+                 {
+                     py::gil_scoped_release release;
+                     status = agent.takeXferCompletionAttestation(
+                         reinterpret_cast<const nixlXferReqH *>(reqh), attestation);
+                 }
+                 if (status == NIXL_IN_PROG) {
+                     return py::none();
+                 }
+                 throw_nixl_exception(status);
+                 return py::cast(nixlXferCompletionReceipt(std::move(attestation)));
              })
         .def("releaseXferReq",
              [](nixlAgent &agent, uintptr_t reqh) -> nixl_status_t {

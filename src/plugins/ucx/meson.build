@@ -28,6 +28,12 @@ ucx_backend_sources = ['config.cpp',
 
 openssl_dep = dependency('openssl', modules: ['libcrypto'], required: true)
 
+ucx_plugin_version = '0.1.0'
+ucx_backend_cpp_args = [
+    '-DNIXL_VERSION="' + meson.project_version() + '"',
+    '-DNIXL_UCX_PLUGIN_VERSION="' + ucx_plugin_version + '"',
+]
+
 ucx_backend_dependencies = [asio_dep,
                             nixl_common_dep,
                             nixl_infra,
@@ -44,6 +50,7 @@ if 'UCX' in static_plugins
                ucx_backend_sources,
                dependencies: ucx_backend_dependencies,
                include_directories: ucx_backend_include_directories,
+               cpp_args: ucx_backend_cpp_args,
                install: false,
                name_prefix: 'libplugin_')  # Custom prefix for plugin libraries
 else
@@ -52,7 +59,7 @@ else
                dependencies: ucx_backend_dependencies,
                include_directories: ucx_backend_include_directories,
                install: true,
-               cpp_args : ['-fPIC'],
+               cpp_args: ucx_backend_cpp_args + ['-fPIC'],
                name_prefix: 'libplugin_',  # Custom prefix for plugin libraries
                install_dir: plugin_install_dir,
                build_rpath: get_option('ucx_path') != '' ? get_option('ucx_path') + '/lib' : '',

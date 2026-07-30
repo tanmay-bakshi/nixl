@@ -1205,11 +1205,12 @@ nixlAgent::takeXferCompletionAttestation(const nixlXferReqH *req_hndl,
     if (req_hndl == nullptr) {
         return NIXL_ERR_INVALID_PARAM;
     }
+
+    NIXL_SHARED_LOCK_GUARD(data->lock);
     if (req_hndl->status != NIXL_SUCCESS) {
         return req_hndl->status;
     }
 
-    NIXL_SHARED_LOCK_GUARD(data->lock);
     nixl_status_t status =
         req_hndl->engine->takeXferCompletionAttestation(
             req_hndl->backendHandle, attestation);
