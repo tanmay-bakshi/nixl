@@ -316,22 +316,24 @@ PYBIND11_MODULE(_bindings, m) {
         .def_readonly("workerIdentity", &nixl_xfer_attestation_segment_t::workerIdentity)
         .def_readonly("endpointIdentity", &nixl_xfer_attestation_segment_t::endpointIdentity)
         .def_readonly("requestInfo", &nixl_xfer_attestation_segment_t::requestInfo)
+        .def_property_readonly("selectedTransports",
+                               [](const nixl_xfer_attestation_segment_t &value) {
+                                   return immutableTuple(value.selectedTransports);
+                               })
         .def_readonly("posted", &nixl_xfer_attestation_segment_t::posted);
 
     py::class_<nixl_xfer_attestation_endpoint_t>(m, "nixlXferAttestationEndpoint")
         .def_readonly("workerId", &nixl_xfer_attestation_endpoint_t::workerId)
         .def_readonly("workerIdentity", &nixl_xfer_attestation_endpoint_t::workerIdentity)
         .def_readonly("endpointIdentity", &nixl_xfer_attestation_endpoint_t::endpointIdentity)
-        .def_property_readonly(
-            "segmentIndices",
-            [](const nixl_xfer_attestation_endpoint_t &value) {
-                return immutableTuple(value.segmentIndices);
-            })
-        .def_property_readonly(
-            "transports",
-            [](const nixl_xfer_attestation_endpoint_t &value) {
-                return immutableTuple(value.transports);
-            })
+        .def_property_readonly("segmentIndices",
+                               [](const nixl_xfer_attestation_endpoint_t &value) {
+                                   return immutableTuple(value.segmentIndices);
+                               })
+        .def_property_readonly("transports",
+                               [](const nixl_xfer_attestation_endpoint_t &value) {
+                                   return immutableTuple(value.transports);
+                               })
         .def_readonly("flushPosted", &nixl_xfer_attestation_endpoint_t::flushPosted)
         .def_readonly("remoteFlushed", &nixl_xfer_attestation_endpoint_t::remoteFlushed);
 

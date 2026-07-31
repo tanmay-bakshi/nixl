@@ -60,7 +60,8 @@ public:
                   size_t worker_id,
                   uint64_t worker_identity,
                   uint64_t endpoint_identity,
-                  const std::vector<nixl_xfer_attestation_transport_t> &transports,
+                  const std::vector<nixl_xfer_attestation_transport_t> &endpoint_transports,
+                  const std::vector<nixl_xfer_attestation_transport_t> &selected_transports,
                   const std::string &request_info);
 
     [[nodiscard]] nixl_status_t

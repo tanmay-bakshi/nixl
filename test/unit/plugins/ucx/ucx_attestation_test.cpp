@@ -126,6 +126,87 @@ testTransportModuleRequirements() {
 }
 
 void
+testStructuredSelectedTransportsAreCanonicalAndBoundToEndpoint() {
+    const std::vector<nixl_xfer_attestation_transport_t> endpoint_transports = {
+        {.transport = "tcp", .device = "lo"},
+        {.transport = "rc_mlx5", .device = "mlx5_0:1"},
+        {.transport = "cuda_ipc", .device = "cuda"},
+        {.transport = "cuda_ipc", .device = "cuda"},
+    };
+    const std::vector<nixl_xfer_attestation_transport_t> expected = {
+        {.transport = "cuda_ipc", .device = "cuda"},
+        {.transport = "rc_mlx5", .device = "mlx5_0:1"},
+    };
+    const std::vector<nixl_xfer_attestation_transport_t> selected_transports = {
+        {.transport = "rc_mlx5", .device = "mlx5_0:1"},
+        {.transport = "cuda_ipc", .device = "cuda"},
+        {.transport = "cuda_ipc", .device = "cuda"},
+    };
+
+    auto state = makeState(1);
+    require(state->beginSubmission() == NIXL_SUCCESS, "submission did not begin");
+    const std::string contradictory_request_info =
+        "{proto|init} diagnostic claims tcp/lo";
+    require(state->recordSegment(0,
+                                 0,
+                                 101,
+                                 201,
+                                 endpoint_transports,
+                                 selected_transports,
+                                 contradictory_request_info) == NIXL_SUCCESS,
+            "structured selected resources were rejected");
+    const nixl_xfer_attestation_t snapshot = state->snapshot();
+    require(snapshot.segments[0].selectedTransports == expected,
+            "selected resources are not canonical and unique");
+    require(snapshot.segments[0].requestInfo == contradictory_request_info,
+            "diagnostic request information was not retained verbatim");
+    require(snapshot.endpoints[0].transports ==
+                std::vector<nixl_xfer_attestation_transport_t>({
+                    {.transport = "cuda_ipc", .device = "cuda"},
+                    {.transport = "rc_mlx5", .device = "mlx5_0:1"},
+                    {.transport = "tcp", .device = "lo"},
+                }),
+            "endpoint resources are not canonical and unique");
+
+    auto wrong_device_state = makeState(1);
+    require(wrong_device_state->beginSubmission() == NIXL_SUCCESS,
+            "wrong-device submission did not begin");
+    require(
+        wrong_device_state->recordSegment(
+            0,
+            0,
+            101,
+            201,
+            endpoint_transports,
+            {{.transport = "cuda_ipc", .device = "forged"}},
+            "diagnostic claims cuda_ipc/cuda") == NIXL_ERR_BACKEND,
+        "selected resource with a forged device was accepted");
+
+    const std::vector<nixl_xfer_attestation_transport_t> incomplete_context = {
+        {.transport = "cuda_ipc", .device = ""},
+    };
+    auto incomplete_state = makeState(1);
+    require(incomplete_state->beginSubmission() == NIXL_SUCCESS,
+            "incomplete-context submission did not begin");
+    require(incomplete_state->recordSegment(
+                0,
+                0,
+                101,
+                201,
+                incomplete_context,
+                {{.transport = "cuda_ipc", .device = "cuda"}},
+                "") == NIXL_ERR_BACKEND,
+            "incomplete endpoint resource context was accepted");
+
+    auto empty_selected_state = makeState(1);
+    require(empty_selected_state->beginSubmission() == NIXL_SUCCESS,
+            "empty-selection submission did not begin");
+    require(empty_selected_state->recordSegment(
+                0, 0, 101, 201, endpoint_transports, {}, "") == NIXL_ERR_BACKEND,
+            "empty selected-resource evidence was accepted");
+}
+
+void
 testLoadedArtifactPathsAreLoadTimeAbsolute() {
     std::string canonical_path = "stale";
     std::string error;
@@ -179,6 +260,9 @@ testRuntimeArtifactsIdentifyLoadedObjects() {
 
 const std::vector<nixl_xfer_attestation_transport_t> transports = {
     {.transport = "self", .device = "memory"},
+    {.transport = "tcp", .device = "eth0"},
+};
+const std::vector<nixl_xfer_attestation_transport_t> selected_transports = {
     {.transport = "tcp", .device = "eth0"},
 };
 
@@ -306,22 +390,29 @@ void
 postImmediateCompletion(nixlUcxAttestationState &state,
                         uint64_t worker_identity,
                         uint64_t endpoint_identity) {
-    require(state.recordSegment(0,
-                                0,
-                                worker_identity,
-                                endpoint_identity,
-                                transports,
-                                "segment-0 protocol") == NIXL_SUCCESS,
-            "first segment evidence was rejected");
-    require(state.recordSegment(1,
-                                0,
-                                worker_identity,
-                                endpoint_identity,
-                                transports,
-                                "segment-1 protocol") == NIXL_SUCCESS,
-            "second segment evidence was rejected");
-    require(state.recordFlush(
-                0, worker_identity, endpoint_identity, NIXL_SUCCESS) == NIXL_SUCCESS,
+    require(
+        state.recordSegment(
+            0,
+            0,
+            worker_identity,
+            endpoint_identity,
+            transports,
+            selected_transports,
+            "segment-0 protocol tcp/eth0") ==
+            NIXL_SUCCESS,
+        "first segment evidence was rejected");
+    require(
+        state.recordSegment(
+            1,
+            0,
+            worker_identity,
+            endpoint_identity,
+            transports,
+            selected_transports,
+            "segment-1 protocol tcp/eth0") ==
+            NIXL_SUCCESS,
+        "second segment evidence was rejected");
+    require(state.recordFlush(0, worker_identity, endpoint_identity, NIXL_SUCCESS) == NIXL_SUCCESS,
             "immediate endpoint flush was rejected");
     require(state.finishSubmission() == NIXL_SUCCESS, "submission did not seal");
 }
@@ -420,16 +511,20 @@ testExactSegmentsAndAllFlushesBindCompletion() {
     require(state->beginSubmission() == NIXL_SUCCESS, "submission did not begin");
 
     require(state->recordSegment(
-                0, 0, 101, 201, transports, "segment-0 protocol") == NIXL_SUCCESS,
+                0, 0, 101, 201, transports, selected_transports, "segment-0 protocol tcp/eth0") ==
+                NIXL_SUCCESS,
             "segment 0 evidence was rejected");
     require(state->recordSegment(
-                1, 0, 101, 201, transports, "segment-1 protocol") == NIXL_SUCCESS,
+                1, 0, 101, 201, transports, selected_transports, "segment-1 protocol tcp/eth0") ==
+                NIXL_SUCCESS,
             "segment 1 evidence was rejected");
     require(state->recordSegment(
-                2, 1, 102, 202, transports, "segment-2 protocol") == NIXL_SUCCESS,
+                2, 1, 102, 202, transports, selected_transports, "segment-2 protocol tcp/eth0") ==
+                NIXL_SUCCESS,
             "segment 2 evidence was rejected");
     require(state->recordSegment(
-                3, 1, 102, 202, transports, "segment-3 protocol") == NIXL_SUCCESS,
+                3, 1, 102, 202, transports, selected_transports, "segment-3 protocol tcp/eth0") ==
+                NIXL_SUCCESS,
             "segment 3 evidence was rejected");
     require(state->recordFlush(0, 101, 201, NIXL_IN_PROG) == NIXL_SUCCESS,
             "first endpoint flush was rejected");
@@ -456,9 +551,13 @@ testExactSegmentsAndAllFlushesBindCompletion() {
     require(completion.endpoints[1].segmentIndices == std::vector<size_t>({2, 3}),
             "second endpoint segment binding changed");
     for (size_t index = 0; index < completion.segments.size(); ++index) {
-        require(completion.segments[index].index == index,
-                "segment order changed");
+        require(completion.segments[index].index == index, "segment order changed");
         require(completion.segments[index].posted, "segment was not marked posted");
+        require(completion.segments[index].selectedTransports ==
+                    std::vector<nixl_xfer_attestation_transport_t>({
+                        {.transport = "tcp", .device = "eth0"},
+                    }),
+                "segment selected-resource evidence changed");
     }
 }
 
@@ -481,9 +580,10 @@ testCompositePostingSealsOnlyAfterBarrier() {
                                      worker_identity,
                                      endpoint_identity,
                                      transports,
-                                     "chunk protocol " + std::to_string(index));
-            flush_statuses[index] = state->recordFlush(
-                index, worker_identity, endpoint_identity, NIXL_SUCCESS);
+                                     selected_transports,
+                                     "chunk protocol " + std::to_string(index) + " tcp/eth0");
+            flush_statuses[index] =
+                state->recordFlush(index, worker_identity, endpoint_identity, NIXL_SUCCESS);
         });
     }
     for (auto &thread : threads) {
@@ -520,6 +620,7 @@ main() {
     try {
         testUnsupportedBackendFailsClosed();
         testTransportModuleRequirements();
+        testStructuredSelectedTransportsAreCanonicalAndBoundToEndpoint();
         testLoadedArtifactPathsAreLoadTimeAbsolute();
         testRuntimeArtifactsIdentifyLoadedObjects();
         testFirstFailureIsPermanent();

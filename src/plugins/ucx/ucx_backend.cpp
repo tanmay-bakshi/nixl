@@ -144,13 +144,15 @@ public:
     [[nodiscard]] nixl_status_t
     recordSegment(size_t index,
                   nixlUcxEp &ep,
-                  const std::vector<nixl_xfer_attestation_transport_t> &transports,
+                  const std::vector<nixl_xfer_attestation_transport_t> &endpoint_transports,
+                  const std::vector<nixl_xfer_attestation_transport_t> &selected_transports,
                   const std::string &request_info) {
         return attestation_->recordSegment(index,
                                            workerId_,
                                            ep.getWorkerIdentity(),
                                            ep.getIdentity(),
-                                           transports,
+                                           endpoint_transports,
+                                           selected_transports,
                                            request_info);
     }
 
@@ -1331,7 +1333,7 @@ nixlUcxEngine::sendXferRangeBatch(nixlUcxEp &ep,
                                   size_t end_idx) {
     batchResult result = {NIXL_SUCCESS, 0, nullptr};
     const auto int_handle = static_cast<nixlUcxBackendReqH *>(handle);
-    std::vector<nixl_xfer_attestation_transport_t> transports;
+    std::vector<nixl_xfer_attestation_transport_t> endpoint_transports;
 
     for (size_t i = start_idx; i < end_idx; ++i) {
         void *laddr = (void *)local[i].addr;
@@ -1349,15 +1351,28 @@ nixlUcxEngine::sendXferRangeBatch(nixlUcxEp &ep,
         ++result.size;
         nixlUcxReq req = nullptr;
         std::string request_info;
+        std::vector<nixl_xfer_attestation_transport_t> selected_transports;
         const nixl_status_t ret = operation == NIXL_READ ?
-            ep.read(
-                raddr, rmd->getRkey(worker_id), laddr, lmd->mem, lsize, req, request_info) :
-            ep.write(
-                laddr, lmd->mem, raddr, rmd->getRkey(worker_id), lsize, req, request_info);
+            ep.read(raddr,
+                    rmd->getRkey(worker_id),
+                    laddr,
+                    lmd->mem,
+                    lsize,
+                    req,
+                    request_info,
+                    selected_transports) :
+            ep.write(laddr,
+                     lmd->mem,
+                     raddr,
+                     rmd->getRkey(worker_id),
+                     lsize,
+                     req,
+                     request_info,
+                     selected_transports);
 
         if (ret == NIXL_IN_PROG) {
-            if (transports.empty()) {
-                result.status = ep.queryTransports(transports);
+            if (endpoint_transports.empty()) {
+                result.status = ep.queryTransports(endpoint_transports);
                 if (result.status != NIXL_SUCCESS) {
                     ucp_request_free(req);
                     if (result.req != nullptr) {
@@ -1367,8 +1382,8 @@ nixlUcxEngine::sendXferRangeBatch(nixlUcxEp &ep,
                     break;
                 }
             }
-            const nixl_status_t evidence_status =
-                int_handle->recordSegment(i, ep, transports, request_info);
+            const nixl_status_t evidence_status = int_handle->recordSegment(
+                i, ep, endpoint_transports, selected_transports, request_info);
             if (evidence_status != NIXL_SUCCESS) {
                 ucp_request_free(req);
                 if (result.req != nullptr) {

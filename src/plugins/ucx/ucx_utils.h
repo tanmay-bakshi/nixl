@@ -120,7 +120,8 @@ public:
          nixlUcxMem &mem,
          size_t size,
          nixlUcxReq &req,
-         std::string &request_info);
+         std::string &request_info,
+         std::vector<nixl_xfer_attestation_transport_t> &selected_transports);
     [[nodiscard]] nixl_status_t
     write(void *laddr,
           nixlUcxMem &mem,
@@ -128,7 +129,8 @@ public:
           const nixl::ucx::rkey &rkey,
           size_t size,
           nixlUcxReq &req,
-          std::string &request_info);
+          std::string &request_info,
+          std::vector<nixl_xfer_attestation_transport_t> &selected_transports);
     [[nodiscard]] nixl_status_t
     queryTransports(std::vector<nixl_xfer_attestation_transport_t> &transports) const;
     nixl_status_t

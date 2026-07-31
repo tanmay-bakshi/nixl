@@ -29,6 +29,7 @@ logger = get_logger(__name__)
 DEFAULT_COMM_PORT = nixlBind.DEFAULT_COMM_PORT
 
 nixl_xfer_attestation_snapshot = nixlBind.nixlXferAttestationSnapshot
+nixl_xfer_attestation_transport = nixlBind.nixlXferAttestationTransport
 nixl_xfer_completion_receipt = nixlBind.nixlXferCompletionReceipt
 
 
@@ -699,6 +700,28 @@ class nixl_agent:
         """
         self._validate_xfer_attestation_handle(handle)
         return handle._agent.queryXferAttestation(handle._handle)
+
+    def query_xfer_ucp_transports(
+        self, handle: nixl_xfer_handle
+    ) -> tuple[nixl_xfer_attestation_transport, ...]:
+        """Query selected UCP data resources observed for a transfer generation.
+
+        :param handle: Transfer handle owned by this agent.
+        :returns: Canonical union of handle-bound selected transport and device
+            pairs. The tuple is empty until the backend has posted segment
+            evidence.
+        """
+        snapshot = self.query_xfer_attestation(handle)
+        selected_by_resource: dict[
+            tuple[str, str], nixl_xfer_attestation_transport
+        ] = {}
+        for segment in snapshot.segments:
+            for transport in segment.selectedTransports:
+                resource = (transport.transport, transport.device)
+                selected_by_resource[resource] = transport
+        return tuple(
+            selected_by_resource[resource] for resource in sorted(selected_by_resource)
+        )
 
     def take_xfer_completion_receipt(
         self, handle: nixl_xfer_handle

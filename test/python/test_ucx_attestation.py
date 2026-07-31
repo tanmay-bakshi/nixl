@@ -11,6 +11,7 @@ import pytest
 
 import nixl._bindings as bindings
 import nixl._utils as utils
+from nixl import nixl_xfer_attestation_transport
 from nixl._api import nixl_agent, nixl_agent_config, nixl_xfer_handle
 
 
@@ -65,7 +66,11 @@ def _assert_non_constructible_and_read_only(
     with pytest.raises(AttributeError):
         snapshot.segments[0].posted = False
     with pytest.raises(AttributeError):
+        snapshot.segments[0].selectedTransports = ()
+    with pytest.raises(AttributeError):
         snapshot.endpoints[0].remoteFlushed = False
+    with pytest.raises(AttributeError):
+        snapshot.segments[0].selectedTransports[0].device = "forged"
     with pytest.raises(AttributeError):
         snapshot.endpoints[0].transports[0].device = "forged"
     with pytest.raises(AttributeError):
@@ -189,6 +194,25 @@ def test_completion_receipt_waits_for_notification_terminal_status() -> None:
         assert receipt.generation == pending_snapshot.generation
         assert receipt.descriptorDigest == pending_snapshot.descriptorDigest
         assert receipt.evidenceDigest == pending_snapshot.evidenceDigest
+        selected_transports = initiator.query_xfer_ucp_transports(handle)
+        assert nixl_xfer_attestation_transport is bindings.nixlXferAttestationTransport
+        selected_resources = tuple(
+            (transport.transport, transport.device) for transport in selected_transports
+        )
+        assert len(selected_resources) > 0
+        assert selected_resources == tuple(sorted(set(selected_resources)))
+        segment_resources = {
+            (transport.transport, transport.device)
+            for segment in receipt.segments
+            for transport in segment.selectedTransports
+        }
+        endpoint_resources = {
+            (transport.transport, transport.device)
+            for endpoint in receipt.endpoints
+            for transport in endpoint.transports
+        }
+        assert selected_resources == tuple(sorted(segment_resources))
+        assert segment_resources.issubset(endpoint_resources)
         expected_components = _expected_runtime_components(receipt)
         actual_components = [
             artifact.component for artifact in receipt.runtimeArtifacts
@@ -285,6 +309,7 @@ def test_thread_pool_completion_receipt_covers_every_chunk() -> None:
         assert isinstance(receipt, bindings.nixlXferCompletionReceipt)
         assert len(receipt.segments) == segment_count
         assert all(segment.posted for segment in receipt.segments)
+        assert all(len(segment.selectedTransports) > 0 for segment in receipt.segments)
         assert len(receipt.endpoints) == 2
         assert len({endpoint.workerId for endpoint in receipt.endpoints}) == 2
         assert all(endpoint.flushPosted for endpoint in receipt.endpoints)
@@ -294,6 +319,20 @@ def test_thread_pool_completion_receipt_covers_every_chunk() -> None:
             for endpoint in receipt.endpoints
             for index in endpoint.segmentIndices
         ) == list(range(segment_count))
+        selected_resources = tuple(
+            (transport.transport, transport.device)
+            for transport in initiator.query_xfer_ucp_transports(handle)
+        )
+        expected_selected_resources = tuple(
+            sorted(
+                {
+                    (transport.transport, transport.device)
+                    for segment in receipt.segments
+                    for transport in segment.selectedTransports
+                }
+            )
+        )
+        assert selected_resources == expected_selected_resources
 
         source_bytes = b"".join(
             ctypes.string_at(source + index * segment_stride, segment_length)

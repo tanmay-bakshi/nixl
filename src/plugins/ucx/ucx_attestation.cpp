@@ -32,11 +32,51 @@
 #include <memory>
 #include <set>
 #include <sstream>
+#include <string_view>
 #include <tuple>
 #include <utility>
 
 #include <openssl/evp.h>
 #include <ucp/api/ucp.h>
+
+namespace {
+
+[[nodiscard]] bool
+transportLess(const nixl_xfer_attestation_transport_t &left,
+              const nixl_xfer_attestation_transport_t &right) {
+    return std::tie(left.transport, left.device) <
+        std::tie(right.transport, right.device);
+}
+
+[[nodiscard]] nixl_status_t
+canonicalizeTransports(
+    const std::vector<nixl_xfer_attestation_transport_t> &input,
+    std::string_view evidence_name,
+    std::vector<nixl_xfer_attestation_transport_t> &output,
+    std::string &error) {
+    output.clear();
+    if (input.empty()) {
+        error = std::string(evidence_name) + " UCX transport evidence is empty";
+        return NIXL_ERR_BACKEND;
+    }
+
+    output = input;
+    for (const auto &transport : output) {
+        if (transport.transport.empty() || transport.device.empty()) {
+            output.clear();
+            error = std::string(evidence_name) +
+                " UCX transport evidence contains an incomplete resource";
+            return NIXL_ERR_BACKEND;
+        }
+    }
+
+    std::sort(output.begin(), output.end(), transportLess);
+    output.erase(std::unique(output.begin(), output.end()), output.end());
+    error.clear();
+    return NIXL_SUCCESS;
+}
+
+} // namespace
 
 nixl_status_t
 nixlUcxGetTransportModuleRequirements(
@@ -596,6 +636,11 @@ makeEvidenceDigest(const nixl_xfer_attestation_t &attestation, std::string &dige
         appendUint64(input, segment.workerIdentity);
         appendUint64(input, segment.endpointIdentity);
         appendString(input, segment.requestInfo);
+        appendUint64(input, segment.selectedTransports.size());
+        for (const auto &transport : segment.selectedTransports) {
+            appendString(input, transport.transport);
+            appendString(input, transport.device);
+        }
     }
 
     auto endpoints = attestation.endpoints;
@@ -746,6 +791,7 @@ nixlUcxAttestationState::beginSubmission() {
         segment.workerIdentity = 0;
         segment.endpointIdentity = 0;
         segment.requestInfo.clear();
+        segment.selectedTransports.clear();
         segment.posted = false;
     }
     return NIXL_SUCCESS;
@@ -757,14 +803,15 @@ nixlUcxAttestationState::recordSegment(
     size_t worker_id,
     uint64_t worker_identity,
     uint64_t endpoint_identity,
-    const std::vector<nixl_xfer_attestation_transport_t> &transports,
+    const std::vector<nixl_xfer_attestation_transport_t> &endpoint_transports,
+    const std::vector<nixl_xfer_attestation_transport_t> &selected_transports,
     const std::string &request_info) {
     const std::lock_guard<std::mutex> lock(mutex_);
     if (attestation_.state == nixl_xfer_attestation_state_t::FAILED) {
         return attestation_.status;
     }
     if (attestation_.state != nixl_xfer_attestation_state_t::POSTING ||
-        index >= attestation_.segments.size() || request_info.empty() || transports.empty()) {
+        index >= attestation_.segments.size()) {
         return failLocked(NIXL_ERR_BACKEND, "invalid segment evidence");
     }
 
@@ -773,18 +820,42 @@ nixlUcxAttestationState::recordSegment(
         return failLocked(NIXL_ERR_BACKEND, "segment evidence was recorded more than once");
     }
 
-    auto canonical_transports = transports;
-    std::sort(canonical_transports.begin(),
-              canonical_transports.end(),
-              [](const auto &left, const auto &right) {
-                  return std::tie(left.transport, left.device) <
-                      std::tie(right.transport, right.device);
-              });
+    std::vector<nixl_xfer_attestation_transport_t> canonical_endpoint_transports;
+    std::string transport_error;
+    const nixl_status_t endpoint_status = canonicalizeTransports(
+        endpoint_transports,
+        "endpoint",
+        canonical_endpoint_transports,
+        transport_error);
+    if (endpoint_status != NIXL_SUCCESS) {
+        return failLocked(endpoint_status, transport_error);
+    }
+
+    std::vector<nixl_xfer_attestation_transport_t> canonical_selected_transports;
+    const nixl_status_t selected_status = canonicalizeTransports(
+        selected_transports,
+        "selected",
+        canonical_selected_transports,
+        transport_error);
+    if (selected_status != NIXL_SUCCESS) {
+        return failLocked(selected_status, transport_error);
+    }
+
+    if (!std::includes(canonical_endpoint_transports.begin(),
+                       canonical_endpoint_transports.end(),
+                       canonical_selected_transports.begin(),
+                       canonical_selected_transports.end(),
+                       transportLess)) {
+        return failLocked(
+            NIXL_ERR_BACKEND,
+            "selected UCX transport is absent from its endpoint context");
+    }
 
     segment.workerId = worker_id;
     segment.workerIdentity = worker_identity;
     segment.endpointIdentity = endpoint_identity;
     segment.requestInfo = request_info;
+    segment.selectedTransports = std::move(canonical_selected_transports);
     segment.posted = true;
 
     auto *endpoint = findEndpointLocked(endpoint_identity);
@@ -794,13 +865,13 @@ nixlUcxAttestationState::recordSegment(
             .workerIdentity = worker_identity,
             .endpointIdentity = endpoint_identity,
             .segmentIndices = {index},
-            .transports = std::move(canonical_transports),
+            .transports = std::move(canonical_endpoint_transports),
         });
         return NIXL_SUCCESS;
     }
 
     if (endpoint->workerId != worker_id || endpoint->workerIdentity != worker_identity ||
-        endpoint->transports != canonical_transports) {
+        endpoint->transports != canonical_endpoint_transports) {
         return failLocked(NIXL_ERR_BACKEND, "endpoint context changed during submission");
     }
     endpoint->segmentIndices.push_back(index);

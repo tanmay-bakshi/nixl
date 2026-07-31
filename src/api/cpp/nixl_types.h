@@ -335,6 +335,7 @@ struct nixlXferAttestationSegment {
     uint64_t workerIdentity = 0;
     uint64_t endpointIdentity = 0;
     std::string requestInfo;
+    std::vector<nixl_xfer_attestation_transport_t> selectedTransports;
     bool posted = false;
 };
 
