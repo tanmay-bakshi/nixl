@@ -134,9 +134,18 @@ main() {
 #endif
 
     // Write request
+    std::vector<nixl_xfer_attestation_transport_t> selected_transports;
     ret = ep[0]->write(
-        buffer[0], mem[0], (uint64_t)buffer[1], *rkey[0], buf_size / 2, req, request_info);
+        buffer[0],
+        mem[0],
+        (uint64_t)buffer[1],
+        *rkey[0],
+        buf_size / 2,
+        req,
+        request_info,
+        selected_transports);
     assert(!request_info.empty());
+    assert(!selected_transports.empty());
     completeRequest(w, std::string("WRITE"), false, ret, req);
 
     // Flush to ensure that all data is in-place
@@ -174,9 +183,18 @@ main() {
 
     // Read request
     request_info.clear();
+    selected_transports.clear();
     ret = ep[0]->read(
-        (uint64_t)buffer[1], *rkey[0], buffer[0], mem[0], buf_size, req, request_info);
+        (uint64_t)buffer[1],
+        *rkey[0],
+        buffer[0],
+        mem[0],
+        buf_size,
+        req,
+        request_info,
+        selected_transports);
     assert(!request_info.empty());
+    assert(!selected_transports.empty());
     completeRequest(w, std::string("READ"), false, ret, req);
 
     // Flush to ensure that all data is in-place

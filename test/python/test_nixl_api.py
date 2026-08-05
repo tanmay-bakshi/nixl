@@ -61,11 +61,11 @@ def two_connected_agents(backend_name):
             str(uuid.uuid4()), nixl_conf=nixl_agent_config(backends=[backend_name])
         ),
     )
-    agent1.add_remote_agent(agent2.get_agent_metadata())
-    agent2.add_remote_agent(agent1.get_agent_metadata())
-    yield (agent1, agent2)
-    agent1.remove_remote_agent(agent2.name)
-    agent2.remove_remote_agent(agent1.name)
+    agent2_handle = agent1.add_remote_agent(agent2.get_agent_metadata())
+    agent1_handle = agent2.add_remote_agent(agent1.get_agent_metadata())
+    yield (agent1, agent2, agent2_handle, agent1_handle)
+    agent1.remove_remote_agent(agent2_handle)
+    agent2.remove_remote_agent(agent1_handle)
 
 
 @pytest.fixture
@@ -164,21 +164,22 @@ def test_metadata_pass(two_agents):
 
     assert agent1.register_memory(agent1_reg_descs) is not None
 
-    passed_name = agent2.add_remote_agent(agent1.get_agent_metadata())
-    assert passed_name == agent1.name.encode()
+    remote_handle = agent2.add_remote_agent(agent1.get_agent_metadata())
+    assert remote_handle.name == agent1.name
+    assert agent2.add_remote_agent(agent1.get_agent_metadata()) is remote_handle
     utils.free_passthru(addr)
 
 
 @pytest.mark.timeout(5)
 def test_empty_notif_tag(two_connected_agents):
-    agent1, agent2 = two_connected_agents
+    agent1, agent2, agent2_handle, agent1_handle = two_connected_agents
 
-    agent1.send_notif(agent2.name, b"whatever")
+    agent1.send_notif(agent2_handle, b"whatever")
 
     found = False
     while not found:
         # empty bytes will consume any message
-        found = agent2.check_remote_xfer_done(agent1.name, b"")
+        found = agent2.check_remote_xfer_done(agent1_handle, b"")
 
 
 def test_improper_get_xfer_descs(one_empty_agent, one_reg_list):
@@ -251,13 +252,16 @@ def _run_xfer_telemetry_check(agent1, agent2):
     addr1 = utils.malloc_passthru(mem_size)
     addr2 = utils.malloc_passthru(mem_size)
 
+    agent2_handle = None
+    agent1_handle = None
     try:
         reg1 = agent1.get_reg_descs([(addr1, mem_size, 0, "")], mem_type="DRAM")
         reg2 = agent2.get_reg_descs([(addr2, mem_size, 0, "")], mem_type="DRAM")
         agent1.register_memory(reg1)
         agent2.register_memory(reg2)
 
-        agent1.add_remote_agent(agent2.get_agent_metadata())
+        agent2_handle = agent1.add_remote_agent(agent2.get_agent_metadata())
+        agent1_handle = agent2.add_remote_agent(agent1.get_agent_metadata())
         src = agent1.get_xfer_descs(
             [(addr1, mem_size // 2, 0), (addr1 + mem_size // 2, mem_size // 2, 0)],
             mem_type="DRAM",
@@ -267,7 +271,9 @@ def _run_xfer_telemetry_check(agent1, agent2):
             mem_type="DRAM",
         )
 
-        handle = agent1.initialize_xfer("WRITE", src, dst, agent2.name, b"telem_msg")
+        handle = agent1.initialize_xfer(
+            "WRITE", src, dst, agent2_handle, b"telem_msg"
+        )
         st = agent1.transfer(handle)
         assert st in ("DONE", "PROC")
 
@@ -277,7 +283,7 @@ def _run_xfer_telemetry_check(agent1, agent2):
             if st == "DONE":
                 break
 
-        while not agent2.check_remote_xfer_done(agent1.name, b"telem_msg"):
+        while not agent2.check_remote_xfer_done(agent1_handle, b"telem_msg"):
             pass
 
         telem = agent1.get_xfer_telemetry(handle)
@@ -290,6 +296,10 @@ def _run_xfer_telemetry_check(agent1, agent2):
 
         agent1.release_xfer_handle(handle)
     finally:
+        if agent2_handle is not None:
+            agent1.remove_remote_agent(agent2_handle)
+        if agent1_handle is not None:
+            agent2.remove_remote_agent(agent1_handle)
         utils.free_passthru(addr1)
         utils.free_passthru(addr2)
 

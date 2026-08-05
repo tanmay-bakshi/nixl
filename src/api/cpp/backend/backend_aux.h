@@ -27,12 +27,35 @@
 // level direction or so.
 typedef std::vector<std::pair<std::string, std::string>> notif_list_t;
 
+struct nixlAuthenticatedNotification {
+    std::string remoteAgent;
+    nixl_blob_t payload;
+    uint64_t handleIdentity = 0;
+    uint64_t generation = 0;
+    uint64_t connectionIdentity = 0;
+    uint64_t endpointIdentity = 0;
+};
+
+using authenticated_notif_list_t =
+    std::vector<nixlAuthenticatedNotification>;
+
+/**
+ * @brief Exact agent-owned authority installed in an authenticated backend.
+ */
+struct nixlRemoteAgentBinding {
+    std::string remoteAgent;
+    std::string agentIncarnation;
+    nixl_remote_agent_authority_t authority;
+};
+
+
 
 struct nixlBackendOptionalArgs {
     // During postXfer, user might ask for a notification if supported
     nixl_blob_t notifMsg;
     bool        hasNotif = false;
     nixl_blob_t customParam;
+    const nixl_remote_agent_authority_t *remoteAgentAuthority = nullptr;
 };
 
 using nixl_opt_b_args_t = nixlBackendOptionalArgs;
@@ -45,6 +68,7 @@ using nixl_opt_b_args_t = nixlBackendOptionalArgs;
 class nixlBackendInitParams {
     public:
         std::string       localAgent;
+        std::string       localAgentIncarnation;
 
         nixl_backend_t    type;
         nixl_b_params_t*  customParams;

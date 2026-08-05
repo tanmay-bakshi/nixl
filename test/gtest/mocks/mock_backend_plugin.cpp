@@ -15,7 +15,10 @@
  * limitations under the License.
  */
 #include "mock_backend_engine.h"
-#include "common.h"
+
+#ifndef MOCK_BACKEND_PLUGIN_NAME
+#define MOCK_BACKEND_PLUGIN_NAME "MOCK_BACKEND"
+#endif
 
 namespace mocks {
 namespace backend_plugin {
@@ -32,7 +35,7 @@ namespace backend_plugin {
 
     static const char *
     get_plugin_name() {
-        return gtest::GetMockBackendName();
+        return MOCK_BACKEND_PLUGIN_NAME;
     }
 
     static const char *

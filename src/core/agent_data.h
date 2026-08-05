@@ -23,6 +23,7 @@
 #include "sync.h"
 
 #include <memory>
+#include <unordered_set>
 
 #if HAVE_ETCD
 #include <etcd/SyncClient.hpp>
@@ -33,6 +34,42 @@ class SyncClient;
 
 #define NIXL_ETCD_NAMESPACE_DEFAULT "/nixl/agents/"
 #endif // HAVE_ETCD
+
+class nixlBackendEngine;
+
+class nixlRemoteAgentH {
+private:
+    nixlRemoteAgentH(uint64_t owner_identity,
+                     uint64_t identity,
+                     uint64_t generation,
+                     std::string name,
+                     std::string agent_incarnation)
+        : ownerIdentity_(owner_identity),
+          identity_(identity),
+          generation_(generation),
+          name_(std::move(name)),
+          agentIncarnation_(std::move(agent_incarnation)) {}
+
+    const uint64_t ownerIdentity_;
+    const uint64_t identity_;
+    const uint64_t generation_;
+    const std::string name_;
+    const std::string agentIncarnation_;
+    bool active_ = true;
+    std::unordered_map<nixlBackendEngine *, nixlRemoteAgentBinding> bindings_;
+
+public:
+    [[nodiscard]] const std::string &
+    getName() const noexcept {
+        return name_;
+    }
+
+    [[nodiscard]] uint64_t getIdentity() const noexcept { return identity_; }
+    [[nodiscard]] uint64_t getGeneration() const noexcept { return generation_; }
+
+    friend class nixlAgent;
+    friend class nixlAgentData;
+};
 
 using backend_list_t = std::vector<nixlBackendEngine*>;
 
@@ -64,6 +101,8 @@ using nixl_socket_map_t = std::map<nixl_socket_peer_t, int>;
 class nixlAgentData {
     private:
         const std::string name_;
+        const uint64_t identity_;
+        const std::string incarnation_;
         const nixlAgentConfig config_;
         const bool useEtcd_;
         const bool needsCommThread_;
@@ -83,6 +122,13 @@ class nixlAgentData {
 
         std::unordered_map<std::string, std::unordered_map<nixl_backend_t, nixl_blob_t>>
             remoteBackends_;
+        std::unordered_map<std::string, nixlRemoteAgentH *> activeRemoteHandles_;
+        std::unordered_map<std::string, uint64_t> remoteGenerations_;
+        std::unordered_set<std::string> quarantinedRemoteNames_;
+        std::unordered_set<const nixlRemoteAgentH *> ownedRemoteHandles_;
+        std::unordered_map<uint64_t, nixlRemoteAgentH *> remoteHandlesByIdentity_;
+        std::vector<std::unique_ptr<nixlRemoteAgentH>> remoteHandles_;
+
 
         // State/methods for listener thread
         std::unique_ptr<nixlMDStreamListener> listener;
@@ -109,14 +155,25 @@ class nixlAgentData {
         commWorkerInternal(nixlAgent *myAgent);
         void enqueueCommWork(nixl_comm_req_t request);
         void getCommWork(std::vector<nixl_comm_req_t> &req_list);
+        [[nodiscard]] nixl_status_t
+        prepareRemoteSections(const std::string &remote_name,
+                              nixlSerDes &sd,
+                              nixlRemoteSectionUpdate &update) const;
         nixl_status_t
-        loadConnInfo(const std::string &remote_name,
-                     const nixl_backend_t &backend,
-                     const nixl_blob_t &conn_info);
-        nixl_status_t
-        loadRemoteSections(const std::string &remote_name, nixlSerDes &sd);
+        applyRemoteSections(const std::string &remote_name,
+                            nixlRemoteSectionUpdate &&update,
+                            bool &rollback_ambiguous);
         nixl_status_t
         invalidateRemoteData(const std::string &remote_name);
+        [[nodiscard]] nixl_status_t
+        validateRemoteHandle(const nixlRemoteAgentH *handle) const;
+        [[nodiscard]] nixlRemoteAgentH *
+        findActiveRemoteHandle(const std::string &remote_name) const;
+        [[nodiscard]] nixlRemoteAgentH *
+        findOwnedRemoteHandle(uint64_t identity, uint64_t generation) const;
+        void
+        deactivateRemoteHandle(const std::string &remote_name);
+
         [[nodiscard]] static backend_set_t
         getBackends(const nixl_opt_args_t *opt_args,
                     const nixlMemSection &section,

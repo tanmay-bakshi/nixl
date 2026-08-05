@@ -18,11 +18,14 @@
 #include <gtest/gtest.h>
 #include <gmock/gmock.h>
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <random>
+#include <regex>
 
 #include "common.h"
 #include "nixl.h"
+#include "agent_data.h"
 #include "plugin_manager.h"
 #include "mocks/gmock_engine.h"
 
@@ -88,15 +91,17 @@ namespace agent {
             return agent_.get();
         }
 
-        const mocks::GMockBackendEngine &
-        getGMockEngine() const {
+        mocks::GMockBackendEngine &
+        getGMockEngine() {
             return gmock_engine_;
         }
 
         nixl_status_t
-        createBackendWithGMock(nixl_b_params_t &params, nixlBackendH *&backend) {
+        createBackendWithGMock(nixl_b_params_t &params,
+                               nixlBackendH *&backend,
+                               const nixl_backend_t &backend_name = GetMockBackendName()) {
             gmock_engine_.SetToParams(params);
-            return agent_->createBackend(GetMockBackendName(), params, backend);
+            return agent_->createBackend(backend_name, params, backend);
         }
 
         nixl_status_t
@@ -104,6 +109,14 @@ namespace agent {
             std::string remote_metadata;
             EXPECT_EQ(remote_agent->getLocalMD(remote_metadata), NIXL_SUCCESS);
             return agent_->loadRemoteMD(remote_metadata, remote_agent_name_out);
+        }
+
+        nixl_status_t
+        getAndLoadRemoteMd(nixlAgent *remote_agent,
+                           nixlRemoteAgentH *&remote_agent_handle_out) {
+            std::string remote_metadata;
+            EXPECT_EQ(remote_agent->getLocalMD(remote_metadata), NIXL_SUCCESS);
+            return agent_->loadRemoteMD(remote_metadata, remote_agent_handle_out);
         }
 
         nixl_status_t
@@ -372,11 +385,11 @@ namespace agent {
         EXPECT_EQ(remote_agent_helper_->createBackendWithGMock(remote_params, remote_backend),
                   NIXL_SUCCESS);
 
-        std::string remote_agent_name_out;
-        EXPECT_EQ(local_agent_helper_->getAndLoadRemoteMd(remote_agent_, remote_agent_name_out),
+        nixlRemoteAgentH *remote_agent_handle = nullptr;
+        EXPECT_EQ(local_agent_helper_->getAndLoadRemoteMd(remote_agent_, remote_agent_handle),
                   NIXL_SUCCESS);
 
-        EXPECT_EQ(local_agent_->invalidateRemoteMD(remote_agent_name_out), NIXL_SUCCESS);
+        EXPECT_EQ(local_agent_->invalidateRemoteMD(remote_agent_handle), NIXL_SUCCESS);
     }
 
     TEST_F(dualAgentBridgeFixture, XferReqTest) {
@@ -522,6 +535,9 @@ namespace agent {
                 return NIXL_SUCCESS;
             });
 
+        ON_CALL(local_agent_helper_->getGMockEngine(), supportsAuthenticatedNotif())
+            .WillByDefault(testing::Return(true));
+
         nixl_b_params_t local_params, remote_params;
         nixlBackendH *local_backend, *remote_backend;
         EXPECT_EQ(local_agent_helper_->createBackendWithGMock(local_params, local_backend),
@@ -529,16 +545,315 @@ namespace agent {
         EXPECT_EQ(remote_agent_helper_->createBackendWithGMock(remote_params, remote_backend),
                   NIXL_SUCCESS);
 
-        std::string remote_agent_name_out;
-        EXPECT_EQ(local_agent_helper_->getAndLoadRemoteMd(remote_agent_, remote_agent_name_out),
+        nixlRemoteAgentH *remote_agent_handle = nullptr;
+        EXPECT_EQ(local_agent_helper_->getAndLoadRemoteMd(remote_agent_, remote_agent_handle),
                   NIXL_SUCCESS);
-        EXPECT_EQ(local_agent_->genNotif(remote_agent_name_out, msg), NIXL_SUCCESS);
+        EXPECT_EQ(local_agent_->genNotif(remote_agent_handle, msg), NIXL_SUCCESS);
 
         nixl_notifs_t notif_map;
         EXPECT_EQ(remote_agent_->getNotifs(notif_map), NIXL_SUCCESS);
         EXPECT_EQ(notif_map.size(), 1u);
         EXPECT_EQ(notif_map[local_agent_name].size(), 1u);
         EXPECT_EQ(notif_map[local_agent_name].front(), msg);
+    }
+
+    TEST_F(dualAgentBridgeFixture, ExactRemoteBindingLifecycleTest) {
+        auto &backend = local_agent_helper_->getGMockEngine();
+        ON_CALL(backend, supportsAuthenticatedNotif())
+            .WillByDefault(testing::Return(true));
+
+        EXPECT_CALL(backend, backendInit(local_agent_name, testing::_))
+            .WillOnce([](const std::string &, const std::string &incarnation) {
+                static const std::regex uuid_v4(
+                    "[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}");
+                EXPECT_TRUE(std::regex_match(incarnation, uuid_v4));
+            });
+
+        nixlRemoteAgentBinding installed_binding;
+        EXPECT_CALL(backend, bindRemoteAgent(testing::_))
+            .WillOnce([&installed_binding](const nixlRemoteAgentBinding &binding) {
+                installed_binding = binding;
+                return NIXL_SUCCESS;
+            });
+
+        nixl_b_params_t local_params, remote_params;
+        nixlBackendH *local_backend, *remote_backend;
+        EXPECT_EQ(local_agent_helper_->createBackendWithGMock(local_params, local_backend),
+                  NIXL_SUCCESS);
+        EXPECT_EQ(remote_agent_helper_->createBackendWithGMock(remote_params, remote_backend),
+                  NIXL_SUCCESS);
+
+        nixlRemoteAgentH *remote_handle = nullptr;
+        EXPECT_EQ(local_agent_helper_->getAndLoadRemoteMd(remote_agent_, remote_handle),
+                  NIXL_SUCCESS);
+        ASSERT_NE(remote_handle, nullptr);
+        EXPECT_EQ(installed_binding.remoteAgent, remote_agent_name);
+        EXPECT_EQ(installed_binding.authority.handleIdentity, remote_handle->getIdentity());
+        EXPECT_EQ(installed_binding.authority.generation, remote_handle->getGeneration());
+
+        const std::string message = "exact-generation";
+        EXPECT_CALL(backend, queryRemoteNotificationState(testing::_))
+            .WillOnce([&installed_binding](const nixlRemoteAgentBinding &binding) {
+                EXPECT_EQ(binding.authority.handleIdentity,
+                          installed_binding.authority.handleIdentity);
+                EXPECT_EQ(binding.authority.generation,
+                          installed_binding.authority.generation);
+                return NIXL_SUCCESS;
+            });
+        EXPECT_CALL(backend,
+                    genNotif(testing::A<const nixlRemoteAgentBinding &>(), message))
+            .WillOnce([&installed_binding](const nixlRemoteAgentBinding &binding,
+                                           const std::string &) {
+                EXPECT_EQ(binding.authority.handleIdentity,
+                          installed_binding.authority.handleIdentity);
+                EXPECT_EQ(binding.authority.generation,
+                          installed_binding.authority.generation);
+                return NIXL_SUCCESS;
+            });
+        EXPECT_EQ(local_agent_->genNotif(remote_handle, message), NIXL_SUCCESS);
+
+        {
+            testing::InSequence sequence;
+            EXPECT_CALL(backend, retireRemoteAgent(testing::_))
+                .WillOnce([&installed_binding](const nixlRemoteAgentBinding &binding) {
+                    EXPECT_EQ(binding.authority.handleIdentity,
+                              installed_binding.authority.handleIdentity);
+                    EXPECT_EQ(binding.authority.generation,
+                              installed_binding.authority.generation);
+                    return NIXL_SUCCESS;
+                });
+            EXPECT_CALL(backend, disconnect(remote_agent_name))
+                .WillOnce(testing::Return(NIXL_SUCCESS));
+        }
+        EXPECT_EQ(local_agent_->invalidateRemoteMD(remote_handle), NIXL_SUCCESS);
+    }
+
+    TEST_F(dualAgentBridgeFixture, GenerationSpecificNotificationSendingTest) {
+        auto &backend = local_agent_helper_->getGMockEngine();
+        ON_CALL(backend, supportsAuthenticatedNotif())
+            .WillByDefault(testing::Return(true));
+
+        std::vector<nixlRemoteAgentBinding> installed_bindings;
+        EXPECT_CALL(backend, bindRemoteAgent(testing::_))
+            .Times(2)
+            .WillRepeatedly([&installed_bindings](const nixlRemoteAgentBinding &binding) {
+                installed_bindings.push_back(binding);
+                return NIXL_SUCCESS;
+            });
+
+        nixl_b_params_t local_params, remote_params;
+        nixlBackendH *local_backend, *remote_backend;
+        EXPECT_EQ(local_agent_helper_->createBackendWithGMock(local_params, local_backend),
+                  NIXL_SUCCESS);
+        EXPECT_EQ(remote_agent_helper_->createBackendWithGMock(remote_params, remote_backend),
+                  NIXL_SUCCESS);
+
+        std::string remote_metadata;
+        EXPECT_EQ(remote_agent_->getLocalMD(remote_metadata), NIXL_SUCCESS);
+
+        nixlRemoteAgentH *generation_one = nullptr;
+        EXPECT_EQ(local_agent_->loadRemoteMD(remote_metadata, generation_one), NIXL_SUCCESS);
+        ASSERT_NE(generation_one, nullptr);
+
+        EXPECT_CALL(backend, queryRemoteNotificationState(testing::_))
+            .Times(2)
+            .WillRepeatedly(testing::Return(NIXL_SUCCESS));
+        std::vector<uint64_t> sent_generations;
+        EXPECT_CALL(backend,
+                    genNotif(testing::A<const nixlRemoteAgentBinding &>(), testing::_))
+            .Times(2)
+            .WillRepeatedly([&sent_generations](const nixlRemoteAgentBinding &binding,
+                                                const std::string &) {
+                sent_generations.push_back(binding.authority.generation);
+                return NIXL_SUCCESS;
+            });
+
+        EXPECT_EQ(local_agent_->genNotif(generation_one, "g1"), NIXL_SUCCESS);
+        EXPECT_EQ(local_agent_->invalidateRemoteMD(generation_one), NIXL_SUCCESS);
+        EXPECT_EQ(local_agent_->genNotif(generation_one, "retired"), NIXL_ERR_NOT_ALLOWED);
+
+        nixlRemoteAgentH *generation_two = nullptr;
+        EXPECT_EQ(local_agent_->loadRemoteMD(remote_metadata, generation_two), NIXL_SUCCESS);
+        ASSERT_NE(generation_two, nullptr);
+        EXPECT_NE(generation_one->getIdentity(), generation_two->getIdentity());
+        EXPECT_EQ(generation_two->getGeneration(), generation_one->getGeneration() + 1);
+        EXPECT_EQ(local_agent_->genNotif(generation_two, "g2"), NIXL_SUCCESS);
+        EXPECT_EQ(local_agent_->invalidateRemoteMD(generation_two), NIXL_SUCCESS);
+
+        ASSERT_EQ(sent_generations.size(), 2u);
+        EXPECT_EQ(sent_generations[0], generation_one->getGeneration());
+        EXPECT_EQ(sent_generations[1], generation_two->getGeneration());
+    }
+
+    TEST_F(dualAgentBridgeFixture, NotificationReadinessGatesTransferBeforePostTest) {
+        auto &backend = local_agent_helper_->getGMockEngine();
+        ON_CALL(backend, supportsAuthenticatedNotif())
+            .WillByDefault(testing::Return(true));
+
+        nixl_b_params_t local_params, remote_params;
+        nixlBackendH *local_backend, *remote_backend;
+        EXPECT_EQ(local_agent_helper_->createBackendWithGMock(local_params, local_backend),
+                  NIXL_SUCCESS);
+        EXPECT_EQ(remote_agent_helper_->createBackendWithGMock(remote_params, remote_backend),
+                  NIXL_SUCCESS);
+
+        nixl_reg_dlist_t local_reg_dlist(DRAM_SEG), remote_reg_dlist(DRAM_SEG);
+        nixl_opt_args_t local_mem_args, remote_mem_args;
+        blob local_blob, remote_blob;
+        EXPECT_EQ(local_agent_helper_->initAndRegisterMemory(
+                      local_blob, local_reg_dlist, local_mem_args, local_backend),
+                  NIXL_SUCCESS);
+        EXPECT_EQ(remote_agent_helper_->initAndRegisterMemory(
+                      remote_blob, remote_reg_dlist, remote_mem_args, remote_backend),
+                  NIXL_SUCCESS);
+
+        nixlBackendMD loaded_remote_metadata(false);
+        ON_CALL(backend, loadRemoteMD(testing::_, testing::_, testing::_, testing::_))
+            .WillByDefault([&loaded_remote_metadata](const nixlBlobDesc &,
+                                                     const nixl_mem_t &,
+                                                     const std::string &,
+                                                     nixlBackendMD *&output) {
+                output = &loaded_remote_metadata;
+                return NIXL_SUCCESS;
+            });
+
+        nixlRemoteAgentH *remote_handle = nullptr;
+        EXPECT_EQ(local_agent_helper_->getAndLoadRemoteMd(remote_agent_, remote_handle),
+                  NIXL_SUCCESS);
+
+        nixl_xfer_dlist_t local_xfer_dlist(DRAM_SEG), remote_xfer_dlist(DRAM_SEG);
+        local_xfer_dlist.addDesc(local_blob.getDesc());
+        remote_xfer_dlist.addDesc(remote_blob.getDesc());
+        nixl_opt_args_t xfer_args;
+        xfer_args.notif = "not-ready";
+        nixlXferReqH *request = nullptr;
+        EXPECT_EQ(local_agent_->createXferReq(NIXL_WRITE,
+                                              local_xfer_dlist,
+                                              remote_xfer_dlist,
+                                              remote_handle,
+                                              request,
+                                              &xfer_args),
+                  NIXL_SUCCESS);
+
+        EXPECT_CALL(backend, queryRemoteNotificationState(testing::_))
+            .WillOnce(testing::Return(NIXL_ERR_NOT_READY));
+        EXPECT_CALL(backend, postXfer(testing::_,
+                                     testing::_,
+                                     testing::_,
+                                     testing::_,
+                                     testing::_,
+                                     testing::_))
+            .Times(0);
+        EXPECT_EQ(local_agent_->postXferReq(request), NIXL_ERR_NOT_READY);
+        EXPECT_EQ(local_agent_->releaseXferReq(request), NIXL_SUCCESS);
+        EXPECT_EQ(local_agent_->invalidateRemoteMD(remote_handle), NIXL_SUCCESS);
+    }
+
+    TEST_F(dualAgentBridgeFixture, TombstonedAndActiveNotificationsSurviveInvalidSiblingTest) {
+        auto &backend = local_agent_helper_->getGMockEngine();
+        ON_CALL(backend, supportsAuthenticatedNotif())
+            .WillByDefault(testing::Return(true));
+
+        nixl_b_params_t local_params, remote_params;
+        nixlBackendH *local_backend, *remote_backend;
+        EXPECT_EQ(local_agent_helper_->createBackendWithGMock(local_params, local_backend),
+                  NIXL_SUCCESS);
+        EXPECT_EQ(remote_agent_helper_->createBackendWithGMock(remote_params, remote_backend),
+                  NIXL_SUCCESS);
+
+        std::string remote_metadata;
+        EXPECT_EQ(remote_agent_->getLocalMD(remote_metadata), NIXL_SUCCESS);
+        nixlRemoteAgentH *generation_one = nullptr;
+        EXPECT_EQ(local_agent_->loadRemoteMD(remote_metadata, generation_one), NIXL_SUCCESS);
+        EXPECT_EQ(local_agent_->invalidateRemoteMD(generation_one), NIXL_SUCCESS);
+
+        nixlRemoteAgentH *generation_two = nullptr;
+        EXPECT_EQ(local_agent_->loadRemoteMD(remote_metadata, generation_two), NIXL_SUCCESS);
+
+        EXPECT_CALL(backend, getAuthenticatedNotifs(testing::_))
+            .WillOnce([generation_one, generation_two](authenticated_notif_list_t &notifications) {
+                notifications.push_back({.payload = "retired-generation",
+                                         .handleIdentity = generation_one->getIdentity(),
+                                         .generation = generation_one->getGeneration()});
+                notifications.push_back({.payload = "invalid",
+                                         .handleIdentity = UINT64_MAX,
+                                         .generation = 1});
+                notifications.push_back({.payload = "active-generation",
+                                         .handleIdentity = generation_two->getIdentity(),
+                                         .generation = generation_two->getGeneration()});
+                return NIXL_SUCCESS;
+            });
+
+        nixl_remote_notifs_t notifications;
+        EXPECT_EQ(local_agent_->getRemoteNotifs(notifications), NIXL_ERR_NOT_ALLOWED);
+        ASSERT_EQ(notifications[generation_one].size(), 1u);
+        EXPECT_EQ(notifications[generation_one][0], "retired-generation");
+        ASSERT_EQ(notifications[generation_two].size(), 1u);
+        EXPECT_EQ(notifications[generation_two][0], "active-generation");
+        EXPECT_EQ(local_agent_->invalidateRemoteMD(generation_two), NIXL_SUCCESS);
+    }
+
+    TEST_F(dualAgentBridgeFixture, RemoteBindingRollbackIsReverseTest) {
+        auto &backend = local_agent_helper_->getGMockEngine();
+        ON_CALL(backend, supportsAuthenticatedNotif())
+            .WillByDefault(testing::Return(true));
+
+        uint64_t next_connection_identity = 10;
+        ON_CALL(backend, queryRemoteAgentAuthority(testing::_, testing::_))
+            .WillByDefault([&next_connection_identity](
+                               const std::string &,
+                               nixl_remote_agent_authority_t &authority) {
+                authority.connectionIdentity = next_connection_identity++;
+                authority.endpointIdentities = {authority.connectionIdentity + 100};
+                return NIXL_SUCCESS;
+            });
+
+        std::vector<uint64_t> bound_connections;
+        EXPECT_CALL(backend, bindRemoteAgent(testing::_))
+            .Times(3)
+            .WillRepeatedly([&bound_connections](const nixlRemoteAgentBinding &binding) {
+                bound_connections.push_back(binding.authority.connectionIdentity);
+                return bound_connections.size() == 3 ? NIXL_ERR_BACKEND : NIXL_SUCCESS;
+            });
+        std::vector<uint64_t> retired_connections;
+        EXPECT_CALL(backend, retireRemoteAgent(testing::_))
+            .Times(2)
+            .WillRepeatedly([&retired_connections](const nixlRemoteAgentBinding &binding) {
+                retired_connections.push_back(binding.authority.connectionIdentity);
+                return NIXL_SUCCESS;
+            });
+        EXPECT_CALL(backend, disconnect(remote_agent_name))
+            .Times(3)
+            .WillRepeatedly(testing::Return(NIXL_SUCCESS));
+
+        const std::array<nixl_backend_t, 3> backend_names = {
+            GetMockBackendName(),
+            GetSecondaryMockBackendName(),
+            GetTertiaryMockBackendName(),
+        };
+        std::array<nixl_b_params_t, 3> local_params;
+        std::array<nixl_b_params_t, 3> remote_params;
+        std::array<nixlBackendH *, 3> local_backends;
+        std::array<nixlBackendH *, 3> remote_backends;
+        for (size_t i = 0; i < backend_names.size(); ++i) {
+            EXPECT_EQ(local_agent_helper_->createBackendWithGMock(
+                          local_params[i], local_backends[i], backend_names[i]),
+                      NIXL_SUCCESS);
+            EXPECT_EQ(remote_agent_helper_->createBackendWithGMock(
+                          remote_params[i], remote_backends[i], backend_names[i]),
+                      NIXL_SUCCESS);
+        }
+
+        std::string remote_metadata;
+        EXPECT_EQ(remote_agent_->getLocalMD(remote_metadata), NIXL_SUCCESS);
+        nixlRemoteAgentH *remote_handle = nullptr;
+        EXPECT_EQ(local_agent_->loadRemoteMD(remote_metadata, remote_handle), NIXL_ERR_BACKEND);
+        EXPECT_EQ(remote_handle, nullptr);
+
+        ASSERT_EQ(bound_connections.size(), 3u);
+        ASSERT_EQ(retired_connections.size(), 2u);
+        EXPECT_EQ(retired_connections[0], bound_connections[1]);
+        EXPECT_EQ(retired_connections[1], bound_connections[0]);
     }
 
     TEST_F(dualAgentBridgeFixture, QueryXferBackendTest) {

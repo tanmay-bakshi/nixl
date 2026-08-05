@@ -64,9 +64,13 @@ public:
     static GMockBackendEngine *
     GetFromParams(nixl_b_params_t *params);
 
+    MOCK_METHOD(void,
+                backendInit,
+                (const std::string &local_agent, const std::string &local_incarnation));
     MOCK_METHOD(bool, supportsRemote, (), (const, override));
     MOCK_METHOD(bool, supportsLocal, (), (const, override));
     MOCK_METHOD(bool, supportsNotif, (), (const, override));
+    MOCK_METHOD(bool, supportsAuthenticatedNotif, (), (const, override));
     MOCK_METHOD(nixl_mem_list_t, getSupportedMems, (), (const, override));
     MOCK_METHOD(nixl_status_t,
                 registerMem,
@@ -112,6 +116,22 @@ public:
                 (const std::string &remote_agent, const std::string &remote_conn_info),
                 (override));
     MOCK_METHOD(nixl_status_t,
+                queryRemoteAgentAuthority,
+                (const std::string &remote_agent, nixl_remote_agent_authority_t &authority),
+                (const, override));
+    MOCK_METHOD(nixl_status_t,
+                bindRemoteAgent,
+                (const nixlRemoteAgentBinding &binding),
+                (override));
+    MOCK_METHOD(nixl_status_t,
+                retireRemoteAgent,
+                (const nixlRemoteAgentBinding &binding),
+                (override));
+    MOCK_METHOD(nixl_status_t,
+                queryRemoteNotificationState,
+                (const nixlRemoteAgentBinding &binding),
+                (const, override));
+    MOCK_METHOD(nixl_status_t,
                 loadRemoteMD,
                 (const nixlBlobDesc &input,
                  const nixl_mem_t &nixl_mem,
@@ -124,8 +144,16 @@ public:
                 (override));
     MOCK_METHOD(nixl_status_t, getNotifs, (notif_list_t & notif_list), (override));
     MOCK_METHOD(nixl_status_t,
+                getAuthenticatedNotifs,
+                (authenticated_notif_list_t & notif_list),
+                (override));
+    MOCK_METHOD(nixl_status_t,
                 genNotif,
                 (const std::string &remote_agent, const std::string &msg),
+                (const, override));
+    MOCK_METHOD(nixl_status_t,
+                genNotif,
+                (const nixlRemoteAgentBinding &binding, const std::string &msg),
                 (const, override));
 };
 

@@ -18,11 +18,14 @@ asio_dep = [dependency('asio', required: true)]
 ucx_backend_includes = include_directories('.')
 
 ucx_backend_sources = ['config.cpp',
+                       'ucx_connection_metadata.cpp',
                        'mem_list.cpp',
                        'rkey.cpp',
                        'ucx_attestation.cpp',
                        'ucx_backend.cpp',
                        'ucx_enums.cpp',
+                       'ucx_notif_wire.cpp',
+                       'ucx_notif_state.cpp',
                        'ucx_plugin.cpp',
                        'ucx_utils.cpp']
 

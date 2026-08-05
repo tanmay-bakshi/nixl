@@ -31,6 +31,7 @@ GMockBackendEngine::GMockBackendEngine() : nixlBackendEngine(&init_params) {
     ON_CALL(*this, supportsRemote()).WillByDefault(Return(true));
     ON_CALL(*this, supportsLocal()).WillByDefault(Return(true));
     ON_CALL(*this, supportsNotif()).WillByDefault(Return(true));
+    ON_CALL(*this, supportsAuthenticatedNotif()).WillByDefault(Return(false));
     ON_CALL(*this, getSupportedMems()).WillByDefault(Return(nixl_mem_list_t{DRAM_SEG}));
     ON_CALL(*this, registerMem(_, _, _)).WillByDefault(Return(NIXL_SUCCESS));
     ON_CALL(*this, deregisterMem(_)).WillByDefault(Return(NIXL_SUCCESS));
@@ -53,10 +54,23 @@ GMockBackendEngine::GMockBackendEngine() : nixlBackendEngine(&init_params) {
         return NIXL_SUCCESS;
     });
     ON_CALL(*this, loadRemoteConnInfo(_, _)).WillByDefault(Return(NIXL_SUCCESS));
+    ON_CALL(*this, queryRemoteAgentAuthority(_, _))
+        .WillByDefault([](const std::string &, nixl_remote_agent_authority_t &authority) {
+            authority.connectionIdentity = 1;
+            authority.endpointIdentities = {1};
+            return NIXL_SUCCESS;
+        });
+    ON_CALL(*this, bindRemoteAgent(_)).WillByDefault(Return(NIXL_SUCCESS));
+    ON_CALL(*this, retireRemoteAgent(_)).WillByDefault(Return(NIXL_SUCCESS));
+    ON_CALL(*this, queryRemoteNotificationState(_)).WillByDefault(Return(NIXL_SUCCESS));
     ON_CALL(*this, loadRemoteMD(_, _, _, _)).WillByDefault(Return(NIXL_SUCCESS));
     ON_CALL(*this, loadLocalMD(_, _)).WillByDefault(Return(NIXL_SUCCESS));
     ON_CALL(*this, getNotifs(_)).WillByDefault(Return(NIXL_SUCCESS));
-    ON_CALL(*this, genNotif(_, _)).WillByDefault(Return(NIXL_SUCCESS));
+    ON_CALL(*this, getAuthenticatedNotifs(_)).WillByDefault(Return(NIXL_SUCCESS));
+    ON_CALL(*this, genNotif(testing::A<const std::string &>(), _))
+        .WillByDefault(Return(NIXL_SUCCESS));
+    ON_CALL(*this, genNotif(testing::A<const nixlRemoteAgentBinding &>(), _))
+        .WillByDefault(Return(NIXL_SUCCESS));
 }
 
 void

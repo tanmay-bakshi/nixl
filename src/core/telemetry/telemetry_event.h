@@ -52,6 +52,7 @@ enum class nixl_telemetry_event_type_t : uint32_t {
     AGENT_ERR_REMOTE_DISCONNECT = 17,
     AGENT_ERR_CANCELED = 18,
     AGENT_ERR_NO_TELEMETRY = 19,
+    AGENT_ERR_NOT_READY = 20,
 };
 
 [[nodiscard]] nixl_telemetry_event_type_t
@@ -101,6 +102,8 @@ telemetryEventTypeStr(const nixl_telemetry_event_type_t type) noexcept {
         return "agent_err_canceled";
     case nixl_telemetry_event_type_t::AGENT_ERR_NO_TELEMETRY:
         return "agent_err_no_telemetry";
+    case nixl_telemetry_event_type_t::AGENT_ERR_NOT_READY:
+        return "agent_err_not_ready";
     }
     return "unknown_event";
 }

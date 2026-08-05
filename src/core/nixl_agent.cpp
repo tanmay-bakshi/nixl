@@ -15,9 +15,11 @@
  * limitations under the License.
  */
 
-#include <iostream>
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <iostream>
+#include <limits>
 #include <numeric>
 
 #include "nixl.h"
@@ -30,6 +32,7 @@
 #include "common/nixl_log.h"
 #include "common/operators.h"
 #include "common/hw_info.h"
+#include "common/uuid_v4.h"
 #include "telemetry.h"
 #include "telemetry_event.h"
 
@@ -38,6 +41,42 @@ namespace {
 const std::vector<std::vector<std::string>> illegal_plugin_combinations = {
     {"GDS", "GDS_MT"},
 };
+std::atomic<uint64_t> next_agent_identity{1};
+std::atomic<uint64_t> next_remote_handle_identity{1};
+
+[[nodiscard]] uint64_t
+allocateIdentity(std::atomic<uint64_t> &next_identity) {
+    uint64_t identity = next_identity.load(std::memory_order_relaxed);
+    do {
+        if (identity == std::numeric_limits<uint64_t>::max()) {
+            throw std::overflow_error("NIXL identity space exhausted");
+        }
+    } while (!next_identity.compare_exchange_weak(
+        identity, identity + 1, std::memory_order_relaxed, std::memory_order_relaxed));
+    return identity;
+}
+
+[[nodiscard]] bool
+isCanonicalAgentIncarnation(const std::string &incarnation) {
+    if (incarnation.size() != 36 || incarnation[8] != '-' || incarnation[13] != '-' ||
+        incarnation[18] != '-' || incarnation[23] != '-' || incarnation[14] != '4' ||
+        (incarnation[19] != '8' && incarnation[19] != '9' && incarnation[19] != 'a' &&
+         incarnation[19] != 'b')) {
+        return false;
+    }
+
+    for (size_t i = 0; i < incarnation.size(); ++i) {
+        if (i == 8 || i == 13 || i == 18 || i == 23) {
+            continue;
+        }
+        const char value = incarnation[i];
+        if (!((value >= '0' && value <= '9') || (value >= 'a' && value <= 'f'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
 
 } // namespace
 
@@ -54,6 +93,7 @@ nixlEngineDeleter::operator()(nixlBackendEngine *engine) const noexcept {
 }
 
 nixlXferReqH::nixlXferReqH(const std::string &remote_agent,
+                           const nixlRemoteAgentH *remote_handle,
                            const nixl_xfer_op_t backend_op,
                            const nixl_mem_t local_type,
                            const nixl_mem_t remote_type,
@@ -61,6 +101,7 @@ nixlXferReqH::nixlXferReqH(const std::string &remote_agent,
     : initiatorDescs(local_type, desc_count),
       targetDescs(remote_type, desc_count),
       remoteAgent(remote_agent),
+      remoteHandle(remote_handle),
       backendOp(backend_op) {}
 
 void
@@ -91,9 +132,12 @@ nixlXferReqH::updateRequestStats(nixlTelemetry *telemetry_pub,
                << duration.count() << "us.";
 }
 
-nixlDlistH::nixlDlistH(const std::string &remote_agent, descs_t &&descs)
+nixlDlistH::nixlDlistH(const std::string &remote_agent,
+                       const nixlRemoteAgentH *remote_handle,
+                       descs_t &&descs)
     : remoteAgent(remote_agent),
-      descs(std::move(descs)) {}
+      descs(std::move(descs)),
+      remoteHandle(remote_handle) {}
 
 /*** nixlAgentData constructor/destructor, as part of nixlAgent's ***/
 
@@ -125,6 +169,8 @@ effectiveSyncMode(nixl_thread_sync_t requested, bool needs_comm_thread) {
 
 nixlAgentData::nixlAgentData(const std::string &name, const nixlAgentConfig &config)
     : name_(name),
+      identity_(allocateIdentity(next_agent_identity)),
+      incarnation_(nixl::UUIDv4().to_string()),
       config_(config),
       useEtcd_(detectEtcd()),
       needsCommThread_(useEtcd_ || config.useListenThread),
@@ -155,6 +201,135 @@ nixlAgentData::nixlAgentData(const std::string &name, const nixlAgentConfig &con
         telemetryEnabled = true;
         NIXL_DEBUG << "Capturing NIXL telemetry based on config (without an output file)";
     }
+}
+
+nixl_status_t
+nixlAgentData::validateRemoteHandle(const nixlRemoteAgentH *handle) const {
+    if (handle == nullptr || ownedRemoteHandles_.find(handle) == ownedRemoteHandles_.end()) {
+        return NIXL_ERR_INVALID_PARAM;
+    }
+    if (handle->ownerIdentity_ != identity_) {
+        return NIXL_ERR_INVALID_PARAM;
+    }
+
+    const auto active = activeRemoteHandles_.find(handle->name_);
+    if (!handle->active_ || active == activeRemoteHandles_.end() ||
+        active->second != handle) {
+        return NIXL_ERR_NOT_ALLOWED;
+    }
+    return NIXL_SUCCESS;
+}
+
+nixlRemoteAgentH *
+nixlAgentData::findActiveRemoteHandle(const std::string &remote_name) const {
+    const auto handle = activeRemoteHandles_.find(remote_name);
+    return handle == activeRemoteHandles_.end() ? nullptr : handle->second;
+}
+
+nixlRemoteAgentH *
+nixlAgentData::findOwnedRemoteHandle(uint64_t identity, uint64_t generation) const {
+    const auto handle = remoteHandlesByIdentity_.find(identity);
+    if (handle == remoteHandlesByIdentity_.end() ||
+        handle->second->generation_ != generation ||
+        handle->second->ownerIdentity_ != identity_) {
+        return nullptr;
+    }
+    return handle->second;
+}
+
+void
+nixlAgentData::deactivateRemoteHandle(const std::string &remote_name) {
+    const auto handle = activeRemoteHandles_.find(remote_name);
+    if (handle == activeRemoteHandles_.end()) {
+        return;
+    }
+    handle->second->active_ = false;
+    activeRemoteHandles_.erase(handle);
+}
+
+nixl_status_t
+nixlAgent::validateXferRemoteHandleLocked(const nixlXferReqH *req_hndl) const {
+    if (req_hndl == nullptr) {
+        return NIXL_ERR_INVALID_PARAM;
+    }
+
+    if (req_hndl->remoteHandle == nullptr) {
+        return req_hndl->remoteAgent == data->name_ ? NIXL_SUCCESS :
+                                                     NIXL_ERR_INVALID_PARAM;
+    }
+
+    const nixl_status_t status = data->validateRemoteHandle(req_hndl->remoteHandle);
+    if (status != NIXL_SUCCESS) {
+        return status;
+    }
+    if (req_hndl->remoteAgent != req_hndl->remoteHandle->name_) {
+        return NIXL_ERR_NOT_ALLOWED;
+    }
+    if (req_hndl->engine == nullptr) {
+        return NIXL_ERR_UNKNOWN;
+    }
+
+    const auto binding = req_hndl->remoteHandle->bindings_.find(req_hndl->engine);
+    if (binding == req_hndl->remoteHandle->bindings_.end()) {
+        return req_hndl->engine->supportsAuthenticatedNotif() ?
+            NIXL_ERR_NOT_ALLOWED :
+            NIXL_SUCCESS;
+    }
+
+    const nixl_remote_agent_authority_t &expected = binding->second.authority;
+    const nixl_remote_agent_authority_t &observed = req_hndl->remoteAuthority;
+    if (expected.handleIdentity != observed.handleIdentity ||
+        expected.generation != observed.generation ||
+        expected.connectionIdentity != observed.connectionIdentity ||
+        expected.endpointIdentities != observed.endpointIdentities) {
+        return NIXL_ERR_NOT_ALLOWED;
+    }
+    return NIXL_SUCCESS;
+}
+
+nixl_status_t
+nixlAgent::validateXferAttestationLocked(
+    const nixlXferReqH *req_hndl,
+    const nixl_xfer_attestation_t &attestation) const {
+    const nixl_status_t status = validateXferRemoteHandleLocked(req_hndl);
+    if (status != NIXL_SUCCESS) {
+        return status;
+    }
+
+    if (req_hndl->remoteHandle == nullptr) {
+        return attestation.remoteAgentHandleIdentity == 0 &&
+                attestation.remoteAgentGeneration == 0 &&
+                attestation.remoteConnectionIdentity == 0 &&
+                attestation.authorizedEndpointIdentities.empty() ?
+            NIXL_SUCCESS :
+            NIXL_ERR_NOT_ALLOWED;
+    }
+
+    const nixl_remote_agent_authority_t &authority = req_hndl->remoteAuthority;
+    if (attestation.remoteAgent != req_hndl->remoteAgent ||
+        attestation.remoteAgentHandleIdentity != authority.handleIdentity ||
+        attestation.remoteAgentGeneration != authority.generation ||
+        attestation.remoteConnectionIdentity != authority.connectionIdentity ||
+        attestation.authorizedEndpointIdentities != authority.endpointIdentities) {
+        return NIXL_ERR_NOT_ALLOWED;
+    }
+
+    for (const auto &segment : attestation.segments) {
+        if (segment.endpointIdentity != 0 &&
+            !std::binary_search(authority.endpointIdentities.begin(),
+                                authority.endpointIdentities.end(),
+                                segment.endpointIdentity)) {
+            return NIXL_ERR_NOT_ALLOWED;
+        }
+    }
+    for (const auto &endpoint : attestation.endpoints) {
+        if (!std::binary_search(authority.endpointIdentities.begin(),
+                                authority.endpointIdentities.end(),
+                                endpoint.endpointIdentity)) {
+            return NIXL_ERR_NOT_ALLOWED;
+        }
+    }
+    return NIXL_SUCCESS;
 }
 
 /*** nixlAgent implementation ***/
@@ -199,6 +374,22 @@ nixlAgent::~nixlAgent() {
         }
 
         data->listener.reset();
+    }
+
+    NIXL_LOCK_GUARD(data->lock);
+    std::unordered_set<std::string> remote_agents;
+    for (const auto &remote_backend : data->remoteBackends_) {
+        remote_agents.insert(remote_backend.first);
+    }
+    for (const auto &remote_handle : data->activeRemoteHandles_) {
+        remote_agents.insert(remote_handle.first);
+    }
+    for (const std::string &remote_agent : remote_agents) {
+        const nixl_status_t status = data->invalidateRemoteData(remote_agent);
+        if (status != NIXL_SUCCESS && status != NIXL_ERR_NOT_FOUND) {
+            NIXL_WARN << "Failed to retire remote agent '" << remote_agent
+                      << "' during agent destruction with status " << status;
+        }
     }
 }
 
@@ -307,6 +498,7 @@ nixlAgent::createBackend(const nixl_backend_t &type,
 
     nixlBackendInitParams init_params;
     init_params.localAgent = data->name_;
+    init_params.localAgentIncarnation = data->incarnation_;
     init_params.type = type;
     init_params.customParams = const_cast<nixl_b_params_t *>(&params);
     init_params.enableProgTh = data->config_.useProgThread;
@@ -521,12 +713,11 @@ nixlAgent::deregisterMem(const nixl_reg_dlist_t &descs,
 }
 
 nixl_status_t
-nixlAgent::makeConnection(const std::string &remote_agent,
-                          const nixl_opt_args_t* extra_params) {
+nixlAgent::makeConnectionLocked(const std::string &remote_agent,
+                                const nixl_opt_args_t *extra_params) {
     std::set<nixl_backend_t> backend_set;
     int count = 0;
 
-    NIXL_LOCK_GUARD(data->lock);
     if (data->remoteBackends_.count(remote_agent) == 0) {
         NIXL_ERROR_FUNC << "metadata for remote agent '" << remote_agent << "' not found";
         return NIXL_ERR_NOT_FOUND;
@@ -574,21 +765,58 @@ nixlAgent::makeConnection(const std::string &remote_agent,
 }
 
 nixl_status_t
-nixlAgent::prepXferDlist (const std::string &agent_name,
-                          const nixl_xfer_dlist_t &descs,
-                          nixlDlistH* &dlist_hndl,
-                          const nixl_opt_args_t* extra_params) const {
+nixlAgent::makeConnection(const std::string &remote_agent,
+                          const nixl_opt_args_t *extra_params) {
+    NIXL_LOCK_GUARD(data->lock);
+    if (remote_agent != data->name_) {
+        NIXL_ERROR_FUNC << "an opaque remote-agent handle is required";
+        return NIXL_ERR_INVALID_PARAM;
+    }
+    return makeConnectionLocked(remote_agent, extra_params);
+}
+
+nixl_status_t
+nixlAgent::makeConnection(const nixlRemoteAgentH *remote_agent,
+                          const nixl_opt_args_t *extra_params) {
+    NIXL_LOCK_GUARD(data->lock);
+    const nixl_status_t status = data->validateRemoteHandle(remote_agent);
+    if (status != NIXL_SUCCESS) {
+        return status;
+    }
+    return makeConnectionLocked(remote_agent->name_, extra_params);
+}
+
+nixl_status_t
+nixlAgent::prepXferDlistImpl(const std::string &agent_name,
+                             const nixlRemoteAgentH *remote_agent,
+                             const nixl_xfer_dlist_t &descs,
+                             nixlDlistH *&dlist_hndl,
+                             const nixl_opt_args_t *extra_params) const {
 
     // Using a set as order is not important to revert the operation
     backend_set_t *backend_set;
-    const bool init_side = (agent_name == NIXL_INIT_AGENT);
 
     NIXL_LOCK_GUARD(data->lock);
+    std::string resolved_agent = agent_name;
+    if (remote_agent != nullptr) {
+        const nixl_status_t status = data->validateRemoteHandle(remote_agent);
+        if (status != NIXL_SUCCESS) {
+            return status;
+        }
+        resolved_agent = remote_agent->name_;
+    }
+
+    const bool init_side = resolved_agent == NIXL_INIT_AGENT;
+    if (!init_side && remote_agent == nullptr && resolved_agent != data->name_) {
+        NIXL_ERROR_FUNC << "an opaque remote-agent handle is required";
+        return NIXL_ERR_INVALID_PARAM;
+    }
+
     // When central KV is supported, still it should return error,
     // just we can add a call to fetchRemoteMD for next time
-    const auto rem_sec_it = data->remoteSections_.find(agent_name);
+    const auto rem_sec_it = data->remoteSections_.find(resolved_agent);
     if (!init_side && (data->remoteSections_.end() == rem_sec_it)) {
-        NIXL_ERROR_FUNC << "metadata for remote agent '" << agent_name << "' not found";
+        NIXL_ERROR_FUNC << "metadata for remote agent '" << resolved_agent << "' not found";
         data->addErrorTelemetry(NIXL_ERR_NOT_FOUND);
         return NIXL_ERR_NOT_FOUND;
     }
@@ -630,13 +858,29 @@ nixlAgent::prepXferDlist (const std::string &agent_name,
         dlist_hndl = nullptr;
         NIXL_ERROR_FUNC << "failed to prepare the descriptors for any of "
                            "the specified or potential backends for agent '"
-                        << agent_name << "'";
+                        << resolved_agent << "'";
         data->addErrorTelemetry(NIXL_ERR_NOT_FOUND);
         return NIXL_ERR_NOT_FOUND;
     }
 
-    dlist_hndl = new nixlDlistH(agent_name, std::move(dlists));
+    dlist_hndl = new nixlDlistH(resolved_agent, remote_agent, std::move(dlists));
     return NIXL_SUCCESS;
+}
+
+nixl_status_t
+nixlAgent::prepXferDlist(const std::string &agent_name,
+                         const nixl_xfer_dlist_t &descs,
+                         nixlDlistH *&dlist_hndl,
+                         const nixl_opt_args_t *extra_params) const {
+    return prepXferDlistImpl(agent_name, nullptr, descs, dlist_hndl, extra_params);
+}
+
+nixl_status_t
+nixlAgent::prepXferDlist(const nixlRemoteAgentH *remote_agent,
+                         const nixl_xfer_dlist_t &descs,
+                         nixlDlistH *&dlist_hndl,
+                         const nixl_opt_args_t *extra_params) const {
+    return prepXferDlistImpl("", remote_agent, descs, dlist_hndl, extra_params);
 }
 
 nixl_status_t
@@ -681,6 +925,20 @@ nixlAgent::makeXferReq (const nixl_xfer_op_t &operation,
                         << "' was invalidated in between prepXferDlist and this call";
         data->addErrorTelemetry(NIXL_ERR_NOT_FOUND);
         return NIXL_ERR_NOT_FOUND;
+    }
+
+    if (remote_side->remoteHandle == nullptr) {
+        if (remote_side->remoteAgent != data->name_) {
+            return NIXL_ERR_INVALID_PARAM;
+        }
+    } else {
+        const nixl_status_t handle_status =
+            data->validateRemoteHandle(remote_side->remoteHandle);
+        if (handle_status != NIXL_SUCCESS) {
+            NIXL_ERROR_FUNC << "prepared remote handle is stale or belongs to another agent";
+            data->addErrorTelemetry(handle_status);
+            return handle_status;
+        }
     }
 
     if (extra_params && extra_params->backends.size() > 0) {
@@ -757,6 +1015,7 @@ nixlAgent::makeXferReq (const nixl_xfer_op_t &operation,
     }
 
     auto handle = std::make_unique<nixlXferReqH>(remote_side->remoteAgent,
+                                                 remote_side->remoteHandle,
                                                  operation,
                                                  local_descs.getType(),
                                                  remote_descs.getType(),
@@ -806,6 +1065,16 @@ nixlAgent::makeXferReq (const nixl_xfer_op_t &operation,
     }
 
     handle->engine = backend;
+
+    if (remote_side->remoteHandle != nullptr) {
+        const auto binding = remote_side->remoteHandle->bindings_.find(backend);
+        if (binding != remote_side->remoteHandle->bindings_.end()) {
+            handle->remoteAuthority = binding->second.authority;
+            opt_args.remoteAgentAuthority = &handle->remoteAuthority;
+        } else if (backend->supportsAuthenticatedNotif()) {
+            return NIXL_ERR_NOT_SUPPORTED;
+        }
+    }
     handle->notifMsg = opt_args.notifMsg;
     handle->hasNotif = opt_args.hasNotif;
 
@@ -832,12 +1101,13 @@ nixlAgent::makeXferReq (const nixl_xfer_op_t &operation,
 }
 
 nixl_status_t
-nixlAgent::createXferReq(const nixl_xfer_op_t &operation,
-                         const nixl_xfer_dlist_t &local_descs,
-                         const nixl_xfer_dlist_t &remote_descs,
-                         const std::string &remote_agent,
-                         nixlXferReqH* &req_hndl,
-                         const nixl_opt_args_t* extra_params) const {
+nixlAgent::createXferReqImpl(const nixl_xfer_op_t &operation,
+                             const nixl_xfer_dlist_t &local_descs,
+                             const nixl_xfer_dlist_t &remote_descs,
+                             const std::string &remote_agent_name,
+                             const nixlRemoteAgentH *remote_agent,
+                             nixlXferReqH *&req_hndl,
+                             const nixl_opt_args_t *extra_params) const {
     nixl_status_t ret1, ret2;
     nixl_opt_b_args_t opt_args;
     backend_set_t backend_set;
@@ -861,9 +1131,21 @@ nixlAgent::createXferReq(const nixl_xfer_op_t &operation,
     }
 
     NIXL_SHARED_LOCK_GUARD(data->lock);
-    const auto rem_sec_it = data->remoteSections_.find(remote_agent);
+    std::string resolved_agent = remote_agent_name;
+    if (remote_agent != nullptr) {
+        const nixl_status_t handle_status = data->validateRemoteHandle(remote_agent);
+        if (handle_status != NIXL_SUCCESS) {
+            return handle_status;
+        }
+        resolved_agent = remote_agent->name_;
+    } else if (resolved_agent != data->name_) {
+        NIXL_ERROR_FUNC << "an opaque remote-agent handle is required";
+        return NIXL_ERR_INVALID_PARAM;
+    }
+
+    const auto rem_sec_it = data->remoteSections_.find(resolved_agent);
     if (data->remoteSections_.end() == rem_sec_it) {
-        NIXL_ERROR_FUNC << "metadata for remote agent '" << remote_agent << "' not found";
+        NIXL_ERROR_FUNC << "metadata for remote agent '" << resolved_agent << "' not found";
         data->addErrorTelemetry(NIXL_ERR_NOT_FOUND);
         return NIXL_ERR_NOT_FOUND;
     }
@@ -897,7 +1179,8 @@ nixlAgent::createXferReq(const nixl_xfer_op_t &operation,
     // TODO: merge descriptors back to back in memory (like makeXferReq).
     // TODO [Perf]: Avoid heap allocation on the datapath, maybe use a mem pool
 
-    auto handle = std::make_unique<nixlXferReqH>(remote_agent,
+    auto handle = std::make_unique<nixlXferReqH>(resolved_agent,
+                                                 remote_agent,
                                                  operation,
                                                  local_descs.getType(),
                                                  remote_descs.getType(),
@@ -922,6 +1205,16 @@ nixlAgent::createXferReq(const nixl_xfer_op_t &operation,
                            "registrations to be able to do the transfer";
         data->addErrorTelemetry(NIXL_ERR_NOT_FOUND);
         return NIXL_ERR_NOT_FOUND;
+    }
+
+    if (remote_agent != nullptr) {
+        const auto binding = remote_agent->bindings_.find(handle->engine);
+        if (binding != remote_agent->bindings_.end()) {
+            handle->remoteAuthority = binding->second.authority;
+            opt_args.remoteAgentAuthority = &handle->remoteAuthority;
+        } else if (handle->engine->supportsAuthenticatedNotif()) {
+            return NIXL_ERR_NOT_SUPPORTED;
+        }
     }
 
     if (extra_params) {
@@ -970,6 +1263,38 @@ nixlAgent::createXferReq(const nixl_xfer_op_t &operation,
 }
 
 nixl_status_t
+nixlAgent::createXferReq(const nixl_xfer_op_t &operation,
+                         const nixl_xfer_dlist_t &local_descs,
+                         const nixl_xfer_dlist_t &remote_descs,
+                         const std::string &remote_agent,
+                         nixlXferReqH *&req_hndl,
+                         const nixl_opt_args_t *extra_params) const {
+    return createXferReqImpl(operation,
+                             local_descs,
+                             remote_descs,
+                             remote_agent,
+                             nullptr,
+                             req_hndl,
+                             extra_params);
+}
+
+nixl_status_t
+nixlAgent::createXferReq(const nixl_xfer_op_t &operation,
+                         const nixl_xfer_dlist_t &local_descs,
+                         const nixl_xfer_dlist_t &remote_descs,
+                         const nixlRemoteAgentH *remote_agent,
+                         nixlXferReqH *&req_hndl,
+                         const nixl_opt_args_t *extra_params) const {
+    return createXferReqImpl(operation,
+                             local_descs,
+                             remote_descs,
+                             "",
+                             remote_agent,
+                             req_hndl,
+                             extra_params);
+}
+
+nixl_status_t
 nixlAgent::estimateXferCost(const nixlXferReqH *req_hndl,
                             std::chrono::microseconds &duration,
                             std::chrono::microseconds &err_margin,
@@ -979,14 +1304,10 @@ nixlAgent::estimateXferCost(const nixlXferReqH *req_hndl,
     nixl_status_t ret;
     NIXL_SHARED_LOCK_GUARD(data->lock);
 
-    // Check if the remote agent connection info is still valid
-    // (assuming cost estimation requires connection info like transfers)
-    if (!req_hndl->remoteAgent.empty() &&
-        (data->remoteSections_.count(req_hndl->remoteAgent) == 0)) {
-        NIXL_ERROR_FUNC << "invalid request handle, remote agent was invalidated "
-                           "after transfer request creation";
-        data->addErrorTelemetry(NIXL_ERR_NOT_FOUND);
-        return NIXL_ERR_NOT_FOUND;
+    const nixl_status_t handle_status = validateXferRemoteHandleLocked(req_hndl);
+    if (handle_status != NIXL_SUCCESS) {
+        data->addErrorTelemetry(handle_status);
+        return handle_status;
     }
 
     if (!req_hndl->engine) {
@@ -1029,12 +1350,10 @@ nixlAgent::postXferReq(nixlXferReqH *req_hndl,
     }
 
     NIXL_SHARED_LOCK_GUARD(data->lock);
-    // Check if the remote was invalidated before post/repost
-    if (data->remoteSections_.count(req_hndl->remoteAgent) == 0) {
-        NIXL_ERROR_FUNC << "remote agent '" << req_hndl->remoteAgent
-                        << "' was invalidated after transfer request creation";
-        data->addErrorTelemetry(NIXL_ERR_NOT_FOUND);
-        return NIXL_ERR_NOT_FOUND;
+    const nixl_status_t handle_status = validateXferRemoteHandleLocked(req_hndl);
+    if (handle_status != NIXL_SUCCESS) {
+        data->addErrorTelemetry(handle_status);
+        return handle_status;
     }
 
     // We can't repost while a request is in progress
@@ -1085,6 +1404,24 @@ nixlAgent::postXferReq(nixlXferReqH *req_hndl,
         return NIXL_ERR_BACKEND;
     }
 
+    if (opt_args.hasNotif && req_hndl->remoteHandle != nullptr &&
+        req_hndl->engine->supportsAuthenticatedNotif()) {
+        const auto binding = req_hndl->remoteHandle->bindings_.find(req_hndl->engine);
+        if (binding == req_hndl->remoteHandle->bindings_.end()) {
+            return NIXL_ERR_NOT_ALLOWED;
+        }
+        const nixl_status_t readiness =
+            req_hndl->engine->queryRemoteNotificationState(binding->second);
+        if (readiness != NIXL_SUCCESS) {
+            data->addErrorTelemetry(readiness);
+            return readiness;
+        }
+    }
+
+    if (req_hndl->remoteHandle != nullptr) {
+        opt_args.remoteAgentAuthority = &req_hndl->remoteAuthority;
+    }
+
     // If status is not NIXL_IN_PROG we can repost,
     req_hndl->status = req_hndl->engine->postXfer(req_hndl->backendOp,
                                                   req_hndl->initiatorDescs,
@@ -1123,16 +1460,14 @@ nixlAgent::postXferReq(nixlXferReqH *req_hndl,
 
 nixl_status_t
 nixlAgent::getXferStatusLocked(nixlXferReqH *req_hndl) const {
+    const nixl_status_t handle_status = validateXferRemoteHandleLocked(req_hndl);
+    if (handle_status != NIXL_SUCCESS) {
+        return handle_status;
+    }
+
     // If the status is done, no need to recheck and no state changes.
     // Same for users incorrectly recalling this method in error/done.
     if (req_hndl->status == NIXL_IN_PROG) {
-        // Check if the remote was invalidated before completion
-        if (data->remoteSections_.count(req_hndl->remoteAgent) == 0) {
-            NIXL_ERROR_FUNC << "remote agent '" << req_hndl->remoteAgent
-                            << "' was invalidated during transfer";
-            return NIXL_ERR_NOT_FOUND;
-        }
-
         req_hndl->status = req_hndl->engine->checkXfer(req_hndl->backendHandle);
         if (req_hndl->status < 0) {
             if (req_hndl->status == NIXL_ERR_REMOTE_DISCONNECT) {
@@ -1166,6 +1501,12 @@ nixlAgent::getXferStatus (nixlXferReqH *req_hndl) const {
 nixl_status_t
 nixlAgent::getXferTelemetry(const nixlXferReqH *req_hndl, nixl_xfer_telem_t &telemetry) const {
 
+    NIXL_SHARED_LOCK_GUARD(data->lock);
+    const nixl_status_t handle_status = validateXferRemoteHandleLocked(req_hndl);
+    if (handle_status != NIXL_SUCCESS) {
+        return handle_status;
+    }
+
     if (!data->telemetryEnabled) {
         NIXL_ERROR_FUNC << "cannot return values when telemetry is not enabled.";
         return NIXL_ERR_NO_TELEMETRY;
@@ -1184,6 +1525,10 @@ nixl_status_t
 nixlAgent::queryXferBackend(const nixlXferReqH* req_hndl,
                             nixlBackendH* &backend) const {
     NIXL_LOCK_GUARD(data->lock);
+    const nixl_status_t handle_status = validateXferRemoteHandleLocked(req_hndl);
+    if (handle_status != NIXL_SUCCESS) {
+        return handle_status;
+    }
     backend = data->backendHandles_[req_hndl->engine->getType()].get();
     return NIXL_SUCCESS;
 }
@@ -1196,12 +1541,16 @@ nixlAgent::queryXferAttestation(const nixlXferReqH *req_hndl,
     }
 
     NIXL_SHARED_LOCK_GUARD(data->lock);
+    const nixl_status_t handle_status = validateXferRemoteHandleLocked(req_hndl);
+    if (handle_status != NIXL_SUCCESS) {
+        return handle_status;
+    }
     nixl_status_t status =
         req_hndl->engine->queryXferAttestation(req_hndl->backendHandle, attestation);
     if (status != NIXL_SUCCESS) {
         return status;
     }
-    return NIXL_SUCCESS;
+    return validateXferAttestationLocked(req_hndl, attestation);
 }
 
 nixl_status_t
@@ -1219,6 +1568,11 @@ nixlAgent::takeXferCompletionAttestation(nixlXferReqH *req_hndl,
 
     status = req_hndl->engine->takeXferCompletionAttestation(
         req_hndl->backendHandle, attestation);
+    if (status != NIXL_SUCCESS) {
+        return status;
+    }
+
+    status = validateXferAttestationLocked(req_hndl, attestation);
     if (status != NIXL_SUCCESS) {
         return status;
     }
@@ -1326,9 +1680,66 @@ nixlAgent::getNotifs(nixl_notifs_t &notif_map,
 }
 
 nixl_status_t
-nixlAgent::genNotif(const std::string &remote_agent,
-                    const nixl_blob_t &msg,
-                    const nixl_opt_args_t *extra_params) const {
+nixlAgent::getRemoteNotifs(nixl_remote_notifs_t &notif_map,
+                           const nixl_opt_args_t *extra_params) {
+    backend_list_t selected_engines;
+    backend_list_t *backend_list = &selected_engines;
+    authenticated_notif_list_t backend_notifications;
+    nixl_status_t bad_status = NIXL_SUCCESS;
+
+    NIXL_LOCK_GUARD(data->lock);
+    if (extra_params == nullptr || extra_params->backends.empty()) {
+        for (nixlBackendEngine *engine : data->notifEngines) {
+            if (engine->supportsAuthenticatedNotif()) {
+                selected_engines.push_back(engine);
+            }
+        }
+    } else {
+        for (const nixlBackendH *backend : extra_params->backends) {
+            if (backend->engine->supportsAuthenticatedNotif()) {
+                selected_engines.push_back(backend->engine);
+            }
+        }
+    }
+
+    if (backend_list->empty()) {
+        return NIXL_ERR_NOT_SUPPORTED;
+    }
+
+    for (nixlBackendEngine *engine : *backend_list) {
+        backend_notifications.clear();
+        const nixl_status_t status =
+            engine->getAuthenticatedNotifs(backend_notifications);
+        if (status != NIXL_SUCCESS) {
+            bad_status = status;
+            continue;
+        }
+
+        for (auto &notification : backend_notifications) {
+            if (notification.handleIdentity == 0 && notification.generation == 0) {
+                continue;
+            }
+
+            nixlRemoteAgentH *remote_handle =
+                data->findOwnedRemoteHandle(notification.handleIdentity,
+                                            notification.generation);
+            if (remote_handle == nullptr ||
+                remote_handle->bindings_.find(engine) == remote_handle->bindings_.end()) {
+                bad_status = NIXL_ERR_NOT_ALLOWED;
+                continue;
+            }
+
+            notif_map[remote_handle].push_back(
+                std::move(notification.payload));
+        }
+    }
+
+    return bad_status;
+}
+
+nixl_status_t
+nixlAgent::genLocalNotifLocked(const nixl_blob_t &msg,
+                               const nixl_opt_args_t *extra_params) const {
 
     backend_list_t backend_list_value;
     backend_list_t *backend_list;
@@ -1350,40 +1761,90 @@ nixlAgent::genNotif(const std::string &remote_agent,
         return NIXL_ERR_BACKEND;
     }
 
-    NIXL_SHARED_LOCK_GUARD(data->lock);
-
-    if (data->name_ == remote_agent) {
-        for (const auto &eng : *backend_list) {
-            if (eng->supportsLocal()) {
-                ret = eng->genNotif(remote_agent, msg);
-                if (ret < 0) {
-                    NIXL_ERROR_FUNC << "backend '" << eng->getType() << "' returned error status "
-                                    << ret << " while sending intra-agent notifications";
-                }
-                return ret;
+    for (const auto &eng : *backend_list) {
+        if (eng->supportsLocal()) {
+            ret = eng->genNotif(data->name_, msg);
+            if (ret < 0) {
+                NIXL_ERROR_FUNC << "backend '" << eng->getType() << "' returned error status "
+                                << ret << " while sending intra-agent notifications";
             }
-        }
-        NIXL_ERROR_FUNC << "no specified or potential backend can send intra-agent notifications";
-        return NIXL_ERR_NOT_FOUND;
-    }
-    const auto iter = data->remoteBackends_.find(remote_agent);
-
-    if (iter != data->remoteBackends_.end()) {
-        for (const auto &eng : *backend_list) {
-            if (iter->second.count(eng->getType()) != 0) {
-                ret = eng->genNotif(remote_agent, msg);
-                if (ret < 0) {
-                    NIXL_ERROR_FUNC << "backend '" << eng->getType() << "' returned error status "
-                                    << ret << " while sending notification to agent '"
-                                    << remote_agent << "'";
-                }
-                return ret;
-            }
+            return ret;
         }
     }
-
-    NIXL_ERROR_FUNC << "no specified or potential backend could send the inter-agent notifications";
+    NIXL_ERROR_FUNC << "no specified or potential backend can send intra-agent notifications";
     return NIXL_ERR_NOT_FOUND;
+}
+
+nixl_status_t
+nixlAgent::genRemoteNotifLocked(const nixlRemoteAgentH *remote_agent,
+                                const nixl_blob_t &msg,
+                                const nixl_opt_args_t *extra_params) const {
+    backend_list_t selected_engines;
+    const backend_list_t *backend_list = &data->notifEngines;
+    nixl_status_t unavailable_status = NIXL_ERR_NOT_FOUND;
+
+    if (extra_params != nullptr && !extra_params->backends.empty()) {
+        for (const nixlBackendH *backend : extra_params->backends) {
+            if (backend->engine->supportsAuthenticatedNotif()) {
+                selected_engines.push_back(backend->engine);
+            }
+        }
+        backend_list = &selected_engines;
+    }
+
+    for (nixlBackendEngine *engine : *backend_list) {
+        if (!engine->supportsAuthenticatedNotif()) {
+            continue;
+        }
+        const auto binding = remote_agent->bindings_.find(engine);
+        if (binding == remote_agent->bindings_.end()) {
+            continue;
+        }
+
+        const nixl_status_t readiness =
+            engine->queryRemoteNotificationState(binding->second);
+        if (readiness != NIXL_SUCCESS) {
+            if (unavailable_status == NIXL_ERR_NOT_FOUND ||
+                readiness == NIXL_ERR_NOT_READY) {
+                unavailable_status = readiness;
+            }
+            continue;
+        }
+
+        const nixl_status_t status = engine->genNotif(binding->second, msg);
+        if (status < 0) {
+            NIXL_ERROR_FUNC << "backend '" << engine->getType() << "' returned error status "
+                            << status << " while sending notification to agent '"
+                            << remote_agent->name_ << "'";
+        }
+        return status;
+    }
+
+    return unavailable_status;
+}
+
+nixl_status_t
+nixlAgent::genNotif(const std::string &remote_agent,
+                    const nixl_blob_t &msg,
+                    const nixl_opt_args_t *extra_params) const {
+    NIXL_SHARED_LOCK_GUARD(data->lock);
+    if (remote_agent != data->name_) {
+        NIXL_ERROR_FUNC << "an opaque remote-agent handle is required";
+        return NIXL_ERR_INVALID_PARAM;
+    }
+    return genLocalNotifLocked(msg, extra_params);
+}
+
+nixl_status_t
+nixlAgent::genNotif(const nixlRemoteAgentH *remote_agent,
+                    const nixl_blob_t &msg,
+                    const nixl_opt_args_t *extra_params) const {
+    NIXL_SHARED_LOCK_GUARD(data->lock);
+    const nixl_status_t status = data->validateRemoteHandle(remote_agent);
+    if (status != NIXL_SUCCESS) {
+        return status;
+    }
+    return genRemoteNotifLocked(remote_agent, msg, extra_params);
 }
 
 nixl_status_t
@@ -1404,6 +1865,9 @@ nixlAgent::getLocalMD (nixl_blob_t &str) const {
     nixlSerDes sd;
     ret = sd.addStr("Agent", data->name_);
     // Always returns SUCCESS, serdes class logs errors if necessary
+    if (ret) return NIXL_ERR_UNKNOWN;
+
+    ret = sd.addStr("AgentIncarnation", data->incarnation_);
     if (ret) return NIXL_ERR_UNKNOWN;
 
     ret = sd.addBuf("Conns", &conn_cnt, sizeof(conn_cnt));
@@ -1484,6 +1948,9 @@ nixlAgent::getLocalPartialMD(const nixl_reg_dlist_t &descs,
     // Always returns SUCCESS, serdes class logs errors if necessary
     if (ret) return NIXL_ERR_UNKNOWN;
 
+    ret = sd.addStr("AgentIncarnation", data->incarnation_);
+    if (ret) return NIXL_ERR_UNKNOWN;
+
     // Only add connection info if requested via extra_params or empty dlist
     size_t conn_cnt = ((extra_params && extra_params->includeConnInfo) || descs.descCount() == 0) ?
                       found_iters.size() : 0;
@@ -1512,14 +1979,13 @@ nixlAgent::getLocalPartialMD(const nixl_reg_dlist_t &descs,
 }
 
 nixl_status_t
-nixlAgent::loadRemoteMD (const nixl_blob_t &remote_metadata,
-                         std::string &agent_name) {
+nixlAgent::loadRemoteMD(const nixl_blob_t &remote_metadata,
+                        nixlRemoteAgentH *&remote_agent_handle) {
     nixlSerDes sd;
-    nixl_blob_t conn_info;
-    nixl_backend_t nixl_backend;
     nixl_status_t ret;
 
     NIXL_LOCK_GUARD(data->lock);
+    remote_agent_handle = nullptr;
     ret = sd.importStr(remote_metadata);
     if (ret != NIXL_SUCCESS) {
         NIXL_ERROR_FUNC << "failed to deserialize remote metadata";
@@ -1532,10 +1998,41 @@ nixlAgent::loadRemoteMD (const nixl_blob_t &remote_metadata,
         return NIXL_ERR_MISMATCH;
     }
 
+    const std::string agent_incarnation = sd.getStr("AgentIncarnation");
+    if (!isCanonicalAgentIncarnation(agent_incarnation)) {
+        NIXL_ERROR_FUNC << "error in deserializing remote agent incarnation";
+        return NIXL_ERR_MISMATCH;
+    }
+
     if (remote_agent == data->name_) {
         NIXL_ERROR_FUNC << "remote agent name same as local agent, "
                            "no need to load metadata";
         return NIXL_ERR_INVALID_PARAM;
+    }
+
+    if (data->quarantinedRemoteNames_.count(remote_agent) != 0) {
+        NIXL_ERROR_FUNC << "remote agent '" << remote_agent
+                        << "' is quarantined after ambiguous cleanup";
+        return NIXL_ERR_NOT_ALLOWED;
+    }
+
+    nixlRemoteAgentH *active_handle =
+        data->findActiveRemoteHandle(remote_agent);
+    if (active_handle != nullptr) {
+        if (active_handle->agentIncarnation_ != agent_incarnation) {
+            NIXL_ERROR_FUNC << "conflicting incarnation for active remote agent '"
+                            << remote_agent << "'";
+            return NIXL_ERR_NOT_ALLOWED;
+        }
+    }
+
+    const bool has_residual_remote_data = data->remoteBackends_.count(remote_agent) != 0 ||
+        data->remoteSections_.count(remote_agent) != 0;
+    if (active_handle == nullptr && has_residual_remote_data) {
+        const nixl_status_t cleanup_status = data->invalidateRemoteData(remote_agent);
+        NIXL_ERROR_FUNC << "rejected orphan metadata state for remote agent '"
+                        << remote_agent << "'; cleanup status " << cleanup_status;
+        return cleanup_status == NIXL_SUCCESS ? NIXL_ERR_NOT_ALLOWED : cleanup_status;
     }
 
     NIXL_DEBUG << "Loading remote metadata for agent: " << remote_agent;
@@ -1547,29 +2044,26 @@ nixlAgent::loadRemoteMD (const nixl_blob_t &remote_metadata,
         return NIXL_ERR_MISMATCH;
     }
 
-    int count = 0;
+    std::unordered_map<nixl_backend_t, nixl_blob_t> document_connections;
     for (size_t i = 0; i < conn_cnt; ++i) {
-        nixl_backend = sd.getStr("t");
-        conn_info = sd.getStr("c");
+        nixl_backend_t nixl_backend = sd.getStr("t");
+        nixl_blob_t conn_info = sd.getStr("c");
 
         if (nixl_backend.empty() || conn_info.empty()) {
             NIXL_ERROR_FUNC << "failed to deserialize remote metadata";
             return NIXL_ERR_MISMATCH;
         }
 
-        ret = data->loadConnInfo(remote_agent, nixl_backend, conn_info);
-        if (ret == NIXL_SUCCESS) {
-            count++;
-        } else if (ret != NIXL_ERR_NOT_SUPPORTED) {
-            NIXL_ERROR_FUNC << "error loading connection info for backend '" << nixl_backend
-                            << "' with status " << ret;
-            return ret;
+        const auto existing_connection = document_connections.find(nixl_backend);
+        if (existing_connection != document_connections.end()) {
+            if (existing_connection->second == conn_info) {
+                continue;
+            }
+            NIXL_ERROR_FUNC << "conflicting duplicate connection metadata for backend '"
+                            << nixl_backend << "'";
+            return NIXL_ERR_NOT_ALLOWED;
         }
-    }
-
-    if ((count == 0) && (conn_cnt > 0)) {
-        NIXL_ERROR_FUNC << "no common backend found";
-        return NIXL_ERR_BACKEND;
+        document_connections.emplace(std::move(nixl_backend), std::move(conn_info));
     }
 
     if (sd.getStr("") != "MemSection") {
@@ -1577,19 +2071,266 @@ nixlAgent::loadRemoteMD (const nixl_blob_t &remote_metadata,
         return NIXL_ERR_MISMATCH;
     }
 
-    ret = data->loadRemoteSections(remote_agent, sd);
+    nixlRemoteSectionUpdate section_update;
+    ret = data->prepareRemoteSections(remote_agent, sd, section_update);
     if (ret != NIXL_SUCCESS) {
-        NIXL_ERROR_FUNC << "error loading remote metadata for agent '" << remote_agent
+        NIXL_ERROR_FUNC << "error validating remote metadata for agent '" << remote_agent
                         << "' with status " << ret;
         return ret;
     }
 
-    agent_name = remote_agent;
+    struct ConnectionUpdate {
+        nixl_backend_t backend;
+        nixl_blob_t connInfo;
+        nixlBackendEngine *engine;
+    };
+    std::vector<ConnectionUpdate> connection_updates;
+    size_t common_connection_count = 0;
+    const auto existing_backends = data->remoteBackends_.find(remote_agent);
+    for (const auto &[backend, conn_info] : document_connections) {
+        const auto engine = data->backendEngines_.find(backend);
+        if (engine == data->backendEngines_.end() || !engine->second->supportsRemote()) {
+            NIXL_DEBUG << "Agent " << data->name_
+                       << " does not support a remote backend: " << backend;
+            continue;
+        }
+
+        ++common_connection_count;
+        if (existing_backends != data->remoteBackends_.end()) {
+            const auto existing_connection = existing_backends->second.find(backend);
+            if (existing_connection != existing_backends->second.end()) {
+                if (existing_connection->second != conn_info) {
+                    NIXL_ERROR_FUNC << "conflicting connection info for backend '" << backend
+                                    << "'";
+                    return NIXL_ERR_NOT_ALLOWED;
+                }
+                continue;
+            }
+        }
+        connection_updates.push_back({backend, conn_info, engine->second.get()});
+    }
+
+    if (common_connection_count == 0 && conn_cnt > 0) {
+        NIXL_ERROR_FUNC << "no common backend found";
+        return NIXL_ERR_BACKEND;
+    }
+    if (active_handle == nullptr && connection_updates.empty()) {
+        NIXL_ERROR_FUNC << "remote metadata has no usable connection information";
+        return NIXL_ERR_NOT_FOUND;
+    }
+    for (nixlBackendEngine *section_backend : section_update.getBackends()) {
+        const nixl_backend_t &backend = section_backend->getType();
+        const bool has_committed_connection =
+            existing_backends != data->remoteBackends_.end() &&
+            existing_backends->second.count(backend) != 0;
+        const bool has_staged_connection = std::any_of(
+            connection_updates.begin(),
+            connection_updates.end(),
+            [section_backend](const ConnectionUpdate &connection) {
+                return connection.engine == section_backend;
+            });
+        if (!has_committed_connection && !has_staged_connection) {
+            NIXL_ERROR_FUNC << "remote descriptor metadata for backend '" << backend
+                            << "' has no connection information";
+            return NIXL_ERR_NOT_FOUND;
+        }
+    }
+
+    uint64_t handle_identity;
+    uint64_t generation;
+    std::unique_ptr<nixlRemoteAgentH> candidate_handle;
+    if (active_handle != nullptr) {
+        handle_identity = active_handle->identity_;
+        generation = active_handle->generation_;
+    } else {
+        const auto previous_generation = data->remoteGenerations_.find(remote_agent);
+        const uint64_t last_generation = previous_generation == data->remoteGenerations_.end() ?
+            0 : previous_generation->second;
+        if (last_generation == std::numeric_limits<uint64_t>::max()) {
+            return NIXL_ERR_NOT_ALLOWED;
+        }
+        handle_identity = allocateIdentity(next_remote_handle_identity);
+        generation = last_generation + 1;
+        candidate_handle = std::unique_ptr<nixlRemoteAgentH>(new nixlRemoteAgentH(
+            data->identity_, handle_identity, generation, remote_agent, agent_incarnation));
+    }
+
+    std::vector<const ConnectionUpdate *> staged_connections;
+    staged_connections.reserve(connection_updates.size());
+    std::unordered_map<nixlBackendEngine *, nixlRemoteAgentBinding> new_bindings;
+    std::vector<nixlBackendEngine *> bound_engines;
+    bound_engines.reserve(connection_updates.size());
+    const auto rollback_staged_connections =
+        [this,
+         &remote_agent,
+         &staged_connections,
+         &new_bindings,
+         &bound_engines,
+         active_handle,
+         &candidate_handle,
+         generation](nixl_status_t failure_status) {
+            nixl_status_t cleanup_status = NIXL_SUCCESS;
+            std::unordered_set<nixlBackendEngine *> unretired_engines;
+
+            for (auto engine = bound_engines.rbegin(); engine != bound_engines.rend(); ++engine) {
+                const nixl_status_t retire_status =
+                    (*engine)->retireRemoteAgent(new_bindings.at(*engine));
+                if (retire_status == NIXL_SUCCESS) {
+                    continue;
+                }
+                unretired_engines.insert(*engine);
+                if (cleanup_status == NIXL_SUCCESS) {
+                    cleanup_status = retire_status;
+                }
+            }
+
+            for (auto connection = staged_connections.rbegin();
+                 connection != staged_connections.rend(); ++connection) {
+                if (unretired_engines.count((*connection)->engine) != 0) {
+                    data->remoteBackends_[remote_agent].try_emplace(
+                        (*connection)->backend, (*connection)->connInfo);
+                    continue;
+                }
+
+                const nixl_status_t disconnect_status =
+                    (*connection)->engine->disconnect(remote_agent);
+                if (disconnect_status == NIXL_SUCCESS) {
+                    continue;
+                }
+
+                data->remoteBackends_[remote_agent].try_emplace(
+                    (*connection)->backend, (*connection)->connInfo);
+                data->quarantinedRemoteNames_.insert(remote_agent);
+                if (cleanup_status == NIXL_SUCCESS) {
+                    cleanup_status = disconnect_status;
+                }
+            }
+            if (cleanup_status != NIXL_SUCCESS) {
+                if (active_handle != nullptr) {
+                    for (nixlBackendEngine *engine : unretired_engines) {
+                        active_handle->bindings_.try_emplace(engine, new_bindings.at(engine));
+                    }
+                    data->deactivateRemoteHandle(remote_agent);
+                } else if (!unretired_engines.empty()) {
+                    for (nixlBackendEngine *engine : unretired_engines) {
+                        candidate_handle->bindings_.try_emplace(engine, new_bindings.at(engine));
+                    }
+                    candidate_handle->active_ = false;
+                    nixlRemoteAgentH *tombstone = candidate_handle.get();
+                    data->remoteGenerations_[remote_agent] = generation;
+                    data->ownedRemoteHandles_.insert(tombstone);
+                    data->remoteHandlesByIdentity_.emplace(tombstone->identity_, tombstone);
+                    data->remoteHandles_.push_back(std::move(candidate_handle));
+                }
+                data->quarantinedRemoteNames_.insert(remote_agent);
+                NIXL_ERROR_FUNC << "metadata rollback failed for remote agent '"
+                                << remote_agent << "' with status " << cleanup_status
+                                << " after metadata load failed with status " << failure_status;
+                return cleanup_status;
+            }
+            return failure_status;
+        };
+
+    for (const ConnectionUpdate &connection : connection_updates) {
+        ret = connection.engine->loadRemoteConnInfo(remote_agent, connection.connInfo);
+        if (ret != NIXL_SUCCESS) {
+            NIXL_ERROR_FUNC << "error loading connection info for backend '"
+                            << connection.backend << "' with status " << ret;
+            return rollback_staged_connections(ret);
+        }
+        staged_connections.push_back(&connection);
+    }
+
+    for (const ConnectionUpdate *connection : staged_connections) {
+        if (!connection->engine->supportsAuthenticatedNotif()) {
+            continue;
+        }
+
+        nixl_remote_agent_authority_t authority;
+        ret = connection->engine->queryRemoteAgentAuthority(remote_agent, authority);
+        if (ret != NIXL_SUCCESS || authority.connectionIdentity == 0 ||
+            authority.endpointIdentities.empty() ||
+            std::any_of(authority.endpointIdentities.begin(),
+                        authority.endpointIdentities.end(),
+                        [](uint64_t endpoint) { return endpoint == 0; })) {
+            return rollback_staged_connections(
+                ret == NIXL_SUCCESS ? NIXL_ERR_BACKEND : ret);
+        }
+
+        std::sort(authority.endpointIdentities.begin(), authority.endpointIdentities.end());
+        const auto unique_endpoint = std::unique(
+            authority.endpointIdentities.begin(), authority.endpointIdentities.end());
+        if (unique_endpoint != authority.endpointIdentities.end()) {
+            return rollback_staged_connections(NIXL_ERR_BACKEND);
+        }
+        authority.handleIdentity = handle_identity;
+        authority.generation = generation;
+        const auto [binding, inserted] = new_bindings.emplace(
+            connection->engine,
+            nixlRemoteAgentBinding{remote_agent, agent_incarnation, std::move(authority)});
+        if (!inserted) {
+            return rollback_staged_connections(NIXL_ERR_BACKEND);
+        }
+
+        ret = connection->engine->bindRemoteAgent(binding->second);
+        if (ret != NIXL_SUCCESS) {
+            return rollback_staged_connections(ret);
+        }
+        bound_engines.push_back(connection->engine);
+    }
+
+    bool resource_rollback_ambiguous = false;
+    ret = data->applyRemoteSections(
+        remote_agent, std::move(section_update), resource_rollback_ambiguous);
+    if (ret != NIXL_SUCCESS) {
+        if (resource_rollback_ambiguous) {
+            data->quarantinedRemoteNames_.insert(remote_agent);
+            data->deactivateRemoteHandle(remote_agent);
+        }
+        NIXL_ERROR_FUNC << "error loading remote metadata for agent '" << remote_agent
+                        << "' with status " << ret;
+        return rollback_staged_connections(ret);
+    }
+
+    if (!connection_updates.empty()) {
+        auto &remote_backends = data->remoteBackends_[remote_agent];
+        for (const ConnectionUpdate &connection : connection_updates) {
+            remote_backends.emplace(connection.backend, connection.connInfo);
+        }
+    }
+
+    if (active_handle != nullptr) {
+        for (auto &[engine, binding] : new_bindings) {
+            active_handle->bindings_.emplace(engine, std::move(binding));
+        }
+        remote_agent_handle = active_handle;
+        return NIXL_SUCCESS;
+    }
+
+    candidate_handle->bindings_ = std::move(new_bindings);
+    data->remoteGenerations_[remote_agent] = generation;
+    remote_agent_handle = candidate_handle.get();
+    data->ownedRemoteHandles_.insert(remote_agent_handle);
+    data->remoteHandlesByIdentity_.emplace(handle_identity, remote_agent_handle);
+    data->activeRemoteHandles_.emplace(remote_agent, remote_agent_handle);
+    data->remoteHandles_.push_back(std::move(candidate_handle));
     return NIXL_SUCCESS;
 }
 
 nixl_status_t
-nixlAgent::invalidateRemoteMD(const std::string &remote_agent) {
+nixlAgent::loadRemoteMD(const nixl_blob_t &remote_metadata,
+                        std::string &agent_name) {
+    nixlRemoteAgentH *remote_agent = nullptr;
+    const nixl_status_t status = loadRemoteMD(remote_metadata, remote_agent);
+    if (status != NIXL_SUCCESS) {
+        return status;
+    }
+    agent_name = remote_agent->getName();
+    return NIXL_SUCCESS;
+}
+
+nixl_status_t
+nixlAgent::invalidateRemoteMDByName(const std::string &remote_agent) {
     NIXL_LOCK_GUARD(data->lock);
 
     if (remote_agent == data->name_) {
@@ -1597,19 +2338,7 @@ nixlAgent::invalidateRemoteMD(const std::string &remote_agent) {
         return NIXL_ERR_INVALID_PARAM;
     }
 
-    nixl_status_t ret = NIXL_ERR_NOT_FOUND;
-    if (data->remoteSections_.erase(remote_agent) > 0) {
-        ret = NIXL_SUCCESS;
-    }
-
-    if (data->remoteBackends_.count(remote_agent) != 0) {
-        for (auto &it : data->remoteBackends_[remote_agent]) {
-            data->backendEngines_[it.first]->disconnect(remote_agent);
-        }
-
-        data->remoteBackends_.erase(remote_agent);
-        ret = NIXL_SUCCESS;
-    }
+    const nixl_status_t ret = data->invalidateRemoteData(remote_agent);
 
     if (ret == NIXL_ERR_NOT_FOUND)
         NIXL_INFO << __FUNCTION__ << ": remote metadata for agent '" << remote_agent
@@ -1618,6 +2347,22 @@ nixlAgent::invalidateRemoteMD(const std::string &remote_agent) {
         NIXL_ERROR_FUNC << "error invalidating remote metadata for agent '" << remote_agent
                         << "' with status " << ret;
     return ret;
+}
+
+nixl_status_t
+nixlAgent::invalidateRemoteMD(const std::string &) {
+    NIXL_ERROR_FUNC << "an opaque remote-agent handle is required";
+    return NIXL_ERR_INVALID_PARAM;
+}
+
+nixl_status_t
+nixlAgent::invalidateRemoteMD(const nixlRemoteAgentH *remote_agent) {
+    NIXL_LOCK_GUARD(data->lock);
+    const nixl_status_t status = data->validateRemoteHandle(remote_agent);
+    if (status != NIXL_SUCCESS) {
+        return status;
+    }
+    return data->invalidateRemoteData(remote_agent->name_);
 }
 
 nixl_status_t

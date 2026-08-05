@@ -17,7 +17,7 @@
 #ifndef TEST_GTEST_MOCKS_MOCK_BACKEND_ENGINE_H
 #define TEST_GTEST_MOCKS_MOCK_BACKEND_ENGINE_H
 
-#include "backend/backend_engine.h"
+#include "gmock_engine.h"
 #include "backend/backend_plugin.h"
 #include <cassert>
 
@@ -25,7 +25,7 @@ namespace mocks {
 
 class MockBackendEngine : public nixlBackendEngine {
 private:
-    nixlBackendEngine *gmock_backend_engine;
+    GMockBackendEngine *gmock_backend_engine;
 
 public:
     MockBackendEngine(const nixlBackendInitParams *init_params);
@@ -43,6 +43,10 @@ public:
   bool supportsNotif() const override {
     assert(sharedState > 0);
     return gmock_backend_engine->supportsNotif();
+  }
+  bool supportsAuthenticatedNotif() const override {
+    assert(sharedState > 0);
+    return gmock_backend_engine->supportsAuthenticatedNotif();
   }
   nixl_mem_list_t getSupportedMems() const override {
     assert(sharedState > 0);
@@ -87,13 +91,23 @@ public:
   }
   nixl_status_t loadRemoteConnInfo(const std::string &remote_agent,
                                    const std::string &remote_conn_info);
+  nixl_status_t queryRemoteAgentAuthority(
+      const std::string &remote_agent,
+      nixl_remote_agent_authority_t &authority) const override;
+  nixl_status_t bindRemoteAgent(const nixlRemoteAgentBinding &binding) override;
+  nixl_status_t retireRemoteAgent(const nixlRemoteAgentBinding &binding) override;
+  nixl_status_t queryRemoteNotificationState(
+      const nixlRemoteAgentBinding &binding) const override;
   nixl_status_t loadRemoteMD(const nixlBlobDesc &input,
                              const nixl_mem_t &nixl_mem,
                              const std::string &remote_agent,
                              nixlBackendMD *&output) override;
   nixl_status_t loadLocalMD(nixlBackendMD *input, nixlBackendMD *&output);
   nixl_status_t getNotifs(notif_list_t &notif_list) override;
+  nixl_status_t getAuthenticatedNotifs(authenticated_notif_list_t &notif_list) override;
   nixl_status_t genNotif(const std::string &remote_agent,
+                         const std::string &msg) const override;
+  nixl_status_t genNotif(const nixlRemoteAgentBinding &binding,
                          const std::string &msg) const override;
 
 private:

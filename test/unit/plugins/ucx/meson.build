@@ -46,6 +46,27 @@ ucx_attestation_test = executable('ucx_attestation_test',
 
 test('ucx_attestation', ucx_attestation_test)
 
+ucx_connection_metadata_test = executable('ucx_connection_metadata_test',
+        'ucx_connection_metadata_test.cpp',
+        dependencies: ucx_backend_test_dep,
+        include_directories: ucx_test_include_directories)
+
+test('ucx_connection_metadata', ucx_connection_metadata_test)
+
+ucx_notif_wire_test = executable('ucx_notif_wire_test',
+        'ucx_notif_wire_test.cpp',
+        dependencies: ucx_backend_test_dep,
+        include_directories: ucx_test_include_directories)
+
+test('ucx_notif_wire', ucx_notif_wire_test)
+
+ucx_notif_state_test = executable('ucx_notif_state_test',
+        'ucx_notif_state_test.cpp',
+        dependencies: ucx_backend_test_dep,
+        include_directories: ucx_test_include_directories)
+
+test('ucx_notif_state', ucx_notif_state_test)
+
 if get_option('buildtype') != 'release'
 
     ucx_worker_bin = executable('ucx_worker_test',

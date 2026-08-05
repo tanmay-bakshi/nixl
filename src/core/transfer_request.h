@@ -37,6 +37,7 @@ enum nixl_telemetry_stat_status_t {
 class nixlXferReqH {
 public:
     nixlXferReqH(const std::string &remote_agent,
+                 const nixlRemoteAgentH *remote_handle,
                  const nixl_xfer_op_t backend_op,
                  const nixl_mem_t local_type,
                  const nixl_mem_t remote_type,
@@ -69,6 +70,8 @@ private:
     nixl_meta_dlist_t targetDescs;
 
     const std::string remoteAgent;
+    const nixlRemoteAgentH *const remoteHandle;
+    nixl_remote_agent_authority_t remoteAuthority;
     nixl_blob_t notifMsg;
     bool hasNotif = false;
 
@@ -81,10 +84,12 @@ private:
 struct nixlDlistH {
     using descs_t = std::unordered_map<nixlBackendEngine *, std::unique_ptr<nixl_meta_dlist_t>>;
 
-    nixlDlistH(const std::string &remote_agent, descs_t &&descs);
+    nixlDlistH(const std::string &remote_agent,
+               const nixlRemoteAgentH *remote_handle, descs_t &&descs);
 
     const std::string remoteAgent; // Empty means "local".
     const descs_t descs;
+    const nixlRemoteAgentH *const remoteHandle;
 };
 
 #endif

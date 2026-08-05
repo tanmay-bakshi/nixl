@@ -349,59 +349,29 @@ nixlLocalSection::~nixlLocalSection() {
 nixlRemoteSection::nixlRemoteSection(std::string agent_name) noexcept
     : agentName(std::move(agent_name)) {}
 
-nixl_status_t nixlRemoteSection::addDescList (
-                                 const nixl_reg_dlist_t& mem_elms,
-                                 nixlBackendEngine* backend) {
-    if (!backend->supportsRemote()) {
-        return NIXL_ERR_UNKNOWN;
+nixlRemoteSection::nixlRemoteSection(nixlRemoteSection &&other) noexcept
+    : agentName(std::move(other.agentName)) {
+    for (size_t i = 0; i < memToBackend.size(); ++i) {
+        memToBackend[i].swap(other.memToBackend[i]);
     }
-
-    // Fewer checks than LocalSection, as it's private and called by loadRemoteData
-    // In RemoteSection, if we support updates, value for a key gets overwritten
-    // Without it, it's corrupt data, we keep the last option without raising an error
-    const nixl_mem_t nixl_mem = mem_elms.getType();
-
-    nixlSecDescList &target = emplace(nixl_mem, backend);
-
-    // Add entries to the target list.
-    nixlSectionDesc out;
-    nixlBasicDesc *p = &out;
-    nixl_status_t ret;
-    for (int i=0; i<mem_elms.descCount(); ++i) {
-        // TODO: Can add overlap checks (erroneous)
-        int idx = target.getIndex(mem_elms[i]);
-        if (idx < 0) {
-            ret = backend->loadRemoteMD(mem_elms[i], nixl_mem, agentName, out.metadataP);
-            // In case of errors, no need to remove the previous entries
-            // Agent will delete the full object.
-            if (ret<0)
-                return ret;
-            *p = mem_elms[i]; // Copy the basic desc part
-            out.metaBlob = mem_elms[i].metaInfo;
-            target.addDesc(out);
-        } else {
-            const nixl_blob_t &prev_meta_info = target[idx].metaBlob;
-            // TODO: Support metadata updates
-            if (prev_meta_info != mem_elms[i].metaInfo)
-                return NIXL_ERR_NOT_ALLOWED;
-        }
-    }
-    return NIXL_SUCCESS;
+    sectionMap.swap(other.sectionMap);
 }
 
 nixl_status_t
-nixlRemoteSection::loadRemoteData(nixlSerDes *deserializer, backend_map_t &backendToEngineMap) {
+nixlRemoteSection::prepareRemoteData(nixlSerDes *deserializer,
+                                     const backend_map_t &backendToEngineMap,
+                                     nixlRemoteSectionUpdate &update) const {
     nixl_status_t ret;
     size_t seg_count;
 
+    update.additions_.clear();
+    update.backends_.clear();
     ret = deserializer->getBuf("nixlSecElms", &seg_count, sizeof(seg_count));
     if (ret != NIXL_SUCCESS) {
         return ret;
     }
 
     for (size_t i = 0; i < seg_count; ++i) {
-        // In case of errors, no need to remove the previous entries
-        // Agent will delete the full object.
         const nixl_backend_t nixl_backend = deserializer->getStr("bknd");
         if (nixl_backend.empty()) {
             return NIXL_ERR_INVALID_PARAM;
@@ -411,14 +381,95 @@ nixlRemoteSection::loadRemoteData(nixlSerDes *deserializer, backend_map_t &backe
         if (s_desc.isEmpty()) { // can be used for entry removal in future
             return NIXL_ERR_NOT_FOUND;
         }
+        if (s_desc.getType() < DRAM_SEG || s_desc.getType() > FILE_SEG) {
+            return NIXL_ERR_INVALID_PARAM;
+        }
 
         const auto it = backendToEngineMap.find(nixl_backend);
-        if (it != backendToEngineMap.end()) {
-            ret = addDescList(s_desc, it->second.get());
-            if (ret != NIXL_SUCCESS) {
-                return ret;
-            }
+        if (it == backendToEngineMap.end()) {
+            continue;
         }
+
+        nixlBackendEngine *backend = it->second.get();
+        if (!backend->supportsRemote()) {
+            return NIXL_ERR_NOT_SUPPORTED;
+        }
+        update.backends_.insert(backend);
+
+        const section_key_t key{s_desc.getType(), backend};
+        const auto existing_section = sectionMap.find(key);
+        auto &additions = update.additions_[key];
+        for (const nixlBlobDesc &desc : s_desc) {
+            if (existing_section != sectionMap.end()) {
+                const int existing_index = existing_section->second.getIndex(desc);
+                if (existing_index >= 0) {
+                    if (existing_section->second[existing_index].metaBlob != desc.metaInfo) {
+                        return NIXL_ERR_NOT_ALLOWED;
+                    }
+                    continue;
+                }
+            }
+
+            const auto duplicate = std::find_if(
+                additions.begin(), additions.end(), [&desc](const nixlBlobDesc &candidate) {
+                    return static_cast<const nixlBasicDesc &>(candidate) ==
+                        static_cast<const nixlBasicDesc &>(desc);
+                });
+            if (duplicate != additions.end()) {
+                if (duplicate->metaInfo != desc.metaInfo) {
+                    return NIXL_ERR_NOT_ALLOWED;
+                }
+                continue;
+            }
+
+            additions.push_back(desc);
+        }
+    }
+    return NIXL_SUCCESS;
+}
+
+nixl_status_t
+nixlRemoteSection::applyRemoteData(nixlRemoteSectionUpdate &&update,
+                                   bool &rollback_ambiguous) {
+    std::map<section_key_t, std::vector<nixlSectionDesc>> staged;
+    std::vector<std::pair<nixlBackendEngine *, nixlBackendMD *>> staged_owners;
+    rollback_ambiguous = false;
+
+    for (const auto &[key, additions] : update.additions_) {
+        nixlBackendEngine *backend = key.second;
+        std::vector<nixlSectionDesc> &batch = staged[key];
+        batch.reserve(additions.size());
+
+        for (const nixlBlobDesc &desc : additions) {
+            nixlSectionDesc loaded;
+            const nixl_status_t status =
+                backend->loadRemoteMD(desc, key.first, agentName, loaded.metadataP);
+            if (loaded.metadataP != nullptr) {
+                staged_owners.emplace_back(backend, loaded.metadataP);
+            }
+            if (status != NIXL_SUCCESS || loaded.metadataP == nullptr) {
+                nixl_status_t cleanup_status = NIXL_SUCCESS;
+                for (auto owner = staged_owners.rbegin(); owner != staged_owners.rend(); ++owner) {
+                    const nixl_status_t unload_status = owner->first->unloadMD(owner->second);
+                    if (unload_status != NIXL_SUCCESS && cleanup_status == NIXL_SUCCESS) {
+                        cleanup_status = unload_status;
+                    }
+                }
+                rollback_ambiguous = cleanup_status != NIXL_SUCCESS;
+                if (rollback_ambiguous) {
+                    return cleanup_status;
+                }
+                return status == NIXL_SUCCESS ? NIXL_ERR_BACKEND : status;
+            }
+
+            static_cast<nixlBasicDesc &>(loaded) = desc;
+            loaded.metaBlob = desc.metaInfo;
+            batch.push_back(std::move(loaded));
+        }
+    }
+
+    for (auto &[key, batch] : staged) {
+        emplace(key.first, key.second).addDescs(std::move(batch));
     }
     return NIXL_SUCCESS;
 }

@@ -30,6 +30,7 @@ class nixlDlistH;
 class nixlBackendH;
 class nixlXferReqH;
 class nixlAgentData;
+class nixlRemoteAgentH;
 
 
 /*** NIXL memory type, operation and status enums ***/
@@ -65,7 +66,8 @@ enum nixl_status_t {
     NIXL_ERR_NOT_SUPPORTED = -9,
     NIXL_ERR_REMOTE_DISCONNECT = -10,
     NIXL_ERR_CANCELED = -11,
-    NIXL_ERR_NO_TELEMETRY = -12
+    NIXL_ERR_NO_TELEMETRY = -12,
+    NIXL_ERR_NOT_READY = -13
 };
 
 /**
@@ -127,6 +129,12 @@ using nixl_b_params_t = std::unordered_map<std::string, std::string>;
  *        to hold nixl_notifs_t (nixl notifications)
  */
 using nixl_notifs_t = std::unordered_map<std::string, std::vector<nixl_blob_t>>;
+/**
+ * @brief Notifications attributed to an agent-owned remote handle.
+ */
+using nixl_remote_notifs_t =
+    std::unordered_map<const nixlRemoteAgentH *, std::vector<nixl_blob_t>>;
+
 
 /**
  * @brief A constant to define the default communication port.
@@ -335,6 +343,7 @@ struct nixlXferAttestationSegment {
     uint64_t workerIdentity = 0;
     uint64_t endpointIdentity = 0;
     std::string requestInfo;
+    std::vector<nixl_xfer_attestation_transport_t> selectedTransports;
     bool posted = false;
 };
 
@@ -383,6 +392,10 @@ struct nixlXferAttestation {
     std::string backend;
     std::string localAgent;
     std::string remoteAgent;
+    uint64_t remoteAgentHandleIdentity = 0;
+    uint64_t remoteAgentGeneration = 0;
+    uint64_t remoteConnectionIdentity = 0;
+    std::vector<uint64_t> authorizedEndpointIdentities;
     nixl_xfer_op_t operation = NIXL_WRITE;
     nixl_mem_t localMemoryType = DRAM_SEG;
     nixl_mem_t remoteMemoryType = DRAM_SEG;
@@ -395,6 +408,19 @@ struct nixlXferAttestation {
 };
 
 using nixl_xfer_attestation_t = nixlXferAttestation;
+/**
+ * @struct nixlRemoteAgentAuthority
+ * @brief Immutable authority captured from one active remote-agent generation.
+ */
+struct nixlRemoteAgentAuthority {
+    uint64_t handleIdentity = 0;
+    uint64_t generation = 0;
+    uint64_t connectionIdentity = 0;
+    std::vector<uint64_t> endpointIdentities;
+};
+
+using nixl_remote_agent_authority_t = nixlRemoteAgentAuthority;
+
 
 /**
  * @brief A define for an empty string, that indicates the descriptor list is being

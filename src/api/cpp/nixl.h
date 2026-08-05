@@ -36,6 +36,46 @@ class nixlAgent {
         /** @var  data  The members in agent class wrapped into single nixlAgentData member. */
         const std::unique_ptr<nixlAgentData> data;
 
+        friend class nixlAgentData;
+
+        [[nodiscard]] nixl_status_t
+        validateXferRemoteHandleLocked(const nixlXferReqH *req_hndl) const;
+
+        [[nodiscard]] nixl_status_t
+        validateXferAttestationLocked(const nixlXferReqH *req_hndl,
+                                      const nixl_xfer_attestation_t &attestation) const;
+
+        nixl_status_t
+        makeConnectionLocked(const std::string &remote_agent,
+                             const nixl_opt_args_t *extra_params);
+
+        nixl_status_t
+        prepXferDlistImpl(const std::string &agent_name,
+                          const nixlRemoteAgentH *remote_agent,
+                          const nixl_xfer_dlist_t &descs,
+                          nixlDlistH *&dlist_hndl,
+                          const nixl_opt_args_t *extra_params) const;
+
+        nixl_status_t
+        createXferReqImpl(const nixl_xfer_op_t &operation,
+                          const nixl_xfer_dlist_t &local_descs,
+                          const nixl_xfer_dlist_t &remote_descs,
+                          const std::string &remote_agent_name,
+                          const nixlRemoteAgentH *remote_agent,
+                          nixlXferReqH *&req_hndl,
+                          const nixl_opt_args_t *extra_params) const;
+
+        nixl_status_t
+        genLocalNotifLocked(const nixl_blob_t &msg,
+                            const nixl_opt_args_t *extra_params) const;
+        nixl_status_t
+        genRemoteNotifLocked(const nixlRemoteAgentH *remote_agent,
+                             const nixl_blob_t &msg,
+                             const nixl_opt_args_t *extra_params) const;
+
+        nixl_status_t
+        invalidateRemoteMDByName(const std::string &remote_agent);
+
         /**
          * @brief Progress one transfer while the caller retains the agent data lock.
          */
@@ -162,6 +202,10 @@ class nixlAgent {
         nixl_status_t
         makeConnection (const std::string &remote_agent,
                         const nixl_opt_args_t* extra_params = nullptr);
+        nixl_status_t
+        makeConnection(const nixlRemoteAgentH *remote_agent,
+                       const nixl_opt_args_t *extra_params = nullptr);
+
 
         /*** Transfer Request Preparation ***/
         /**
@@ -190,6 +234,12 @@ class nixlAgent {
                        const nixl_xfer_dlist_t &descs,
                        nixlDlistH* &dlist_hndl,
                        const nixl_opt_args_t* extra_params = nullptr) const;
+        nixl_status_t
+        prepXferDlist(const nixlRemoteAgentH *remote_agent,
+                      const nixl_xfer_dlist_t &descs,
+                      nixlDlistH *&dlist_hndl,
+                      const nixl_opt_args_t *extra_params = nullptr) const;
+
         /**
          * @brief  Prepare a local descriptor list for transfer requests.
          *
@@ -260,6 +310,14 @@ class nixlAgent {
                        const std::string &remote_agent,
                        nixlXferReqH* &req_hndl,
                        const nixl_opt_args_t* extra_params = nullptr) const;
+        nixl_status_t
+        createXferReq(const nixl_xfer_op_t &operation,
+                      const nixl_xfer_dlist_t &local_descs,
+                      const nixl_xfer_dlist_t &remote_descs,
+                      const nixlRemoteAgentH *remote_agent,
+                      nixlXferReqH *&req_hndl,
+                      const nixl_opt_args_t *extra_params = nullptr) const;
+
 
         /*** Operations on prepared Transfer Request ***/
 
@@ -440,6 +498,10 @@ class nixlAgent {
         nixl_status_t
         getNotifs (nixl_notifs_t &notif_map,
                    const nixl_opt_args_t* extra_params = nullptr);
+        nixl_status_t
+        getRemoteNotifs(nixl_remote_notifs_t &notif_map,
+                        const nixl_opt_args_t *extra_params = nullptr);
+
 
         /**
          * @brief  Generate a notification, not bound to a transfer, e.g., for control.
@@ -457,6 +519,11 @@ class nixlAgent {
         genNotif (const std::string &remote_agent,
                   const nixl_blob_t &msg,
                   const nixl_opt_args_t* extra_params = nullptr) const;
+        nixl_status_t
+        genNotif(const nixlRemoteAgentH *remote_agent,
+                 const nixl_blob_t &msg,
+                 const nixl_opt_args_t *extra_params = nullptr) const;
+
 
         /*** Metadata handling through side channel ***/
         /**
@@ -499,6 +566,10 @@ class nixlAgent {
         nixl_status_t
         loadRemoteMD (const nixl_blob_t &remote_metadata,
                       std::string &agent_name);
+        nixl_status_t
+        loadRemoteMD(const nixl_blob_t &remote_metadata,
+                     nixlRemoteAgentH *&remote_agent);
+
 
         /**
          * @brief  Invalidate the remote agent metadata cached locally. This will
@@ -510,6 +581,9 @@ class nixlAgent {
          */
         nixl_status_t
         invalidateRemoteMD (const std::string &remote_agent);
+        nixl_status_t
+        invalidateRemoteMD(const nixlRemoteAgentH *remote_agent);
+
 
         /*** Metadata handling through direct channels (p2p socket and ETCD) ***/
         /**

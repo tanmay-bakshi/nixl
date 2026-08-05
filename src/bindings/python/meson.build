@@ -22,7 +22,7 @@ py = import('python').find_installation('python3', pure: false)
 py.extension_module('_bindings',
            'nixl_bindings.cpp',
            subdir: (cuda_wheel_dir),
-           dependencies: [nixl_dep, serdes_interface, pybind_dep],
+           dependencies: [nixl_dep, nixl_common_dep, serdes_interface, pybind_dep],
            include_directories: [nixl_inc_dirs, utils_inc_dirs],
            install: true)
 

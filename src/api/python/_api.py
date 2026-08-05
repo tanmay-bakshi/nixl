@@ -29,7 +29,10 @@ logger = get_logger(__name__)
 DEFAULT_COMM_PORT = nixlBind.DEFAULT_COMM_PORT
 
 nixl_xfer_attestation_snapshot = nixlBind.nixlXferAttestationSnapshot
+nixl_xfer_attestation_transport = nixlBind.nixlXferAttestationTransport
 nixl_xfer_completion_receipt = nixlBind.nixlXferCompletionReceipt
+
+_REMOTE_HANDLE_CONSTRUCTION_TOKEN = object()
 
 
 """
@@ -116,6 +119,74 @@ class nixl_xfer_handle:
                 except Exception:
                     pass
                 return
+
+
+class nixl_remote_agent_handle:
+    """Canonical Python identity for an agent-owned native remote handle.
+
+    :ivar name: Remote agent name authenticated by the loaded metadata.
+    :ivar identity: Process-unique native handle identity.
+    :ivar generation: Monotonic generation for this remote agent name.
+    """
+
+    __slots__ = ("_active", "_native_handle", "_owner")
+
+    _active: bool
+    _native_handle: nixlBind.nixlRemoteAgentH
+    _owner: nixlBind.nixlAgent
+
+    def __init__(
+        self,
+        owner: nixlBind.nixlAgent,
+        native_handle: nixlBind.nixlRemoteAgentH,
+        construction_token: object,
+    ) -> None:
+        """Create the canonical wrapper retained by one high-level agent.
+
+        :param owner: Owning native NIXL agent.
+        :param native_handle: Agent-owned native remote handle.
+        :param construction_token: Module-private construction authority.
+        """
+        if construction_token is not _REMOTE_HANDLE_CONSTRUCTION_TOKEN:
+            raise TypeError("remote-agent handles can only be created by nixl_agent")
+        self._owner = owner
+        self._native_handle = native_handle
+        self._active = True
+
+    @property
+    def name(self) -> str:
+        """Return the authenticated remote agent name.
+
+        :returns: Remote agent name.
+        """
+        return self._native_handle.name
+
+    @property
+    def identity(self) -> int:
+        """Return the process-unique native handle identity.
+
+        :returns: Native handle identity.
+        """
+        return int(self._native_handle.identity)
+
+    @property
+    def generation(self) -> int:
+        """Return the name-scoped handle generation.
+
+        :returns: Remote handle generation.
+        """
+        return int(self._native_handle.generation)
+
+    def __repr__(self) -> str:
+        """Return a diagnostic representation of this opaque handle.
+
+        :returns: Handle representation.
+        """
+        return (
+            "nixl_remote_agent_handle("
+            f"name={self.name!r}, identity={self.identity}, "
+            f"generation={self.generation}, active={self._active})"
+        )
 
 
 # Opaque handle for backend can be just int, as it's not passed to the user
@@ -220,7 +291,8 @@ class nixl_agent:
 
         self.name = agent_name
         self._leaked_xfer_handles: list[int] = []
-        self.notifs: dict[str, list[bytes]] = {}
+        self._remote_agent_handles: dict[int, nixl_remote_agent_handle] = {}
+        self.notifs: dict[nixl_remote_agent_handle, list[bytes]] = {}
         self.backends: dict[str, nixl_backend_handle] = {}
         self.backend_mems: dict[str, list[str]] = {}
         self.backend_options: dict[str, dict[str, str]] = {}
@@ -269,6 +341,50 @@ class nixl_agent:
         }
 
         logger.info("Initialized NIXL agent: %s", agent_name)
+
+    def _wrap_remote_agent(
+        self, native_handle: nixlBind.nixlRemoteAgentH
+    ) -> nixl_remote_agent_handle:
+        """Resolve one native handle to its canonical high-level wrapper.
+
+        :param native_handle: Agent-owned native remote handle.
+        :returns: Canonical wrapper for the native identity.
+        :raises RuntimeError: If an identity aliases a different native handle.
+        """
+        identity = int(native_handle.identity)
+        existing = self._remote_agent_handles.get(identity)
+        if existing is not None:
+            if existing._native_handle != native_handle:
+                raise RuntimeError("native remote-handle identity collision")
+            return existing
+
+        handle = nixl_remote_agent_handle(
+            self.agent, native_handle, _REMOTE_HANDLE_CONSTRUCTION_TOKEN
+        )
+        self._remote_agent_handles[identity] = handle
+        return handle
+
+    def _unwrap_remote_agent(
+        self,
+        handle: nixl_remote_agent_handle,
+        require_active: bool = True,
+    ) -> nixlBind.nixlRemoteAgentH:
+        """Validate ownership and return the native remote handle.
+
+        :param handle: High-level remote handle to validate.
+        :param require_active: Whether a tombstoned handle must be rejected locally.
+        :returns: Agent-owned native remote handle.
+        :raises TypeError: If ``handle`` is not a remote-agent handle.
+        :raises ValueError: If ``handle`` belongs to another agent.
+        :raises RuntimeError: If ``handle`` is tombstoned.
+        """
+        if not isinstance(handle, nixl_remote_agent_handle):
+            raise TypeError("remote_agent must be a nixl_remote_agent_handle")
+        if handle._owner is not self.agent:
+            raise ValueError("remote-agent handle belongs to a different NIXL agent")
+        if require_active and not handle._active:
+            raise RuntimeError("remote-agent handle has been invalidated")
+        return handle._native_handle
 
     def __del__(self):
         # Best-effort cleanup of any leaked xfer handles belonging to this agent
@@ -466,12 +582,29 @@ class nixl_agent:
     @param remote_agent Name of the remote agent.
     """
 
-    def make_connection(self, remote_agent: str, backends: list[str] = []):
+    def make_connection(
+        self,
+        remote_agent: str | nixl_remote_agent_handle,
+        backends: list[str] = [],
+    ) -> None:
+        """Proactively connect to an owned remote handle or local loopback.
+
+        :param remote_agent: Owned remote handle, or this agent's name for loopback.
+        :param backends: Backend names to use.
+        """
         handle_list = []
         for backend_string in backends:
             handle_list.append(self.backends[backend_string])
 
-        self.agent.makeConnection(remote_agent, handle_list)
+        if isinstance(remote_agent, str):
+            if remote_agent != self.name:
+                raise TypeError(
+                    "remote connections require a nixl_remote_agent_handle"
+                )
+            self.agent.makeConnection(remote_agent, handle_list)
+            return
+
+        self.agent.makeConnection(self._unwrap_remote_agent(remote_agent), handle_list)
 
     """
     @brief  Prepare a transfer descriptor list for data transfer.
@@ -497,25 +630,44 @@ class nixl_agent:
 
     def prep_xfer_dlist(
         self,
-        agent_name: str,
+        remote_agent: str | nixl_remote_agent_handle,
         xfer_list,
         mem_type: Optional[str] = None,
         backends: list[str] = [],
     ) -> nixl_prepped_dlist_handle:
+        """Prepare a local, loopback, or handle-bound descriptor list.
+
+        :param remote_agent: Empty/init sentinel for local descriptors, this agent's
+            name for loopback, or an owned remote handle.
+        :param xfer_list: Transfer descriptors.
+        :param mem_type: Descriptor memory type.
+        :param backends: Backend names to use.
+        :returns: Prepared descriptor-list handle.
+        """
         descs = self.get_xfer_descs(xfer_list, mem_type)
 
-        is_local = agent_name == "NIXL_INIT_AGENT" or agent_name == ""
-        if is_local:
-            agent_name = nixlBind.NIXL_INIT_AGENT
+        is_initiator = isinstance(remote_agent, str) and remote_agent in (
+            "NIXL_INIT_AGENT",
+            "",
+        )
+        is_loopback = isinstance(remote_agent, str) and remote_agent == self.name
+        if isinstance(remote_agent, str) and not (is_initiator or is_loopback):
+            raise TypeError(
+                "remote descriptor lists require a nixl_remote_agent_handle"
+            )
 
         handle_list = []
         for backend_string in backends:
             handle_list.append(self.backends[backend_string])
 
-        if is_local:
+        if is_initiator:
             handle = self.agent.prepXferDlist(descs, handle_list)
+        elif is_loopback:
+            handle = self.agent.prepXferDlist(self.name, descs, handle_list)
         else:
-            handle = self.agent.prepXferDlist(agent_name, descs, handle_list)
+            handle = self.agent.prepXferDlist(
+                self._unwrap_remote_agent(remote_agent), descs, handle_list
+            )
         return nixl_prepped_dlist_handle(self.agent, handle)
 
     """
@@ -604,17 +756,41 @@ class nixl_agent:
         operation: str,
         local_descs: nixlBind.nixlXferDList,
         remote_descs: nixlBind.nixlXferDList,
-        remote_agent: str,
+        remote_agent: str | nixl_remote_agent_handle,
         notif_msg: bytes = b"",
         backends: list[str] = [],
     ) -> nixl_xfer_handle:
+        """Create a transfer bound to an owned remote handle or local loopback.
+
+        :param operation: Transfer operation name.
+        :param local_descs: Local transfer descriptors.
+        :param remote_descs: Target transfer descriptors.
+        :param remote_agent: Owned remote handle, or this agent's name for loopback.
+        :param notif_msg: Optional completion notification.
+        :param backends: Backend names to use.
+        :returns: Transfer handle.
+        """
         op = self.nixl_ops[operation]
         handle_list = []
         for backend_string in backends:
             handle_list.append(self.backends[backend_string])
 
+        if isinstance(remote_agent, str):
+            if remote_agent != self.name:
+                raise TypeError(
+                    "remote transfers require a nixl_remote_agent_handle"
+                )
+            native_remote_agent = remote_agent
+        else:
+            native_remote_agent = self._unwrap_remote_agent(remote_agent)
+
         handle = self.agent.createXferReq(
-            op, local_descs, remote_descs, remote_agent, notif_msg, handle_list
+            op,
+            local_descs,
+            remote_descs,
+            native_remote_agent,
+            notif_msg,
+            handle_list,
         )
 
         return nixl_xfer_handle(self.agent, handle)
@@ -628,17 +804,19 @@ class nixl_agent:
     @param handle Handle to the transfer operation, from make_prepped_xfer, or initialize_xfer.
     @param notif_msg Optional notification message can be specified or updated per transfer call.
            notif_msg should be bytes, as that is what will be returned to the target, but will work with str too.
-    @return Status of the transfer operation ("DONE", "PROC", or "ERR").
+    @return Status of the transfer operation ("DONE", "PROC", "NOT_READY", or "ERR").
     """
 
     def transfer(self, handle: nixl_xfer_handle, notif_msg: bytes = b"") -> str:
-        status = self.agent.postXferReq(handle._handle, notif_msg)
+        try:
+            status = self.agent.postXferReq(handle._handle, notif_msg)
+        except nixlBind.nixlNotReadyError:
+            return "NOT_READY"
         if status == nixlBind.NIXL_SUCCESS:
             return "DONE"
-        elif status == nixlBind.NIXL_IN_PROG:
+        if status == nixlBind.NIXL_IN_PROG:
             return "PROC"
-        else:
-            return "ERR"
+        return "ERR"
 
     """
     @brief Check the state of a transfer operation.
@@ -700,6 +878,28 @@ class nixl_agent:
         self._validate_xfer_attestation_handle(handle)
         return handle._agent.queryXferAttestation(handle._handle)
 
+    def query_xfer_ucp_transports(
+        self, handle: nixl_xfer_handle
+    ) -> tuple[nixl_xfer_attestation_transport, ...]:
+        """Query selected UCP data resources observed for a transfer generation.
+
+        :param handle: Transfer handle owned by this agent.
+        :returns: Canonical union of handle-bound selected transport and device
+            pairs. The tuple is empty until the backend has posted segment
+            evidence.
+        """
+        snapshot = self.query_xfer_attestation(handle)
+        selected_by_resource: dict[
+            tuple[str, str], nixl_xfer_attestation_transport
+        ] = {}
+        for segment in snapshot.segments:
+            for transport in segment.selectedTransports:
+                resource = (transport.transport, transport.device)
+                selected_by_resource[resource] = transport
+        return tuple(
+            selected_by_resource[resource] for resource in sorted(selected_by_resource)
+        )
+
     def take_xfer_completion_receipt(
         self, handle: nixl_xfer_handle
     ) -> nixl_xfer_completion_receipt | None:
@@ -752,11 +952,38 @@ class nixl_agent:
             Return Dict is a map of remote agent names to a list of notification messages from that agent.
     """
 
-    def get_new_notifs(self, backends: list[str] = []) -> dict[str, list[bytes]]:
+    def get_new_notifs(
+        self, backends: list[str] = []
+    ) -> dict[nixl_remote_agent_handle, list[bytes]]:
+        """Drain newly authenticated notifications keyed by canonical handle.
+
+        :param backends: Backend names to poll.
+        :returns: New notifications keyed by canonical remote handle.
+        :raises RuntimeError: If native notification ownership is unknown or stale.
+        """
         handle_list = []
         for backend_string in backends:
             handle_list.append(self.backends[backend_string])
-        return self.agent.getNotifs({}, handle_list)
+
+        native_notifications = self.agent.getRemoteNotifs(handle_list)
+        notifications: dict[nixl_remote_agent_handle, list[bytes]] = {}
+        for native_handle, messages in native_notifications.items():
+            identity = int(native_handle.identity)
+            remote_handle = self._remote_agent_handles.get(identity)
+            if remote_handle is None:
+                raise RuntimeError(
+                    "received a notification for an unknown remote handle"
+                )
+            if remote_handle._native_handle != native_handle:
+                raise RuntimeError(
+                    "notification remote-handle identity collision"
+                )
+            if not remote_handle._active:
+                raise RuntimeError(
+                    "received a notification for an invalidated remote handle"
+                )
+            notifications[remote_handle] = list(messages)
+        return notifications
 
     """
     @brief Update notifications in a map
@@ -766,11 +993,16 @@ class nixl_agent:
     @return Dictionary of updated notifications.
     """
 
-    def update_notifs(self, backends: list[str] = []) -> dict[str, list[bytes]]:
-        handle_list = []
-        for backend_string in backends:
-            handle_list.append(self.backends[backend_string])
-        self.notifs = self.agent.getNotifs(self.notifs, handle_list)  # Adds new notifs
+    def update_notifs(
+        self, backends: list[str] = []
+    ) -> dict[nixl_remote_agent_handle, list[bytes]]:
+        """Merge newly authenticated notifications into the retained map.
+
+        :param backends: Backend names to poll.
+        :returns: Retained notifications keyed by canonical remote handle.
+        """
+        for remote_handle, messages in self.get_new_notifs(backends).items():
+            self.notifs.setdefault(remote_handle, []).extend(messages)
         return self.notifs
 
     """
@@ -787,28 +1019,34 @@ class nixl_agent:
 
     def check_remote_xfer_done(
         self,
-        remote_agent_name: str,
+        remote_agent: nixl_remote_agent_handle,
         lookup_tag: bytes,
         backends: list[str] = [],
-        tag_is_prefix=True,
+        tag_is_prefix: bool = True,
     ) -> bool:
-        handle_list = []
-        for backend_string in backends:
-            handle_list.append(self.backends[backend_string])
-        self.notifs = self.agent.getNotifs(self.notifs, handle_list)  # Adds new notifs
-        found = False
-        message = None
+        """Consume one matching notification from an owned remote handle.
 
-        if remote_agent_name in self.notifs:
-            for msg in self.notifs[remote_agent_name]:
+        :param remote_agent: Owned remote handle.
+        :param lookup_tag: Notification tag to match.
+        :param backends: Backend names to poll.
+        :param tag_is_prefix: Whether the tag must be a prefix.
+        :returns: Whether a matching notification was consumed.
+        """
+        self._unwrap_remote_agent(remote_agent)
+        self.update_notifs(backends)
+        found = False
+        message: bytes | None = None
+
+        if remote_agent in self.notifs:
+            for msg in self.notifs[remote_agent]:
                 if (tag_is_prefix and msg.startswith(lookup_tag)) or (
                     not tag_is_prefix and lookup_tag in msg
                 ):
                     message = msg
                     found = True
                     break
-        if message:
-            self.notifs[remote_agent_name].remove(message)
+        if message is not None:
+            self.notifs[remote_agent].remove(message)
         return found
 
     """
@@ -821,12 +1059,31 @@ class nixl_agent:
     """
 
     def send_notif(
-        self, remote_agent_name: str, notif_msg: bytes, backend: Optional[str] = None
-    ):
-        if backend is None:
-            self.agent.genNotif(remote_agent_name, notif_msg)
+        self,
+        remote_agent: str | nixl_remote_agent_handle,
+        notif_msg: bytes,
+        backend: Optional[str] = None,
+    ) -> None:
+        """Send a notification to an owned remote handle or local loopback.
+
+        :param remote_agent: Owned remote handle, or this agent's name for loopback.
+        :param notif_msg: Notification payload.
+        :param backend: Optional backend name.
+        """
+        if isinstance(remote_agent, str):
+            if remote_agent != self.name:
+                raise TypeError(
+                    "remote notifications require a nixl_remote_agent_handle"
+                )
+            native_remote_agent = remote_agent
         else:
-            self.agent.genNotif(remote_agent_name, notif_msg, self.backends[backend])
+            native_remote_agent = self._unwrap_remote_agent(remote_agent)
+        if backend is None:
+            self.agent.genNotif(native_remote_agent, notif_msg)
+        else:
+            self.agent.genNotif(
+                native_remote_agent, notif_msg, [self.backends[backend]]
+            )
 
     """
     @brief Get the full metadata of the local agent.
@@ -867,9 +1124,14 @@ class nixl_agent:
     @return Name of the added remote agent.
     """
 
-    def add_remote_agent(self, metadata: bytes) -> str:
-        agent_name = self.agent.loadRemoteMD(metadata)
-        return agent_name
+    def add_remote_agent(self, metadata: bytes) -> nixl_remote_agent_handle:
+        """Load exact remote metadata and return its canonical handle.
+
+        :param metadata: Exact serialized remote metadata.
+        :returns: Canonical agent-owned remote handle.
+        """
+        native_handle = self.agent.loadRemoteMD(metadata)
+        return self._wrap_remote_agent(native_handle)
 
     """
     @brief Remove a remote agent. After this call, current agent cannot initiate
@@ -879,8 +1141,16 @@ class nixl_agent:
     @param agent Name of the remote agent.
     """
 
-    def remove_remote_agent(self, agent: str):
-        self.agent.invalidateRemoteMD(agent)
+    def remove_remote_agent(self, agent: nixl_remote_agent_handle) -> None:
+        """Invalidate an exact agent-owned remote handle.
+
+        :param agent: Remote handle to invalidate.
+        """
+        native_handle = self._unwrap_remote_agent(agent)
+        try:
+            self.agent.invalidateRemoteMD(native_handle)
+        finally:
+            agent._active = False
 
     """
     @brief Send all of your metadata to a peer or central metadata server.

@@ -18,7 +18,6 @@
 #include "ucx_backend.h"
 #include "common/nixl_log.h"
 #include "serdes/serdes.h"
-#include "common/nixl_log.h"
 
 #include <algorithm>
 #include <optional>
@@ -40,20 +39,163 @@
 namespace {
 
 std::atomic<uint64_t> next_handle_identity{1};
+std::atomic<uint64_t> next_connection_identity{1};
 
 [[nodiscard]] uint64_t
-allocateHandleIdentity() {
-    uint64_t identity = next_handle_identity.load(std::memory_order_relaxed);
+allocateIdentity(std::atomic<uint64_t> &next_identity, const char *kind) {
+    uint64_t identity = next_identity.load(std::memory_order_relaxed);
     do {
         if (identity == std::numeric_limits<uint64_t>::max()) {
-            throw std::overflow_error("UCX handle identity space exhausted");
+            throw std::overflow_error(std::string("UCX ") + kind + " identity space exhausted");
         }
-    } while (!next_handle_identity.compare_exchange_weak(
+    } while (!next_identity.compare_exchange_weak(
         identity, identity + 1, std::memory_order_relaxed, std::memory_order_relaxed));
     return identity;
 }
 
+[[nodiscard]] int
+hexNibble(char value) noexcept {
+    if (value >= '0' && value <= '9') {
+        return value - '0';
+    }
+    if (value >= 'a' && value <= 'f') {
+        return value - 'a' + 10;
+    }
+    if (value >= 'A' && value <= 'F') {
+        return value - 'A' + 10;
+    }
+    return -1;
+}
+
+[[nodiscard]] bool
+parseWireUuid(std::string_view encoded,
+              nixl::ucx::notif_wire_uuid_t &uuid) noexcept {
+    nixl::ucx::notif_wire_uuid_t parsed;
+    size_t nibble_index = 0;
+    for (const char value : encoded) {
+        if (value == '-') {
+            continue;
+        }
+        const int nibble = hexNibble(value);
+        if (nibble < 0 || nibble_index >= parsed.bytes.size() * 2) {
+            return false;
+        }
+        const size_t byte_index = nibble_index / 2;
+        if ((nibble_index & 1U) == 0) {
+            parsed.bytes[byte_index] = static_cast<std::uint8_t>(nibble << 4);
+        } else {
+            parsed.bytes[byte_index] |= static_cast<std::uint8_t>(nibble);
+        }
+        ++nibble_index;
+    }
+    if (nibble_index != parsed.bytes.size() * 2 ||
+        !nixl::ucx::isCanonicalNotifWireUuid(parsed)) {
+        return false;
+    }
+    uuid = parsed;
+    return true;
+}
+
+[[nodiscard]] nixl_status_t
+notifStateToNixl(nixl::ucx::notif_state_status_t status) noexcept {
+    using enum nixl::ucx::notif_state_status_t;
+    switch (status) {
+    case SUCCESS:
+        return NIXL_SUCCESS;
+    case NOT_READY:
+        return NIXL_ERR_NOT_READY;
+    case UNKNOWN_ROUTE:
+    case UNKNOWN_CAPABILITY:
+        return NIXL_ERR_NOT_FOUND;
+    case INVALID_ARGUMENT:
+        return NIXL_ERR_INVALID_PARAM;
+    case ROUTE_RETIRED:
+    case ROUTE_CONFLICT:
+    case ROUTE_FAILED:
+    case STALE_EPOCH:
+    case EPOCH_CONFLICT:
+    case EPOCH_EXHAUSTED:
+        return NIXL_ERR_NOT_ALLOWED;
+    case RANDOM_FAILURE:
+        return NIXL_ERR_BACKEND;
+    }
+    return NIXL_ERR_UNKNOWN;
+}
+
 } // namespace
+
+nixl_status_t
+nixlUcxNotificationQueue::push(nixlAuthenticatedNotification &&notification) {
+    if (failed_) {
+        return NIXL_ERR_NOT_ALLOWED;
+    }
+
+    const bool item_overflow = notification.remoteAgent.size() > maxBytes_ ||
+        notification.payload.size() > maxBytes_ - notification.remoteAgent.size();
+    size_t notification_size = 0;
+    if (!item_overflow) {
+        notification_size = notification.remoteAgent.size() + notification.payload.size();
+    }
+    const bool count_overflow = notifications_.size() >= maxNotifications_;
+    const bool byte_overflow = item_overflow || queuedBytes_ > maxBytes_ ||
+        notification_size > maxBytes_ - queuedBytes_;
+    if (count_overflow || byte_overflow) {
+        failed_ = true;
+        notifications_.clear();
+        queuedBytes_ = 0;
+        NIXL_ERROR << "UCX authenticated notification queue exceeded its process bounds";
+        return NIXL_ERR_NOT_ALLOWED;
+    }
+
+    queuedBytes_ += notification_size;
+    notifications_.push_back(std::move(notification));
+    return NIXL_SUCCESS;
+}
+
+nixl_status_t
+nixlUcxNotificationQueue::drainLegacy(notif_list_t &notifications) {
+    if (!notifications.empty()) {
+        return NIXL_ERR_INVALID_PARAM;
+    }
+    if (failed_) {
+        notifications_.clear();
+        queuedBytes_ = 0;
+        return NIXL_ERR_NOT_ALLOWED;
+    }
+
+    notifications.reserve(notifications_.size());
+    for (auto &notification : notifications_) {
+        notifications.emplace_back(
+            std::move(notification.remoteAgent), std::move(notification.payload));
+    }
+    notifications_.clear();
+    queuedBytes_ = 0;
+    return NIXL_SUCCESS;
+}
+
+nixl_status_t
+nixlUcxNotificationQueue::drainAuthenticated(
+    authenticated_notif_list_t &notifications) {
+    if (!notifications.empty()) {
+        return NIXL_ERR_INVALID_PARAM;
+    }
+    if (failed_) {
+        notifications_.clear();
+        queuedBytes_ = 0;
+        return NIXL_ERR_NOT_ALLOWED;
+    }
+
+    notifications_.swap(notifications);
+    queuedBytes_ = 0;
+    return NIXL_SUCCESS;
+}
+
+void
+nixlUcxNotificationQueue::poison() {
+    failed_ = true;
+    notifications_.clear();
+    queuedBytes_ = 0;
+}
 
 class nixlUcxBackendReqH : public nixlBackendReqH {
 private:
@@ -104,12 +246,13 @@ protected:
 public:
     // Notification to be sent after completion of all requests
     struct Notif {
-        const std::string agent;
-        const nixl_blob_t payload;
+        std::vector<std::uint8_t> frame;
+        const ucx_connection_ptr_t connection;
 
-        Notif(const std::string &remote_agent, const nixl_blob_t &msg)
-            : agent(remote_agent),
-              payload(msg) {}
+        Notif(std::vector<std::uint8_t> wire_frame,
+              ucx_connection_ptr_t remote_connection)
+            : frame(std::move(wire_frame)),
+              connection(std::move(remote_connection)) {}
     };
 
     std::optional<Notif> notif;
@@ -122,15 +265,18 @@ public:
           workerId_(worker_id),
           attestation_(attestation != nullptr ?
                            std::move(attestation) :
-                           std::make_shared<nixlUcxAttestationState>(allocateHandleIdentity())) {}
+                           std::make_shared<nixlUcxAttestationState>(
+                               allocateIdentity(next_handle_identity, "handle"))) {}
 
     [[nodiscard]] nixl_status_t
     prepareAttestation(nixl_xfer_op_t operation,
                        const nixl_meta_dlist_t &local,
                        const nixl_meta_dlist_t &remote,
                        const std::string &local_agent,
-                       const std::string &remote_agent) {
-        return attestation_->prepare(operation, local, remote, local_agent, remote_agent);
+                       const std::string &remote_agent,
+                       const nixl_remote_agent_authority_t *remote_agent_authority) {
+        return attestation_->prepare(
+            operation, local, remote, local_agent, remote_agent, remote_agent_authority);
     }
 
     [[nodiscard]] nixl_status_t
@@ -144,13 +290,15 @@ public:
     [[nodiscard]] nixl_status_t
     recordSegment(size_t index,
                   nixlUcxEp &ep,
-                  const std::vector<nixl_xfer_attestation_transport_t> &transports,
+                  const std::vector<nixl_xfer_attestation_transport_t> &endpoint_transports,
+                  const std::vector<nixl_xfer_attestation_transport_t> &selected_transports,
                   const std::string &request_info) {
         return attestation_->recordSegment(index,
                                            workerId_,
                                            ep.getWorkerIdentity(),
                                            ep.getIdentity(),
-                                           transports,
+                                           endpoint_transports,
+                                           selected_transports,
                                            request_info);
     }
 
@@ -520,20 +668,27 @@ nixlUcxThreadEngine::~nixlUcxThreadEngine() {
 }
 
 void
-nixlUcxThreadEngine::appendNotif(std::string &&remote_name, std::string &&msg) {
+nixlUcxThreadEngine::appendNotif(nixlAuthenticatedNotification &&notification) const {
     const std::lock_guard lock(notifMutex_);
-    notifList_.emplace_back(std::move(remote_name), std::move(msg));
+    (void)notifQueue_.push(std::move(notification));
+}
+
+void
+nixlUcxThreadEngine::poisonNotifs() const {
+    const std::lock_guard lock(notifMutex_);
+    notifQueue_.poison();
 }
 
 nixl_status_t
 nixlUcxThreadEngine::getNotifs(notif_list_t &notif_list) {
-    if (!notif_list.empty()) {
-        return NIXL_ERR_INVALID_PARAM;
-    }
-
     const std::lock_guard lock(notifMutex_);
-    notifList_.swap(notif_list);
-    return NIXL_SUCCESS;
+    return notifQueue_.drainLegacy(notif_list);
+}
+
+nixl_status_t
+nixlUcxThreadEngine::getAuthenticatedNotifs(authenticated_notif_list_t &notif_list) {
+    const std::lock_guard lock(notifMutex_);
+    return notifQueue_.drainAuthenticated(notif_list);
 }
 
 /****************************************
@@ -840,7 +995,7 @@ nixlUcxThreadPoolEngine::prepXfer(const nixl_xfer_op_t &operation,
         getWorker(worker_id).get(), worker_id, chunk_size, num_chunks);
     const nixl_status_t status =
         prepareHandleAttestation(
-            comp_handle, operation, local, remote, remote_agent);
+            comp_handle, operation, local, remote, remote_agent, opt_args);
     if (status != NIXL_SUCCESS) {
         delete comp_handle;
         return status;
@@ -907,24 +1062,36 @@ nixlUcxThreadPoolEngine::sendXferRange(const nixl_xfer_op_t &operation,
 }
 
 void
-nixlUcxThreadPoolEngine::appendNotif(std::string &&remote_name, std::string &&msg) {
+nixlUcxThreadPoolEngine::appendNotif(nixlAuthenticatedNotification &&notification) const {
     const std::lock_guard lock(notifMutex_);
-    notifList_.emplace_back(std::move(remote_name), std::move(msg));
+    (void)notifQueue_.push(std::move(notification));
+}
+
+void
+nixlUcxThreadPoolEngine::poisonNotifs() const {
+    const std::lock_guard lock(notifMutex_);
+    notifQueue_.poison();
 }
 
 nixl_status_t
 nixlUcxThreadPoolEngine::getNotifs(notif_list_t &notif_list) {
-    if (!notif_list.empty()) {
-        return NIXL_ERR_INVALID_PARAM;
-    }
-
     if (!sharedThread_) {
         progressLoop();
     }
 
     const std::lock_guard lock(notifMutex_);
-    notifList_.swap(notif_list);
-    return NIXL_SUCCESS;
+    return notifQueue_.drainLegacy(notif_list);
+}
+
+nixl_status_t
+nixlUcxThreadPoolEngine::getAuthenticatedNotifs(
+    authenticated_notif_list_t &notif_list) {
+    if (!sharedThread_) {
+        progressLoop();
+    }
+
+    const std::lock_guard lock(notifMutex_);
+    return notifQueue_.drainAuthenticated(notif_list);
 }
 
 /****************************************
@@ -989,9 +1156,36 @@ nixlUcxEngine::nixlUcxEngine(const nixlBackendInitParams &init_params)
         uws.emplace_back(std::make_unique<nixlUcxWorker>(*uc, err_handling_mode));
     }
 
-    auto &uw = uws.front();
-    workerAddr = uw->epAddr();
-    uw->regAmCallback(nixl::ucx::am_cb_op_t::NOTIF_STR, notifAmCb, this);
+    localConnectionMetadata_.backendIncarnation =
+        nixl::ucx::generateConnectionMetadataUuid();
+    localConnectionMetadata_.workers.reserve(uws.size());
+    for (const auto &worker : uws) {
+        localConnectionMetadata_.workers.push_back({
+            .incarnation = nixl::ucx::generateConnectionMetadataUuid(),
+            .endpointAddress = worker->epAddr(),
+        });
+    }
+
+    if (!parseWireUuid(localAgentIncarnation, localAgentIncarnationUuid_)) {
+        throw std::invalid_argument("invalid local agent incarnation");
+    }
+    std::vector<nixl::ucx::notif_wire_uuid_t> local_worker_incarnations;
+    local_worker_incarnations.reserve(localConnectionMetadata_.workers.size());
+    for (const auto &worker : localConnectionMetadata_.workers) {
+        local_worker_incarnations.push_back(worker.incarnation);
+    }
+    notifState_ = std::make_unique<nixl::ucx::notif_capability_state_t>(
+        localAgentIncarnationUuid_,
+        localConnectionMetadata_.backendIncarnation,
+        std::move(local_worker_incarnations));
+
+    notifCallbackContexts_.reserve(uws.size());
+    for (size_t worker_id = 0; worker_id < uws.size(); ++worker_id) {
+        notifCallbackContexts_.push_back({.engine = this, .workerId = worker_id});
+        uws[worker_id]->regAmCallback(nixl::ucx::am_cb_op_t::NOTIF_STR,
+                                     notifAmCb,
+                                     &notifCallbackContexts_.back());
+    }
 }
 
 nixl_mem_list_t nixlUcxEngine::getSupportedMems () const {
@@ -1010,6 +1204,8 @@ tlsSharedWorkerMap() {
 // Through parent destructor the unregister will be called.
 nixlUcxEngine::~nixlUcxEngine() {
     tlsSharedWorkerMap().erase(this);
+    const std::lock_guard lock(connectionMutex_);
+    remoteConnMap.clear();
 }
 
 /****************************************
@@ -1017,56 +1213,255 @@ nixlUcxEngine::~nixlUcxEngine() {
 *****************************************/
 
 nixl_status_t nixlUcxEngine::checkConn(const std::string &remote_agent) {
-    return remoteConnMap.count(remote_agent) ? NIXL_SUCCESS : NIXL_ERR_NOT_FOUND;
+    return getConnection(remote_agent) != nullptr ? NIXL_SUCCESS : NIXL_ERR_NOT_FOUND;
 }
 
 nixl_status_t nixlUcxEngine::getConnInfo(std::string &str) const {
-    str = workerAddr;
-    return NIXL_SUCCESS;
+    return nixl::ucx::encodeConnectionMetadata(localConnectionMetadata_, str) ==
+            nixl::ucx::connection_metadata_status_t::SUCCESS ?
+        NIXL_SUCCESS : NIXL_ERR_BACKEND;
 }
 
 nixl_status_t nixlUcxEngine::connect(const std::string &remote_agent) {
     if(remote_agent == localAgent) {
-        return loadRemoteConnInfo(remote_agent, workerAddr);
+        std::string local_conn_info;
+        const nixl_status_t status = getConnInfo(local_conn_info);
+        if (status != NIXL_SUCCESS) {
+            return status;
+        }
+        return loadRemoteConnInfo(remote_agent, local_conn_info);
     }
 
-    return (remoteConnMap.find(remote_agent) == remoteConnMap.end()) ? NIXL_ERR_NOT_FOUND :
-                                                                       NIXL_SUCCESS;
+    return getConnection(remote_agent) == nullptr ? NIXL_ERR_NOT_FOUND : NIXL_SUCCESS;
 }
 
 nixl_status_t nixlUcxEngine::disconnect(const std::string &remote_agent) {
+    const std::lock_guard lock(connectionMutex_);
     const auto it = remoteConnMap.find(remote_agent);
 
     if (it == remoteConnMap.end()) {
         return NIXL_ERR_NOT_FOUND;
     }
 
-    // thread safety?
     remoteConnMap.erase(it);
     return NIXL_SUCCESS;
+}
+
+nixl_status_t
+nixlUcxEngine::queryRemoteAgentAuthority(
+    const std::string &remote_agent,
+    nixl_remote_agent_authority_t &authority) const {
+    const ucx_connection_ptr_t connection = getConnection(remote_agent);
+    if (connection == nullptr) {
+        return NIXL_ERR_NOT_FOUND;
+    }
+
+    authority = {};
+    authority.connectionIdentity = connection->identity_;
+    authority.endpointIdentities.reserve(connection->eps.size());
+    for (const auto &ep : connection->eps) {
+        authority.endpointIdentities.push_back(ep->getIdentity());
+    }
+    std::sort(authority.endpointIdentities.begin(), authority.endpointIdentities.end());
+    return NIXL_SUCCESS;
+}
+
+nixl_status_t
+nixlUcxEngine::makeRoute(const nixlRemoteAgentBinding &binding,
+                         nixl::ucx::notif_route_key_t &route,
+                         ucx_connection_ptr_t &connection) const {
+    if (binding.remoteAgent.empty() || binding.authority.handleIdentity == 0 ||
+        binding.authority.generation == 0 ||
+        binding.authority.connectionIdentity == 0 ||
+        binding.authority.endpointIdentities.empty()) {
+        return NIXL_ERR_INVALID_PARAM;
+    }
+
+    connection = getConnection(binding.remoteAgent);
+    if (connection == nullptr ||
+        connection->getIdentity() != binding.authority.connectionIdentity) {
+        return NIXL_ERR_NOT_FOUND;
+    }
+
+    std::vector<uint64_t> endpoint_identities;
+    endpoint_identities.reserve(connection->eps.size());
+    for (const auto &endpoint : connection->eps) {
+        endpoint_identities.push_back(endpoint->getIdentity());
+    }
+    std::sort(endpoint_identities.begin(), endpoint_identities.end());
+    if (endpoint_identities != binding.authority.endpointIdentities) {
+        return NIXL_ERR_NOT_ALLOWED;
+    }
+
+    nixl::ucx::notif_wire_uuid_t remote_agent_incarnation;
+    if (!parseWireUuid(binding.agentIncarnation, remote_agent_incarnation)) {
+        return NIXL_ERR_INVALID_PARAM;
+    }
+    route = {
+        .handleIdentity = binding.authority.handleIdentity,
+        .handleGeneration = binding.authority.generation,
+        .remoteAgentIncarnation = remote_agent_incarnation,
+        .remoteBackendIncarnation = connection->metadata_.backendIncarnation,
+    };
+    return NIXL_SUCCESS;
+}
+
+nixl_status_t
+nixlUcxEngine::bindRemoteAgent(const nixlRemoteAgentBinding &binding) {
+    nixl::ucx::notif_route_key_t route;
+    ucx_connection_ptr_t connection;
+    const nixl_status_t route_status = makeRoute(binding, route, connection);
+    if (route_status != NIXL_SUCCESS) {
+        return route_status;
+    }
+
+    bool inserted_route = false;
+    {
+        const std::lock_guard lock(exactRouteMutex_);
+        const auto known = exactRoutes_.find(route.handleIdentity);
+        if (known != exactRoutes_.end()) {
+            if (known->second.route != route ||
+                known->second.remoteAgent != binding.remoteAgent ||
+                known->second.connectionIdentity != connection->getIdentity()) {
+                return NIXL_ERR_NOT_ALLOWED;
+            }
+        } else {
+            exactRoutes_.emplace(route.handleIdentity,
+                                 exactRouteRecord{
+                                     .route = route,
+                                     .remoteAgent = binding.remoteAgent,
+                                     .connectionIdentity = connection->getIdentity(),
+                                 });
+            inserted_route = true;
+        }
+    }
+
+    nixl::ucx::notif_remote_binding_t remote_binding = {
+        .route = route,
+        .connectionIdentity = connection->getIdentity(),
+    };
+    remote_binding.workers.reserve(connection->metadata_.workers.size());
+    for (size_t worker_index = 0;
+         worker_index < connection->metadata_.workers.size();
+         ++worker_index) {
+        remote_binding.workers.push_back({
+            .incarnation = connection->metadata_.workers[worker_index].incarnation,
+            .endpointIdentity =
+                connection->eps[worker_index % connection->eps.size()]->getIdentity(),
+        });
+    }
+
+    nixl::ucx::notif_route_snapshot_t snapshot;
+    const nixl::ucx::notif_state_status_t bind_status =
+        notifState_->bindRemoteAgent(remote_binding, snapshot);
+    if (bind_status != nixl::ucx::notif_state_status_t::SUCCESS) {
+        if (inserted_route) {
+            const std::lock_guard lock(exactRouteMutex_);
+            exactRoutes_.erase(route.handleIdentity);
+        }
+        return notifStateToNixl(bind_status);
+    }
+
+    nixl::ucx::notif_wire_envelope_t offer;
+    const auto &worker = localConnectionMetadata_.workers.front().incarnation;
+    if (notifState_->makeOffer(route, worker, offer) ==
+        nixl::ucx::notif_state_status_t::SUCCESS) {
+        const nixl_status_t send_status =
+            sendControlFrame(offer, connection->getIdentity(), 0);
+        if (send_status != NIXL_SUCCESS) {
+            NIXL_WARN << "UCX notification OFFER will be retried for handle "
+                      << route.handleIdentity << ": " << send_status;
+        }
+    }
+    return NIXL_SUCCESS;
+}
+
+nixl_status_t
+nixlUcxEngine::retireRemoteAgent(const nixlRemoteAgentBinding &binding) {
+    nixl::ucx::notif_route_key_t route;
+    ucx_connection_ptr_t connection;
+    const nixl_status_t route_status = makeRoute(binding, route, connection);
+    if (route_status != NIXL_SUCCESS) {
+        return route_status;
+    }
+    const std::optional<exactRouteRecord> record =
+        getExactRoute(route.handleIdentity, route.handleGeneration);
+    if (!record.has_value() || record->route != route) {
+        return NIXL_ERR_NOT_FOUND;
+    }
+    return notifStateToNixl(notifState_->retireRemoteAgent(route));
+}
+
+nixl_status_t
+nixlUcxEngine::queryRemoteNotificationState(
+    const nixlRemoteAgentBinding &binding) const {
+    nixl::ucx::notif_route_key_t route;
+    ucx_connection_ptr_t connection;
+    const nixl_status_t route_status = makeRoute(binding, route, connection);
+    if (route_status != NIXL_SUCCESS) {
+        return route_status;
+    }
+
+    nixl::ucx::notif_route_snapshot_t snapshot;
+    const nixl::ucx::notif_state_status_t query_status =
+        notifState_->queryRemoteNotificationState(route, snapshot);
+    if (query_status != nixl::ucx::notif_state_status_t::SUCCESS) {
+        return notifStateToNixl(query_status);
+    }
+    switch (snapshot.state) {
+    case nixl::ucx::notif_route_state_t::READY:
+        return NIXL_SUCCESS;
+    case nixl::ucx::notif_route_state_t::NOT_READY: {
+        nixl::ucx::notif_wire_envelope_t offer;
+        const auto &worker = localConnectionMetadata_.workers.front().incarnation;
+        if (notifState_->makeOffer(route, worker, offer) ==
+            nixl::ucx::notif_state_status_t::SUCCESS) {
+            (void)sendControlFrame(offer, connection->getIdentity(), 0);
+        }
+        return NIXL_ERR_NOT_READY;
+    }
+    case nixl::ucx::notif_route_state_t::RETIRED:
+    case nixl::ucx::notif_route_state_t::FAILED:
+        return NIXL_ERR_NOT_ALLOWED;
+    }
+    return NIXL_ERR_UNKNOWN;
 }
 
 nixl_status_t nixlUcxEngine::loadRemoteConnInfo (const std::string &remote_agent,
                                                  const std::string &remote_conn_info)
 {
-    size_t size = remote_conn_info.size();
-    std::vector<char> addr(size);
-
-    if(remoteConnMap.count(remote_agent)) {
-        return NIXL_ERR_INVALID_PARAM;
+    {
+        const std::lock_guard lock(connectionMutex_);
+        if (remoteConnMap.count(remote_agent) != 0) {
+            return NIXL_ERR_INVALID_PARAM;
+        }
     }
 
-    nixlSerDes::_stringToBytes(addr.data(), remote_conn_info, size);
-    std::shared_ptr<nixlUcxConnection> conn = std::make_shared<nixlUcxConnection>();
-    for (auto &uw : uws) {
-        std::unique_ptr<nixlUcxEp> result = uw->connect(addr.data(), size);
+    nixl::ucx::connection_metadata_t remote_metadata;
+    if (nixl::ucx::decodeConnectionMetadata(remote_conn_info, remote_metadata) !=
+        nixl::ucx::connection_metadata_status_t::SUCCESS) {
+        return NIXL_ERR_MISMATCH;
+    }
+
+    std::shared_ptr<nixlUcxConnection> conn = std::make_shared<nixlUcxConnection>(
+        allocateIdentity(next_connection_identity, "connection"),
+        std::move(remote_metadata));
+    for (size_t worker_id = 0; worker_id < uws.size(); ++worker_id) {
+        const auto &remote_worker =
+            conn->metadata_.workers[worker_id % conn->metadata_.workers.size()];
+        std::unique_ptr<nixlUcxEp> result = uws[worker_id]->connect(
+            remote_worker.endpointAddress.data(), remote_worker.endpointAddress.size());
         if (!result) {
             return NIXL_ERR_BACKEND;
         }
         conn->eps.push_back(std::move(result));
     }
-
-    remoteConnMap.insert({remote_agent, conn});
+    {
+        const std::lock_guard lock(connectionMutex_);
+        if (!remoteConnMap.emplace(remote_agent, conn).second) {
+            return NIXL_ERR_INVALID_PARAM;
+        }
+    }
 
     return NIXL_SUCCESS;
 }
@@ -1134,16 +1529,17 @@ nixl_status_t
 nixlUcxEngine::internalMDHelper (const nixl_blob_t &blob,
                                  const std::string &agent,
                                  nixlBackendMD* &output) {
+    output = nullptr;
     try {
-        const auto it = remoteConnMap.find(agent);
-
-        if (it == remoteConnMap.end()) {
+        const ucx_connection_ptr_t connection = getConnection(agent);
+        if (connection == nullptr) {
             // TODO: err: remote connection not found
             return NIXL_ERR_NOT_FOUND;
         }
         // nixlSerDes::_stringToBytes() was used to "unpack" blob here.
-        output = new nixlUcxPublicMetadata(
-            it->second, makePublicMetadataRkeys(it->second, uws.size(), blob.data()));
+        auto metadata = std::make_unique<nixlUcxPublicMetadata>(
+            connection, makePublicMetadataRkeys(connection, uws.size(), blob.data()));
+        output = metadata.release();
         return NIXL_SUCCESS;
     }
     catch (const std::runtime_error &e) {
@@ -1242,7 +1638,7 @@ nixl_status_t nixlUcxEngine::prepXfer (const nixl_xfer_op_t &operation,
     const auto int_handle = new nixlUcxBackendReqH(getWorker(worker_id).get(), worker_id);
     const nixl_status_t status =
         prepareHandleAttestation(
-            int_handle, operation, local, remote, remote_agent);
+            int_handle, operation, local, remote, remote_agent, opt_args);
     if (status != NIXL_SUCCESS) {
         delete int_handle;
         return status;
@@ -1257,10 +1653,16 @@ nixlUcxEngine::prepareHandleAttestation(nixlBackendReqH *handle,
                                         const nixl_xfer_op_t &operation,
                                         const nixl_meta_dlist_t &local,
                                         const nixl_meta_dlist_t &remote,
-                                        const std::string &remote_agent) const {
+                                        const std::string &remote_agent,
+                                        const nixl_opt_b_args_t *opt_args) const {
     const auto int_handle = static_cast<nixlUcxBackendReqH *>(handle);
     return int_handle->prepareAttestation(
-        operation, local, remote, localAgent, remote_agent);
+        operation,
+        local,
+        remote,
+        localAgent,
+        remote_agent,
+        opt_args == nullptr ? nullptr : opt_args->remoteAgentAuthority);
 }
 
 nixl_status_t nixlUcxEngine::estimateXferCost (const nixl_xfer_op_t &operation,
@@ -1331,7 +1733,7 @@ nixlUcxEngine::sendXferRangeBatch(nixlUcxEp &ep,
                                   size_t end_idx) {
     batchResult result = {NIXL_SUCCESS, 0, nullptr};
     const auto int_handle = static_cast<nixlUcxBackendReqH *>(handle);
-    std::vector<nixl_xfer_attestation_transport_t> transports;
+    std::vector<nixl_xfer_attestation_transport_t> endpoint_transports;
 
     for (size_t i = start_idx; i < end_idx; ++i) {
         void *laddr = (void *)local[i].addr;
@@ -1349,15 +1751,28 @@ nixlUcxEngine::sendXferRangeBatch(nixlUcxEp &ep,
         ++result.size;
         nixlUcxReq req = nullptr;
         std::string request_info;
+        std::vector<nixl_xfer_attestation_transport_t> selected_transports;
         const nixl_status_t ret = operation == NIXL_READ ?
-            ep.read(
-                raddr, rmd->getRkey(worker_id), laddr, lmd->mem, lsize, req, request_info) :
-            ep.write(
-                laddr, lmd->mem, raddr, rmd->getRkey(worker_id), lsize, req, request_info);
+            ep.read(raddr,
+                    rmd->getRkey(worker_id),
+                    laddr,
+                    lmd->mem,
+                    lsize,
+                    req,
+                    request_info,
+                    selected_transports) :
+            ep.write(laddr,
+                     lmd->mem,
+                     raddr,
+                     rmd->getRkey(worker_id),
+                     lsize,
+                     req,
+                     request_info,
+                     selected_transports);
 
         if (ret == NIXL_IN_PROG) {
-            if (transports.empty()) {
-                result.status = ep.queryTransports(transports);
+            if (endpoint_transports.empty()) {
+                result.status = ep.queryTransports(endpoint_transports);
                 if (result.status != NIXL_SUCCESS) {
                     ucp_request_free(req);
                     if (result.req != nullptr) {
@@ -1367,8 +1782,8 @@ nixlUcxEngine::sendXferRangeBatch(nixlUcxEp &ep,
                     break;
                 }
             }
-            const nixl_status_t evidence_status =
-                int_handle->recordSegment(i, ep, transports, request_info);
+            const nixl_status_t evidence_status = int_handle->recordSegment(
+                i, ep, endpoint_transports, selected_transports, request_info);
             if (evidence_status != NIXL_SUCCESS) {
                 ucp_request_free(req);
                 if (result.req != nullptr) {
@@ -1457,16 +1872,18 @@ nixlUcxEngine::sendXferRange(const nixl_xfer_op_t &operation,
         if (evidence_status != NIXL_SUCCESS) {
             return evidence_status;
         }
-        if (int_handle->append(ret,
-                               req,
-                               conn,
-                               nixlUcxBackendReqH::pending_kind_t::ENDPOINT_FLUSH,
-                               ep->getIdentity()) != NIXL_SUCCESS) {
+        const nixl_status_t append_status = int_handle->append(
+            ret,
+            req,
+            conn,
+            nixlUcxBackendReqH::pending_kind_t::ENDPOINT_FLUSH,
+            ep->getIdentity());
+        if (append_status != NIXL_SUCCESS) {
             int_handle->getAttestationState()->fail(
                 int_handle->getAttestationState()->getGeneration(),
-                ret,
+                append_status,
                 "UCX endpoint flush submission failed");
-            return ret;
+            return append_status;
         }
     }
 
@@ -1484,11 +1901,33 @@ nixlUcxEngine::postXfer(const nixl_xfer_op_t &operation,
     const size_t rcnt = remote.descCount();
     const auto int_handle = static_cast<nixlUcxBackendReqH *>(handle);
     nixl_status_t ret;
+    std::vector<std::uint8_t> notification_frame;
+    ucx_connection_ptr_t notification_connection;
 
     if (lcnt != rcnt) {
         NIXL_ERROR << "Local (" << lcnt << ") and remote (" << rcnt
                    << ") descriptor lists differ in size";
         return NIXL_ERR_INVALID_PARAM;
+    }
+
+    if (opt_args != nullptr && opt_args->hasNotif) {
+        if (opt_args->remoteAgentAuthority == nullptr) {
+            return NIXL_ERR_INVALID_PARAM;
+        }
+        ret = prepareDataFrame(*opt_args->remoteAgentAuthority,
+                               int_handle->getWorkerId(),
+                               opt_args->notifMsg,
+                               notification_frame,
+                               notification_connection);
+        if (ret != NIXL_SUCCESS) {
+            return ret;
+        }
+        const auto remote_metadata =
+            static_cast<nixlUcxPublicMetadata *>(remote[0].metadataP);
+        if (remote_metadata == nullptr ||
+            remote_metadata->conn != notification_connection) {
+            return NIXL_ERR_NOT_ALLOWED;
+        }
     }
 
     ret = int_handle->beginSubmission();
@@ -1511,21 +1950,22 @@ nixlUcxEngine::postXfer(const nixl_xfer_op_t &operation,
     }
 
     ret = int_handle->status();
-    if (opt_args && opt_args->hasNotif) {
+    if (opt_args != nullptr && opt_args->hasNotif) {
         if (ret == NIXL_SUCCESS) {
             nixlUcxReq req;
-            const auto rmd = static_cast<nixlUcxPublicMetadata *>(remote[0].metadataP);
-            ret = notifSendPriv(remote_agent,
-                                opt_args->notifMsg,
-                                rmd->conn->getEp(int_handle->getWorkerId()),
+            ret = notifSendPriv(std::move(notification_frame),
+                                notification_connection->getEp(int_handle->getWorkerId()),
                                 &req);
-            if (int_handle->append(ret, req, rmd->conn) != NIXL_SUCCESS) {
-                return ret;
+            const nixl_status_t append_status =
+                int_handle->append(ret, req, notification_connection);
+            if (append_status != NIXL_SUCCESS) {
+                return append_status;
             }
 
             ret = int_handle->status();
         } else if (ret == NIXL_IN_PROG) {
-            int_handle->notif.emplace(remote_agent, opt_args->notifMsg);
+            int_handle->notif.emplace(
+                std::move(notification_frame), notification_connection);
         }
     }
 
@@ -1541,24 +1981,26 @@ nixl_status_t nixlUcxEngine::checkXfer (nixlBackendReqH* handle) const
         return handle_status;
     }
 
-    const nixlUcxBackendReqH::Notif notif(std::move(int_handle->notif).value());
+    nixlUcxBackendReqH::Notif notif(std::move(int_handle->notif).value());
     int_handle->notif.reset();
 
     if (handle_status != NIXL_SUCCESS) [[unlikely]] {
         return handle_status;
     }
 
-    const ucx_connection_ptr_t conn = getConnection(notif.agent);
-    if (!conn) [[unlikely]] {
+    const ucx_connection_ptr_t &conn = notif.connection;
+    if (conn == nullptr) [[unlikely]] {
         return NIXL_ERR_NOT_FOUND;
     }
 
     nixlUcxReq req;
     const auto &ep = conn->getEp(int_handle->getWorkerId());
-    const nixl_status_t status = notifSendPriv(notif.agent, notif.payload, ep, &req);
+    const nixl_status_t status =
+        notifSendPriv(std::move(notif.frame), ep, &req);
 
-    if (int_handle->append(status, req, conn) != NIXL_SUCCESS) {
-        return status;
+    const nixl_status_t append_status = int_handle->append(status, req, conn);
+    if (append_status != NIXL_SUCCESS) {
+        return append_status;
     }
 
     return int_handle->status();
@@ -1617,20 +2059,21 @@ nixlUcxEngine::progressLoop() {
  * Notifications
 *****************************************/
 
-//agent will provide cached msg
 nixl_status_t
-nixlUcxEngine::notifSendPriv(const std::string &remote_agent,
-                             const std::string &msg,
+nixlUcxEngine::notifSendPriv(std::vector<std::uint8_t> &&frame,
                              const std::unique_ptr<nixlUcxEp> &ep,
                              nixlUcxReq *req) const {
-    nixlSerDes ser_des;
+    if (ep == nullptr || frame.empty() ||
+        frame.size() > nixl::ucx::notif_wire_max_frame_size) {
+        return NIXL_ERR_INVALID_PARAM;
+    }
+    const nixl_status_t endpoint_status = ep->checkTxState();
+    if (endpoint_status != NIXL_SUCCESS) {
+        return endpoint_status;
+    }
 
-    ser_des.addStr("name", localAgent);
-    ser_des.addStr("msg", msg);
-    // TODO: replace with mpool for performance
-
-    std::string *buffer = new std::string(ser_des.exportStr());
-    auto deleter = [buffer, req](void *completed_request, void *ptr) {
+    auto *buffer = new std::vector<std::uint8_t>(std::move(frame));
+    auto deleter = [buffer, req](void *completed_request, void *) {
         delete buffer;
         if ((req == nullptr) && (completed_request != nullptr)) {
             /* Caller is not interested in the request, free it */
@@ -1641,23 +2084,141 @@ nixlUcxEngine::notifSendPriv(const std::string &remote_agent,
     return ep->sendAm(nixl::ucx::am_cb_op_t::NOTIF_STR,
                       nullptr,
                       0,
-                      (void *)buffer->data(),
+                      buffer->data(),
                       buffer->size(),
                       UCP_AM_SEND_FLAG_EAGER,
                       req,
                       deleter);
 }
 
+nixl_status_t
+nixlUcxEngine::sendControlFrame(
+    const nixl::ucx::notif_wire_envelope_t &envelope,
+    uint64_t connection_identity,
+    size_t worker_id) const {
+    const ucx_connection_ptr_t connection =
+        getConnection(connection_identity);
+    if (connection == nullptr || worker_id >= connection->eps.size()) {
+        return NIXL_ERR_NOT_FOUND;
+    }
+
+    std::vector<std::uint8_t> frame;
+    const nixl::ucx::notif_wire_status_t encode_status =
+        nixl::ucx::encodeNotifWireFrame(envelope, {}, frame);
+    if (encode_status != nixl::ucx::notif_wire_status_t::SUCCESS) {
+        return NIXL_ERR_BACKEND;
+    }
+    const nixl_status_t send_status =
+        notifSendPriv(std::move(frame), connection->getEp(worker_id));
+    return send_status == NIXL_IN_PROG ? NIXL_SUCCESS : send_status;
+}
+
 ucx_connection_ptr_t
 nixlUcxEngine::getConnection(const std::string &remote_agent) const {
+    const std::lock_guard lock(connectionMutex_);
     const auto it = remoteConnMap.find(remote_agent);
     return (it != remoteConnMap.end()) ? it->second : nullptr;
 }
 
+ucx_connection_ptr_t
+nixlUcxEngine::getConnection(uint64_t connection_identity) const {
+    const std::lock_guard lock(connectionMutex_);
+    for (const auto &entry : remoteConnMap) {
+        const ucx_connection_ptr_t &connection = entry.second;
+        if (connection->getIdentity() == connection_identity) {
+            return connection;
+        }
+    }
+    return nullptr;
+}
+
+std::optional<nixlUcxEngine::exactRouteRecord>
+nixlUcxEngine::getExactRoute(uint64_t handle_identity,
+                             uint64_t generation) const {
+    const std::lock_guard lock(exactRouteMutex_);
+    const auto route = exactRoutes_.find(handle_identity);
+    if (route == exactRoutes_.end() ||
+        route->second.route.handleGeneration != generation) {
+        return std::nullopt;
+    }
+    return route->second;
+}
+
+nixl_status_t
+nixlUcxEngine::prepareDataFrame(
+    const nixl_remote_agent_authority_t &authority,
+    size_t worker_id,
+    const std::string &msg,
+    std::vector<std::uint8_t> &frame,
+    ucx_connection_ptr_t &connection) const {
+    if (worker_id >= localConnectionMetadata_.workers.size()) {
+        return NIXL_ERR_INVALID_PARAM;
+    }
+    const std::optional<exactRouteRecord> route =
+        getExactRoute(authority.handleIdentity, authority.generation);
+    if (!route.has_value() ||
+        route->connectionIdentity != authority.connectionIdentity) {
+        return NIXL_ERR_NOT_FOUND;
+    }
+
+    ucx_connection_ptr_t exact_connection =
+        getConnection(route->connectionIdentity);
+    if (exact_connection == nullptr) {
+        return NIXL_ERR_NOT_FOUND;
+    }
+    std::vector<uint64_t> endpoint_identities;
+    endpoint_identities.reserve(exact_connection->eps.size());
+    for (const auto &endpoint : exact_connection->eps) {
+        endpoint_identities.push_back(endpoint->getIdentity());
+    }
+    std::sort(endpoint_identities.begin(), endpoint_identities.end());
+    if (endpoint_identities != authority.endpointIdentities) {
+        return NIXL_ERR_NOT_ALLOWED;
+    }
+
+    nixl::ucx::notif_wire_envelope_t envelope;
+    const nixl::ucx::notif_wire_uuid_t &worker =
+        localConnectionMetadata_.workers[worker_id].incarnation;
+    const nixl::ucx::notif_state_status_t state_status =
+        notifState_->prepareData(route->route, worker, envelope);
+    if (state_status == nixl::ucx::notif_state_status_t::NOT_READY) {
+        nixl::ucx::notif_wire_envelope_t offer;
+        if (notifState_->makeOffer(route->route, worker, offer) ==
+            nixl::ucx::notif_state_status_t::SUCCESS) {
+            (void)sendControlFrame(
+                offer, exact_connection->getIdentity(), worker_id);
+        }
+        return NIXL_ERR_NOT_READY;
+    }
+    if (state_status != nixl::ucx::notif_state_status_t::SUCCESS) {
+        return notifStateToNixl(state_status);
+    }
+
+    std::vector<std::uint8_t> encoded;
+    const auto payload = std::span<const std::uint8_t>(
+        reinterpret_cast<const std::uint8_t *>(msg.data()), msg.size());
+    const nixl::ucx::notif_wire_status_t encode_status =
+        nixl::ucx::encodeNotifWireFrame(envelope, payload, encoded);
+    if (encode_status != nixl::ucx::notif_wire_status_t::SUCCESS) {
+        return encode_status == nixl::ucx::notif_wire_status_t::FRAME_TOO_LARGE ?
+            NIXL_ERR_INVALID_PARAM : NIXL_ERR_BACKEND;
+    }
+
+    frame.swap(encoded);
+    connection = std::move(exact_connection);
+    return NIXL_SUCCESS;
+}
+
 void
-nixlUcxEngine::appendNotif(std::string &&remote_name, std::string &&msg) {
+nixlUcxEngine::appendNotif(nixlAuthenticatedNotification &&notification) const {
     // In the "no progress thread" case the lock in nixlAgent is sufficient.
-    notifList_.emplace_back(std::move(remote_name), std::move(msg));
+    (void)notifQueue_.push(std::move(notification));
+}
+
+void
+nixlUcxEngine::poisonNotifs() const {
+    // In the "no progress thread" case the lock in nixlAgent is sufficient.
+    notifQueue_.poison();
 }
 
 ucs_status_t
@@ -1666,44 +2227,157 @@ nixlUcxEngine::notifAmCb(void *arg, const void *header,
                          size_t length,
                          const ucp_am_recv_param_t *param)
 {
-    nixlSerDes ser_des;
+    if (arg == nullptr || param == nullptr ||
+        (param->recv_attr & UCP_AM_RECV_ATTR_FLAG_RNDV) != 0 ||
+        data == nullptr ||
+        header_length != 0 ||
+        length > nixlUcxNotificationQueue::maxWireBytes) {
+        NIXL_ERROR << "Rejected malformed or oversized UCX notification frame";
+        return UCS_OK;
+    }
 
-    std::string ser_str( (char*) data, length);
-    nixlUcxEngine* engine = (nixlUcxEngine*) arg;
+    const auto *context = static_cast<notifCallbackContext *>(arg);
+    nixlUcxEngine *engine = context->engine;
+    if (engine == nullptr ||
+        context->workerId >= engine->localConnectionMetadata_.workers.size()) {
+        return UCS_OK;
+    }
 
-    // send_am should be forcing EAGER protocol
-    NIXL_ASSERT(!(param->recv_attr & UCP_AM_RECV_ATTR_FLAG_RNDV));
-    NIXL_ASSERT(header_length == 0) << "header_length " << header_length;
+    const auto wire = std::span<const std::uint8_t>(
+        static_cast<const std::uint8_t *>(data), length);
+    nixl::ucx::notif_wire_frame_view_t frame;
+    if (nixl::ucx::decodeNotifWireFrame(wire, frame) !=
+        nixl::ucx::notif_wire_status_t::SUCCESS) {
+        NIXL_ERROR << "Rejected malformed UCX notification frame";
+        engine->poisonNotifs();
+        return UCS_OK;
+    }
 
-    ser_des.importStr(ser_str);
-    std::string remote_name = ser_des.getStr("name");
-    std::string msg = ser_des.getStr("msg");
+    const nixl::ucx::notif_wire_uuid_t &local_worker =
+        engine->localConnectionMetadata_.workers[context->workerId].incarnation;
+    if (frame.envelope.type == nixl::ucx::notif_wire_type_t::OFFER) {
+        nixl::ucx::notif_offer_acceptance_t acceptance;
+        const nixl::ucx::notif_state_status_t status =
+            engine->notifState_->acceptOffer(
+                frame.envelope, local_worker, acceptance);
+        if (status != nixl::ucx::notif_state_status_t::SUCCESS) {
+            NIXL_DEBUG << "Rejected UCX notification OFFER with state status "
+                       << static_cast<int>(status);
+            return UCS_OK;
+        }
 
-    engine->appendNotif(std::move(remote_name), std::move(msg));
+        const std::optional<exactRouteRecord> route = engine->getExactRoute(
+            acceptance.route.handleIdentity,
+            acceptance.route.handleGeneration);
+        if (!route.has_value() || route->route != acceptance.route) {
+            NIXL_ERROR << "Rejected UCX notification OFFER for an unknown exact route";
+            return UCS_OK;
+        }
+        const nixl_status_t ack_status = engine->sendControlFrame(
+            acceptance.acknowledgement,
+            route->connectionIdentity,
+            context->workerId);
+        if (ack_status != NIXL_SUCCESS) {
+            NIXL_WARN << "Failed to send UCX notification ACK: " << ack_status;
+        }
+        if (acceptance.reemitLocalOffer) {
+            const nixl_status_t offer_status = engine->sendControlFrame(
+                acceptance.localOffer,
+                route->connectionIdentity,
+                context->workerId);
+            if (offer_status != NIXL_SUCCESS) {
+                NIXL_WARN << "Failed to re-emit UCX notification OFFER: "
+                          << offer_status;
+            }
+        }
+        return UCS_OK;
+    }
+
+    if (frame.envelope.type == nixl::ucx::notif_wire_type_t::ACK) {
+        nixl::ucx::notif_route_key_t route;
+        const nixl::ucx::notif_state_status_t status =
+            engine->notifState_->acceptAcknowledgement(frame.envelope, route);
+        if (status != nixl::ucx::notif_state_status_t::SUCCESS) {
+            NIXL_DEBUG << "Rejected UCX notification ACK with state status "
+                       << static_cast<int>(status);
+        }
+        return UCS_OK;
+    }
+
+    const nixl::ucx::notif_data_resolution_t resolution =
+        engine->notifState_->resolveData(frame.envelope);
+    if (resolution.disposition ==
+        nixl::ucx::notif_data_disposition_t::POISON_GLOBAL) {
+        NIXL_ERROR << "Unknown UCX notification capability poisoned authenticated draining";
+        engine->poisonNotifs();
+        return UCS_OK;
+    }
+    if (resolution.disposition ==
+        nixl::ucx::notif_data_disposition_t::DROP_ROUTE) {
+        NIXL_ERROR << "Dropped invalid UCX notification for an exact route";
+        return UCS_OK;
+    }
+
+    const std::optional<exactRouteRecord> route = engine->getExactRoute(
+        resolution.authority.route.handleIdentity,
+        resolution.authority.route.handleGeneration);
+    if (!route.has_value() || route->route != resolution.authority.route) {
+        NIXL_ERROR << "Dropped UCX notification with missing exact route ownership";
+        return UCS_OK;
+    }
+
+    engine->appendNotif({
+        .remoteAgent = route->remoteAgent,
+        .payload = std::string(
+            reinterpret_cast<const char *>(frame.payload.data()),
+            frame.payload.size()),
+        .handleIdentity = resolution.authority.route.handleIdentity,
+        .generation = resolution.authority.route.handleGeneration,
+        .connectionIdentity = resolution.authority.connectionIdentity,
+        .endpointIdentity = resolution.authority.endpointIdentity,
+    });
     return UCS_OK;
 }
 
 nixl_status_t
 nixlUcxEngine::getNotifs(notif_list_t &notif_list) {
-    if (!notif_list.empty()) {
-        return NIXL_ERR_INVALID_PARAM;
-    }
-
     progressLoop();
 
     // In the "no progress thread" case the lock in nixlAgent is sufficient.
-    notifList_.swap(notif_list);
-    return NIXL_SUCCESS;
+    return notifQueue_.drainLegacy(notif_list);
+}
+
+nixl_status_t
+nixlUcxEngine::getAuthenticatedNotifs(authenticated_notif_list_t &notif_list) {
+    progressLoop();
+
+    // In the "no progress thread" case the lock in nixlAgent is sufficient.
+    return notifQueue_.drainAuthenticated(notif_list);
 }
 
 nixl_status_t
 nixlUcxEngine::genNotif(const std::string &remote_agent, const std::string &msg) const {
-    const auto conn = getConnection(remote_agent);
-    if (!conn) {
-        return NIXL_ERR_NOT_FOUND;
+    if (remote_agent != localAgent) {
+        return NIXL_ERR_INVALID_PARAM;
+    }
+    appendNotif({.remoteAgent = localAgent, .payload = msg});
+    return NIXL_SUCCESS;
+}
+
+nixl_status_t
+nixlUcxEngine::genNotif(const nixlRemoteAgentBinding &binding,
+                        const std::string &msg) const {
+    const size_t worker_id = getWorkerId();
+    std::vector<std::uint8_t> frame;
+    ucx_connection_ptr_t connection;
+    const nixl_status_t prepare_status = prepareDataFrame(
+        binding.authority, worker_id, msg, frame, connection);
+    if (prepare_status != NIXL_SUCCESS) {
+        return prepare_status;
     }
 
-    const nixl_status_t ret = notifSendPriv(remote_agent, msg, conn->getEp(getWorkerId()));
+    const nixl_status_t ret = notifSendPriv(
+        std::move(frame), connection->getEp(worker_id));
     if (ret == NIXL_IN_PROG) {
         return NIXL_SUCCESS;
     }

@@ -11,7 +11,13 @@ import pytest
 
 import nixl._bindings as bindings
 import nixl._utils as utils
-from nixl._api import nixl_agent, nixl_agent_config, nixl_xfer_handle
+from nixl import nixl_xfer_attestation_transport
+from nixl._api import (
+    nixl_agent,
+    nixl_agent_config,
+    nixl_remote_agent_handle,
+    nixl_xfer_handle,
+)
 
 
 def _make_agents(num_threads: int) -> tuple[nixl_agent, nixl_agent]:
@@ -63,9 +69,23 @@ def _assert_non_constructible_and_read_only(
     with pytest.raises(AttributeError):
         snapshot.generation = snapshot.generation + 1
     with pytest.raises(AttributeError):
+        snapshot.remoteAgentHandleIdentity = 0
+    with pytest.raises(AttributeError):
+        snapshot.remoteAgentGeneration = 0
+    with pytest.raises(AttributeError):
+        snapshot.remoteConnectionIdentity = 0
+    with pytest.raises(AttributeError):
+        snapshot.authorizedEndpointIdentities = ()
+    with pytest.raises(TypeError):
+        snapshot.authorizedEndpointIdentities[0] = 0
+    with pytest.raises(AttributeError):
         snapshot.segments[0].posted = False
     with pytest.raises(AttributeError):
+        snapshot.segments[0].selectedTransports = ()
+    with pytest.raises(AttributeError):
         snapshot.endpoints[0].remoteFlushed = False
+    with pytest.raises(AttributeError):
+        snapshot.segments[0].selectedTransports[0].device = "forged"
     with pytest.raises(AttributeError):
         snapshot.endpoints[0].transports[0].device = "forged"
     with pytest.raises(AttributeError):
@@ -122,8 +142,8 @@ def test_completion_receipt_waits_for_notification_terminal_status() -> None:
     handle: nixl_xfer_handle | None = None
     source_registration: bindings.nixlRegDList | None = None
     destination_registration: bindings.nixlRegDList | None = None
-    initiator_connected = False
-    target_connected = False
+    target_handle: nixl_remote_agent_handle | None = None
+    initiator_handle: nixl_remote_agent_handle | None = None
 
     try:
         utils.ba_buf(source, size)
@@ -134,10 +154,8 @@ def test_completion_receipt_waits_for_notification_terminal_status() -> None:
         destination_registration = target.register_memory(
             [(destination, size, 0, "destination")], mem_type="DRAM"
         )
-        initiator.add_remote_agent(target.get_agent_metadata())
-        initiator_connected = True
-        target.add_remote_agent(initiator.get_agent_metadata())
-        target_connected = True
+        target_handle = initiator.add_remote_agent(target.get_agent_metadata())
+        initiator_handle = target.add_remote_agent(initiator.get_agent_metadata())
 
         source_descriptors = initiator.get_xfer_descs(
             [(source, size, 0)], mem_type="DRAM"
@@ -150,7 +168,7 @@ def test_completion_receipt_waits_for_notification_terminal_status() -> None:
             "WRITE",
             source_descriptors,
             destination_descriptors,
-            target.name,
+            target_handle,
             notification,
         )
         assert initiator.transfer(handle) == "PROC"
@@ -178,6 +196,15 @@ def test_completion_receipt_waits_for_notification_terminal_status() -> None:
         assert pending_snapshot.submissionSealed
         assert pending_snapshot.status == bindings.NIXL_SUCCESS
         assert pending_snapshot.completionClaimed is False
+        assert pending_snapshot.remoteAgentHandleIdentity == target_handle.identity
+        assert pending_snapshot.remoteAgentGeneration == target_handle.generation
+        assert pending_snapshot.remoteConnectionIdentity > 0
+        authorized_endpoint_identities = pending_snapshot.authorizedEndpointIdentities
+        assert type(authorized_endpoint_identities) is tuple
+        assert len(authorized_endpoint_identities) > 0
+        assert authorized_endpoint_identities == tuple(
+            sorted(set(authorized_endpoint_identities))
+        )
         assert initiator.take_xfer_completion_receipt(handle) is None
         _assert_non_constructible_and_read_only(pending_snapshot)
 
@@ -189,6 +216,39 @@ def test_completion_receipt_waits_for_notification_terminal_status() -> None:
         assert receipt.generation == pending_snapshot.generation
         assert receipt.descriptorDigest == pending_snapshot.descriptorDigest
         assert receipt.evidenceDigest == pending_snapshot.evidenceDigest
+        assert (
+            receipt.remoteAgentHandleIdentity
+            == pending_snapshot.remoteAgentHandleIdentity
+        )
+        assert receipt.remoteAgentGeneration == pending_snapshot.remoteAgentGeneration
+        assert (
+            receipt.remoteConnectionIdentity
+            == pending_snapshot.remoteConnectionIdentity
+        )
+        assert receipt.authorizedEndpointIdentities == authorized_endpoint_identities
+        selected_transports = initiator.query_xfer_ucp_transports(handle)
+        assert nixl_xfer_attestation_transport is bindings.nixlXferAttestationTransport
+        selected_resources = tuple(
+            (transport.transport, transport.device) for transport in selected_transports
+        )
+        assert len(selected_resources) > 0
+        assert selected_resources == tuple(sorted(set(selected_resources)))
+        segment_resources = {
+            (transport.transport, transport.device)
+            for segment in receipt.segments
+            for transport in segment.selectedTransports
+        }
+        endpoint_resources = {
+            (transport.transport, transport.device)
+            for endpoint in receipt.endpoints
+            for transport in endpoint.transports
+        }
+        used_endpoint_identities = {
+            endpoint.endpointIdentity for endpoint in receipt.endpoints
+        }
+        assert used_endpoint_identities.issubset(set(authorized_endpoint_identities))
+        assert selected_resources == tuple(sorted(segment_resources))
+        assert segment_resources.issubset(endpoint_resources)
         expected_components = _expected_runtime_components(receipt)
         actual_components = [
             artifact.component for artifact in receipt.runtimeArtifacts
@@ -207,13 +267,13 @@ def test_completion_receipt_waits_for_notification_terminal_status() -> None:
         utils.verify_transfer(source, destination, size)
 
         notification_deadline = time.monotonic() + 30
-        notifications: dict[str, list[bytes]] = {}
-        while initiator.name not in notifications:
+        notifications: dict[nixl_remote_agent_handle, list[bytes]] = {}
+        while initiator_handle not in notifications:
             notifications = target.get_new_notifs()
             if time.monotonic() >= notification_deadline:
                 pytest.fail("completion notification did not arrive before the deadline")
             time.sleep(0.001)
-        assert notifications[initiator.name] == [notification]
+        assert notifications[initiator_handle] == [notification]
     finally:
         if handle is not None:
             handle.release()
@@ -221,10 +281,10 @@ def test_completion_receipt_waits_for_notification_terminal_status() -> None:
             initiator.deregister_memory(source_registration)
         if destination_registration is not None:
             target.deregister_memory(destination_registration)
-        if initiator_connected:
-            initiator.remove_remote_agent(target.name)
-        if target_connected:
-            target.remove_remote_agent(initiator.name)
+        if target_handle is not None:
+            initiator.remove_remote_agent(target_handle)
+        if initiator_handle is not None:
+            target.remove_remote_agent(initiator_handle)
         utils.free_passthru(source)
         utils.free_passthru(destination)
 
@@ -241,8 +301,8 @@ def test_thread_pool_completion_receipt_covers_every_chunk() -> None:
     handle: nixl_xfer_handle | None = None
     source_registration: bindings.nixlRegDList | None = None
     destination_registration: bindings.nixlRegDList | None = None
-    initiator_connected = False
-    target_connected = False
+    target_handle: nixl_remote_agent_handle | None = None
+    initiator_handle: nixl_remote_agent_handle | None = None
 
     try:
         utils.ba_buf(source, region_size)
@@ -253,10 +313,8 @@ def test_thread_pool_completion_receipt_covers_every_chunk() -> None:
         destination_registration = target.register_memory(
             [(destination, region_size, 0, "destination")], mem_type="DRAM"
         )
-        initiator.add_remote_agent(target.get_agent_metadata())
-        initiator_connected = True
-        target.add_remote_agent(initiator.get_agent_metadata())
-        target_connected = True
+        target_handle = initiator.add_remote_agent(target.get_agent_metadata())
+        initiator_handle = target.add_remote_agent(initiator.get_agent_metadata())
 
         source_descriptors = initiator.get_xfer_descs(
             [
@@ -276,7 +334,7 @@ def test_thread_pool_completion_receipt_covers_every_chunk() -> None:
             "WRITE",
             source_descriptors,
             destination_descriptors,
-            target.name,
+            target_handle,
         )
         assert initiator.transfer(handle) in {"DONE", "PROC"}
         _wait_for_done(initiator, handle)
@@ -285,6 +343,7 @@ def test_thread_pool_completion_receipt_covers_every_chunk() -> None:
         assert isinstance(receipt, bindings.nixlXferCompletionReceipt)
         assert len(receipt.segments) == segment_count
         assert all(segment.posted for segment in receipt.segments)
+        assert all(len(segment.selectedTransports) > 0 for segment in receipt.segments)
         assert len(receipt.endpoints) == 2
         assert len({endpoint.workerId for endpoint in receipt.endpoints}) == 2
         assert all(endpoint.flushPosted for endpoint in receipt.endpoints)
@@ -294,6 +353,20 @@ def test_thread_pool_completion_receipt_covers_every_chunk() -> None:
             for endpoint in receipt.endpoints
             for index in endpoint.segmentIndices
         ) == list(range(segment_count))
+        selected_resources = tuple(
+            (transport.transport, transport.device)
+            for transport in initiator.query_xfer_ucp_transports(handle)
+        )
+        expected_selected_resources = tuple(
+            sorted(
+                {
+                    (transport.transport, transport.device)
+                    for segment in receipt.segments
+                    for transport in segment.selectedTransports
+                }
+            )
+        )
+        assert selected_resources == expected_selected_resources
 
         source_bytes = b"".join(
             ctypes.string_at(source + index * segment_stride, segment_length)
@@ -311,10 +384,10 @@ def test_thread_pool_completion_receipt_covers_every_chunk() -> None:
             initiator.deregister_memory(source_registration)
         if destination_registration is not None:
             target.deregister_memory(destination_registration)
-        if initiator_connected:
-            initiator.remove_remote_agent(target.name)
-        if target_connected:
-            target.remove_remote_agent(initiator.name)
+        if target_handle is not None:
+            initiator.remove_remote_agent(target_handle)
+        if initiator_handle is not None:
+            target.remove_remote_agent(initiator_handle)
         utils.free_passthru(source)
         utils.free_passthru(destination)
 
@@ -328,8 +401,8 @@ def test_completion_receipt_drives_native_progress() -> None:
     handle: nixl_xfer_handle | None = None
     source_registration: bindings.nixlRegDList | None = None
     destination_registration: bindings.nixlRegDList | None = None
-    initiator_connected = False
-    target_connected = False
+    target_handle: nixl_remote_agent_handle | None = None
+    initiator_handle: nixl_remote_agent_handle | None = None
 
     try:
         utils.ba_buf(source, size)
@@ -340,10 +413,8 @@ def test_completion_receipt_drives_native_progress() -> None:
         destination_registration = target.register_memory(
             [(destination, size, 0, "destination")], mem_type="DRAM"
         )
-        initiator.add_remote_agent(target.get_agent_metadata())
-        initiator_connected = True
-        target.add_remote_agent(initiator.get_agent_metadata())
-        target_connected = True
+        target_handle = initiator.add_remote_agent(target.get_agent_metadata())
+        initiator_handle = target.add_remote_agent(initiator.get_agent_metadata())
 
         source_descriptors = initiator.get_xfer_descs(
             [(source, size, 0)], mem_type="DRAM"
@@ -356,7 +427,7 @@ def test_completion_receipt_drives_native_progress() -> None:
             "WRITE",
             source_descriptors,
             destination_descriptors,
-            target.name,
+            target_handle,
             notification,
         )
         assert initiator.transfer(handle) == "PROC"
@@ -380,9 +451,9 @@ def test_completion_receipt_drives_native_progress() -> None:
             initiator.deregister_memory(source_registration)
         if destination_registration is not None:
             target.deregister_memory(destination_registration)
-        if initiator_connected:
-            initiator.remove_remote_agent(target.name)
-        if target_connected:
-            target.remove_remote_agent(initiator.name)
+        if target_handle is not None:
+            initiator.remove_remote_agent(target_handle)
+        if initiator_handle is not None:
+            target.remove_remote_agent(initiator_handle)
         utils.free_passthru(source)
         utils.free_passthru(destination)

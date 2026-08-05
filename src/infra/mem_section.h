@@ -185,19 +185,40 @@ class nixlLocalSection : public nixlMemSection {
         ~nixlLocalSection();
 };
 
+class nixlRemoteSectionUpdate {
+private:
+    std::map<section_key_t, std::vector<nixlBlobDesc>> additions_;
+    backend_set_t backends_;
+
+    friend class nixlRemoteSection;
+
+public:
+    [[nodiscard]] const backend_set_t &
+    getBackends() const noexcept {
+        return backends_;
+    }
+};
+
 
 class nixlRemoteSection : public nixlMemSection {
     private:
         std::string agentName;
-
-        nixl_status_t addDescList (
-                           const nixl_reg_dlist_t &mem_elms,
-                           nixlBackendEngine *backend);
     public:
         explicit nixlRemoteSection(std::string agent_name) noexcept;
+        nixlRemoteSection(const nixlRemoteSection &) = delete;
+        nixlRemoteSection &
+        operator=(const nixlRemoteSection &) = delete;
+        nixlRemoteSection(nixlRemoteSection &&other) noexcept;
+        nixlRemoteSection &
+        operator=(nixlRemoteSection &&) = delete;
 
-        nixl_status_t loadRemoteData (nixlSerDes* deserializer,
-                                      backend_map_t &backendToEngineMap);
+        [[nodiscard]] nixl_status_t
+        prepareRemoteData(nixlSerDes *deserializer,
+                          const backend_map_t &backendToEngineMap,
+                          nixlRemoteSectionUpdate &update) const;
+
+        nixl_status_t
+        applyRemoteData(nixlRemoteSectionUpdate &&update, bool &rollback_ambiguous);
 
         // When adding self as a remote agent for local operations
         nixl_status_t

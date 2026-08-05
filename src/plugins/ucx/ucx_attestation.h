@@ -50,7 +50,8 @@ public:
             const nixl_meta_dlist_t &local,
             const nixl_meta_dlist_t &remote,
             const std::string &local_agent,
-            const std::string &remote_agent);
+            const std::string &remote_agent,
+            const nixl_remote_agent_authority_t *remote_agent_authority);
 
     [[nodiscard]] nixl_status_t
     beginSubmission();
@@ -60,7 +61,8 @@ public:
                   size_t worker_id,
                   uint64_t worker_identity,
                   uint64_t endpoint_identity,
-                  const std::vector<nixl_xfer_attestation_transport_t> &transports,
+                  const std::vector<nixl_xfer_attestation_transport_t> &endpoint_transports,
+                  const std::vector<nixl_xfer_attestation_transport_t> &selected_transports,
                   const std::string &request_info);
 
     [[nodiscard]] nixl_status_t

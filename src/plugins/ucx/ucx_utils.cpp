@@ -37,6 +37,7 @@ namespace {
 
 std::atomic<uint64_t> next_worker_identity{1};
 std::atomic<uint64_t> next_endpoint_identity{1};
+constexpr size_t max_ucx_lanes = 64;
 
 [[nodiscard]] uint64_t
 allocateIdentity(std::atomic<uint64_t> &next_identity) {
@@ -51,22 +52,55 @@ allocateIdentity(std::atomic<uint64_t> &next_identity) {
 }
 
 [[nodiscard]] nixl_status_t
-queryRequestInfo(nixlUcxReq request, size_t buffer_size, std::string &request_info) {
+copyTransportEntries(const std::vector<ucp_transport_entry_t> &entries,
+                     unsigned count,
+                     std::vector<nixl_xfer_attestation_transport_t> &transports) {
+    transports.clear();
+    if (count == 0 || count > max_ucx_lanes) {
+        return NIXL_ERR_BACKEND;
+    }
+
+    transports.reserve(count);
+    for (unsigned i = 0; i < count; ++i) {
+        if (entries[i].transport_name == nullptr || entries[i].device_name == nullptr) {
+            transports.clear();
+            return NIXL_ERR_BACKEND;
+        }
+        transports.push_back({entries[i].transport_name, entries[i].device_name});
+    }
+    return NIXL_SUCCESS;
+}
+
+[[nodiscard]] nixl_status_t
+queryRequestEvidence(
+    nixlUcxReq request,
+    size_t buffer_size,
+    std::string &request_info,
+    std::vector<nixl_xfer_attestation_transport_t> &selected_transports) {
     std::vector<char> buffer(buffer_size, '\0');
+    std::vector<ucp_transport_entry_t> entries(max_ucx_lanes + 1);
     ucp_request_attr_t attr = {
-        .field_mask =
-            UCP_REQUEST_ATTR_FIELD_INFO_STRING | UCP_REQUEST_ATTR_FIELD_INFO_STRING_SIZE,
+        .field_mask = UCP_REQUEST_ATTR_FIELD_INFO_STRING |
+            UCP_REQUEST_ATTR_FIELD_INFO_STRING_SIZE | UCP_REQUEST_ATTR_FIELD_TRANSPORTS,
         .debug_string = buffer.data(),
         .debug_string_size = buffer.size(),
+        .transports =
+            {
+                .entries = entries.data(),
+                .num_entries = static_cast<unsigned>(entries.size()),
+                .entry_size = sizeof(ucp_transport_entry_t),
+            },
     };
 
     const ucs_status_t status = ucp_request_query(request, &attr);
-    if (status != UCS_OK || buffer[0] == '\0') {
+    if (status != UCS_OK) {
+        selected_transports.clear();
         return NIXL_ERR_BACKEND;
     }
 
     request_info.assign(buffer.data());
-    return NIXL_SUCCESS;
+    return copyTransportEntries(
+        entries, attr.transports.num_entries, selected_transports);
 }
 
 } // namespace
@@ -198,7 +232,7 @@ nixlUcxEp::closeImpl(ucp_ep_close_flags_t flags) {
 
 nixlUcxEp::nixlUcxEp(ucp_worker_h worker,
                      uint64_t worker_identity,
-                     void *addr,
+                     const void *addr,
                      ucp_err_handling_mode_t err_handling_mode)
     : workerIdentity_(worker_identity),
       identity_(allocateIdentity(next_endpoint_identity)) {
@@ -219,7 +253,7 @@ nixlUcxEp::nixlUcxEp(ucp_worker_h worker,
     ep_params.err_mode = err_handling_mode;
     ep_params.err_handler.cb = err_cb_wrapper;
     ep_params.err_handler.arg = static_cast<void *>(this);
-    ep_params.address = reinterpret_cast<ucp_address_t *>(addr);
+    ep_params.address = reinterpret_cast<const ucp_address_t *>(addr);
 
     status = nixl::ucx::ucsToNixlStatus(ucp_ep_create(worker, &ep_params, &eph));
     if (status == NIXL_SUCCESS)
@@ -316,7 +350,8 @@ nixlUcxEp::read(uint64_t raddr,
                 nixlUcxMem &mem,
                 size_t size,
                 nixlUcxReq &req,
-                std::string &request_info) {
+                std::string &request_info,
+                std::vector<nixl_xfer_attestation_transport_t> &selected_transports) {
     nixl_status_t status = checkTxState();
     if (status != NIXL_SUCCESS) {
         return status;
@@ -331,7 +366,8 @@ nixlUcxEp::read(uint64_t raddr,
     const ucs_status_ptr_t request = ucp_get_nbx(eph, laddr, size, raddr, rkey.get(), &param);
     if (UCS_PTR_IS_PTR(request)) {
         req = static_cast<nixlUcxReq>(request);
-        if (queryRequestInfo(req, requestInfoSize_, request_info) != NIXL_SUCCESS) {
+        if (queryRequestEvidence(
+                req, requestInfoSize_, request_info, selected_transports) != NIXL_SUCCESS) {
             ucp_request_free(request);
             req = nullptr;
             return NIXL_ERR_BACKEND;
@@ -349,7 +385,8 @@ nixlUcxEp::write(void *laddr,
                  const nixl::ucx::rkey &rkey,
                  size_t size,
                  nixlUcxReq &req,
-                 std::string &request_info) {
+                 std::string &request_info,
+                 std::vector<nixl_xfer_attestation_transport_t> &selected_transports) {
     nixl_status_t status = checkTxState();
     if (status != NIXL_SUCCESS) {
         return status;
@@ -364,7 +401,8 @@ nixlUcxEp::write(void *laddr,
     const ucs_status_ptr_t request = ucp_put_nbx(eph, laddr, size, raddr, rkey.get(), &param);
     if (UCS_PTR_IS_PTR(request)) {
         req = static_cast<nixlUcxReq>(request);
-        if (queryRequestInfo(req, requestInfoSize_, request_info) != NIXL_SUCCESS) {
+        if (queryRequestEvidence(
+                req, requestInfoSize_, request_info, selected_transports) != NIXL_SUCCESS) {
             ucp_request_free(request);
             req = nullptr;
             return NIXL_ERR_BACKEND;
@@ -378,7 +416,6 @@ nixlUcxEp::write(void *laddr,
 nixl_status_t
 nixlUcxEp::queryTransports(
     std::vector<nixl_xfer_attestation_transport_t> &transports) const {
-    constexpr size_t max_ucx_lanes = 64;
     std::vector<ucp_transport_entry_t> entries(max_ucx_lanes + 1);
     ucp_ep_attr_t attr = {
         .field_mask = UCP_EP_ATTR_FIELD_TRANSPORTS,
@@ -391,17 +428,12 @@ nixlUcxEp::queryTransports(
     };
 
     const ucs_status_t status = ucp_ep_query(eph, &attr);
-    if (status != UCS_OK || attr.transports.num_entries > max_ucx_lanes) {
+    if (status != UCS_OK) {
+        transports.clear();
         return NIXL_ERR_BACKEND;
     }
 
-    transports.clear();
-    transports.reserve(attr.transports.num_entries);
-    for (unsigned i = 0; i < attr.transports.num_entries; ++i) {
-        transports.push_back(
-            {entries[i].transport_name, entries[i].device_name});
-    }
-    return NIXL_SUCCESS;
+    return copyTransportEntries(entries, attr.transports.num_entries, transports);
 }
 
 nixl_status_t
@@ -627,7 +659,7 @@ nixlUcxWorker::epAddr() {
 }
 
 std::unique_ptr<nixlUcxEp>
-nixlUcxWorker::connect(void *addr, std::size_t size) {
+nixlUcxWorker::connect(const void *addr, std::size_t size) {
     try {
         return std::make_unique<nixlUcxEp>(
             worker.get(), identity_, addr, err_handling_mode_);

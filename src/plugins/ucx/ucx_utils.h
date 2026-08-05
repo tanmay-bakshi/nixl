@@ -92,7 +92,7 @@ public:
 
     nixlUcxEp(ucp_worker_h worker,
               uint64_t worker_identity,
-              void *addr,
+              const void *addr,
               ucp_err_handling_mode_t err_handling_mode);
     ~nixlUcxEp();
     nixlUcxEp(const nixlUcxEp &) = delete;
@@ -120,7 +120,8 @@ public:
          nixlUcxMem &mem,
          size_t size,
          nixlUcxReq &req,
-         std::string &request_info);
+         std::string &request_info,
+         std::vector<nixl_xfer_attestation_transport_t> &selected_transports);
     [[nodiscard]] nixl_status_t
     write(void *laddr,
           nixlUcxMem &mem,
@@ -128,7 +129,8 @@ public:
           const nixl::ucx::rkey &rkey,
           size_t size,
           nixlUcxReq &req,
-          std::string &request_info);
+          std::string &request_info,
+          std::vector<nixl_xfer_attestation_transport_t> &selected_transports);
     [[nodiscard]] nixl_status_t
     queryTransports(std::vector<nixl_xfer_attestation_transport_t> &transports) const;
     nixl_status_t
@@ -240,7 +242,7 @@ public:
     [[nodiscard]] std::string
     epAddr();
     [[nodiscard]] std::unique_ptr<nixlUcxEp>
-    connect(void *addr, size_t size);
+    connect(const void *addr, size_t size);
 
     /* Active message handling */
     int

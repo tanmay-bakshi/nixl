@@ -20,10 +20,12 @@
 #include <pybind11/numpy.h>
 #include <pybind11/chrono.h>
 
+#include <functional>
 #include <tuple>
 #include <iostream>
 
 #include "nixl.h"
+#include "agent_data.h"
 #include "serdes/serdes.h"
 
 namespace py = pybind11;
@@ -90,6 +92,11 @@ public:
     nixlNoTelemetryError(const char *what) : runtime_error(what) {}
 };
 
+class nixlNotReadyError : public std::runtime_error {
+public:
+    nixlNotReadyError(const char *what) : runtime_error(what) {}
+};
+
 class nixlXferAttestationSnapshot {
 public:
     explicit nixlXferAttestationSnapshot(nixl_xfer_attestation_t attestation)
@@ -152,6 +159,20 @@ bindAttestationView(py::class_<T> &binding) {
             "remoteAgent", [](const T &value) { return value.get().remoteAgent; })
         .def_property_readonly(
             "operation", [](const T &value) { return value.get().operation; })
+        .def_property_readonly(
+            "remoteAgentHandleIdentity",
+            [](const T &value) { return value.get().remoteAgentHandleIdentity; })
+        .def_property_readonly(
+            "remoteAgentGeneration",
+            [](const T &value) { return value.get().remoteAgentGeneration; })
+        .def_property_readonly(
+            "remoteConnectionIdentity",
+            [](const T &value) { return value.get().remoteConnectionIdentity; })
+        .def_property_readonly(
+            "authorizedEndpointIdentities",
+            [](const T &value) {
+                return immutableTuple(value.get().authorizedEndpointIdentities);
+            })
         .def_property_readonly(
             "localMemoryType", [](const T &value) { return value.get().localMemoryType; })
         .def_property_readonly(
@@ -216,6 +237,9 @@ throw_nixl_exception(const nixl_status_t &status) {
     case NIXL_ERR_NO_TELEMETRY:
         throw nixlNoTelemetryError(nixlEnumStrings::statusStr(status).c_str());
         break;
+    case NIXL_ERR_NOT_READY:
+        throw nixlNotReadyError(nixlEnumStrings::statusStr(status).c_str());
+        break;
     default:
         throw std::runtime_error("BAD_STATUS");
     }
@@ -271,6 +295,7 @@ PYBIND11_MODULE(_bindings, m) {
         .value("NIXL_ERR_REMOTE_DISCONNECT", NIXL_ERR_REMOTE_DISCONNECT)
         .value("NIXL_ERR_CANCELED", NIXL_ERR_CANCELED)
         .value("NIXL_ERR_NO_TELEMETRY", NIXL_ERR_NO_TELEMETRY)
+        .value("NIXL_ERR_NOT_READY", NIXL_ERR_NOT_READY)
         .export_values();
 
     py::enum_<nixl_xfer_attestation_state_t>(m, "nixl_xfer_attestation_state_t")
@@ -316,22 +341,24 @@ PYBIND11_MODULE(_bindings, m) {
         .def_readonly("workerIdentity", &nixl_xfer_attestation_segment_t::workerIdentity)
         .def_readonly("endpointIdentity", &nixl_xfer_attestation_segment_t::endpointIdentity)
         .def_readonly("requestInfo", &nixl_xfer_attestation_segment_t::requestInfo)
+        .def_property_readonly("selectedTransports",
+                               [](const nixl_xfer_attestation_segment_t &value) {
+                                   return immutableTuple(value.selectedTransports);
+                               })
         .def_readonly("posted", &nixl_xfer_attestation_segment_t::posted);
 
     py::class_<nixl_xfer_attestation_endpoint_t>(m, "nixlXferAttestationEndpoint")
         .def_readonly("workerId", &nixl_xfer_attestation_endpoint_t::workerId)
         .def_readonly("workerIdentity", &nixl_xfer_attestation_endpoint_t::workerIdentity)
         .def_readonly("endpointIdentity", &nixl_xfer_attestation_endpoint_t::endpointIdentity)
-        .def_property_readonly(
-            "segmentIndices",
-            [](const nixl_xfer_attestation_endpoint_t &value) {
-                return immutableTuple(value.segmentIndices);
-            })
-        .def_property_readonly(
-            "transports",
-            [](const nixl_xfer_attestation_endpoint_t &value) {
-                return immutableTuple(value.transports);
-            })
+        .def_property_readonly("segmentIndices",
+                               [](const nixl_xfer_attestation_endpoint_t &value) {
+                                   return immutableTuple(value.segmentIndices);
+                               })
+        .def_property_readonly("transports",
+                               [](const nixl_xfer_attestation_endpoint_t &value) {
+                                   return immutableTuple(value.transports);
+                               })
         .def_readonly("flushPosted", &nixl_xfer_attestation_endpoint_t::flushPosted)
         .def_readonly("remoteFlushed", &nixl_xfer_attestation_endpoint_t::remoteFlushed);
 
@@ -362,6 +389,7 @@ PYBIND11_MODULE(_bindings, m) {
     py::register_exception<nixlRemoteDisconnectError>(m, "nixlRemoteDisconnectError");
     py::register_exception<nixlCancelledError>(m, "nixlCancelledError");
     py::register_exception<nixlNoTelemetryError>(m, "nixlNoTelemetryError");
+    py::register_exception<nixlNotReadyError>(m, "nixlNotReadyError");
 
     py::class_<nixl_xfer_dlist_t>(m, "nixlXferDList")
         .def(py::init<nixl_mem_t, int>(), py::arg("type"), py::arg("init_size") = 0)
@@ -581,6 +609,21 @@ PYBIND11_MODULE(_bindings, m) {
         .def_readwrite("lthrDelay", &nixlAgentConfig::lthrDelay)
         .def_readwrite("etcdWatchTimeout", &nixlAgentConfig::etcdWatchTimeout);
 
+    py::class_<nixlRemoteAgentH,
+               std::unique_ptr<nixlRemoteAgentH, py::nodelete>>(m, "nixlRemoteAgentH")
+        .def_property_readonly("name", &nixlRemoteAgentH::getName)
+        .def_property_readonly("identity", &nixlRemoteAgentH::getIdentity)
+        .def_property_readonly("generation", &nixlRemoteAgentH::getGeneration)
+        .def("__hash__",
+             [](const nixlRemoteAgentH &handle) {
+                 return std::hash<uint64_t>{}(handle.getIdentity());
+             })
+        .def("__eq__",
+             [](const nixlRemoteAgentH &left, const nixlRemoteAgentH &right) {
+                 return &left == &right;
+             },
+             py::is_operator());
+
     // note: pybind will automatically convert notif_map to python types:
     // so, a Dictionary of string: List<string>
 
@@ -679,7 +722,22 @@ PYBIND11_MODULE(_bindings, m) {
         .def(
             "makeConnection",
             [](nixlAgent &agent,
-               const std::string &remote_agent,
+               const std::string &local_agent,
+               const std::vector<uintptr_t> &backends) {
+                nixl_opt_args_t extra_params;
+
+                for (uintptr_t backend : backends)
+                    extra_params.backends.push_back((nixlBackendH *)backend);
+
+                nixl_status_t ret = agent.makeConnection(local_agent, &extra_params);
+                throw_nixl_exception(ret);
+                return ret;
+            },
+            py::call_guard<py::gil_scoped_release>())
+        .def(
+            "makeConnection",
+            [](nixlAgent &agent,
+               const nixlRemoteAgentH *remote_agent,
                const std::vector<uintptr_t> &backends) {
                 nixl_opt_args_t extra_params;
 
@@ -694,7 +752,7 @@ PYBIND11_MODULE(_bindings, m) {
         .def(
             "prepXferDlist",
             [](nixlAgent &agent,
-               std::string &agent_name,
+               const std::string &local_agent,
                const nixl_xfer_dlist_t &descs,
                const std::vector<uintptr_t> &backends) -> uintptr_t {
                 nixlDlistH *handle = nullptr;
@@ -703,11 +761,32 @@ PYBIND11_MODULE(_bindings, m) {
                 for (uintptr_t backend : backends)
                     extra_params.backends.push_back((nixlBackendH *)backend);
 
-                throw_nixl_exception(agent.prepXferDlist(agent_name, descs, handle, &extra_params));
+                throw_nixl_exception(
+                    agent.prepXferDlist(local_agent, descs, handle, &extra_params));
+                return (uintptr_t)handle;
+            },
+            py::arg("local_agent"),
+            py::arg("descs"),
+            py::arg("backend") = std::vector<uintptr_t>({}),
+            py::call_guard<py::gil_scoped_release>())
+        .def(
+            "prepXferDlist",
+            [](nixlAgent &agent,
+               const nixlRemoteAgentH *remote_agent,
+               const nixl_xfer_dlist_t &descs,
+               const std::vector<uintptr_t> &backends) -> uintptr_t {
+                nixlDlistH *handle = nullptr;
+                nixl_opt_args_t extra_params;
+
+                for (uintptr_t backend : backends)
+                    extra_params.backends.push_back((nixlBackendH *)backend);
+
+                throw_nixl_exception(
+                    agent.prepXferDlist(remote_agent, descs, handle, &extra_params));
 
                 return (uintptr_t)handle;
             },
-            py::arg("agent_name"),
+            py::arg("remote_agent"),
             py::arg("descs"),
             py::arg("backend") = std::vector<uintptr_t>({}),
             py::call_guard<py::gil_scoped_release>())
@@ -806,7 +885,38 @@ PYBIND11_MODULE(_bindings, m) {
                const nixl_xfer_op_t &operation,
                const nixl_xfer_dlist_t &local_descs,
                const nixl_xfer_dlist_t &remote_descs,
-               const std::string &remote_agent,
+               const std::string &local_agent,
+               const std::string &notif_msg,
+               const std::vector<uintptr_t> &backends) -> uintptr_t {
+                nixlXferReqH *handle = nullptr;
+                nixl_opt_args_t extra_params;
+
+                for (uintptr_t backend : backends)
+                    extra_params.backends.push_back((nixlBackendH *)backend);
+
+                if (notif_msg.size() > 0) {
+                    extra_params.notif = notif_msg;
+                }
+                nixl_status_t ret = agent.createXferReq(
+                    operation, local_descs, remote_descs, local_agent, handle, &extra_params);
+
+                throw_nixl_exception(ret);
+                return (uintptr_t)handle;
+            },
+            py::arg("operation"),
+            py::arg("local_descs"),
+            py::arg("remote_descs"),
+            py::arg("local_agent"),
+            py::arg("notif_msg") = std::string(""),
+            py::arg("backend") = std::vector<uintptr_t>({}),
+            py::call_guard<py::gil_scoped_release>())
+        .def(
+            "createXferReq",
+            [](nixlAgent &agent,
+               const nixl_xfer_op_t &operation,
+               const nixl_xfer_dlist_t &local_descs,
+               const nixl_xfer_dlist_t &remote_descs,
+               const nixlRemoteAgentH *remote_agent,
                const std::string &notif_msg,
                const std::vector<uintptr_t> &backends) -> uintptr_t {
                 nixlXferReqH *handle = nullptr;
@@ -949,9 +1059,60 @@ PYBIND11_MODULE(_bindings, m) {
             py::arg("notif_map"),
             py::arg("backends") = std::vector<uintptr_t>({}))
         .def(
+            "getRemoteNotifs",
+            [](nixlAgent &agent,
+               const std::vector<uintptr_t> &backends) -> py::dict {
+                nixl_remote_notifs_t notifications;
+                nixl_opt_args_t extra_params;
+                {
+                    py::gil_scoped_release release;
+                    for (uintptr_t backend : backends) {
+                        extra_params.backends.push_back(
+                            reinterpret_cast<nixlBackendH *>(backend));
+                    }
+                    throw_nixl_exception(
+                        agent.getRemoteNotifs(notifications, &extra_params));
+                }
+
+                py::dict result;
+                py::object owner = py::cast(&agent, py::return_value_policy::reference);
+                for (const auto &[remote_agent, messages] : notifications) {
+                    py::object key = py::cast(
+                        remote_agent,
+                        py::return_value_policy::reference_internal,
+                        owner);
+                    py::list values;
+                    for (const auto &message : messages) {
+                        values.append(py::bytes(message));
+                    }
+                    result[key] = std::move(values);
+                }
+                return result;
+            },
+            py::arg("backends") = std::vector<uintptr_t>({}))
+        .def(
             "genNotif",
             [](nixlAgent &agent,
-               const std::string &remote_agent,
+               const std::string &local_agent,
+               const std::string &msg,
+               const std::vector<uintptr_t> &backends) {
+                nixl_opt_args_t extra_params;
+
+                for (uintptr_t backend : backends)
+                    extra_params.backends.push_back((nixlBackendH *)backend);
+
+                nixl_status_t ret = agent.genNotif(local_agent, msg, &extra_params);
+                throw_nixl_exception(ret);
+                return ret;
+            },
+            py::arg("local_agent"),
+            py::arg("msg"),
+            py::arg("backends") = std::vector<uintptr_t>({}),
+            py::call_guard<py::gil_scoped_release>())
+        .def(
+            "genNotif",
+            [](nixlAgent &agent,
+               const nixlRemoteAgentH *remote_agent,
                const std::string &msg,
                const std::vector<uintptr_t> &backends) {
                 nixl_opt_args_t extra_params;
@@ -998,16 +1159,22 @@ PYBIND11_MODULE(_bindings, m) {
             py::arg("inc_conn_info") = false,
             py::arg("backends") = std::vector<uintptr_t>({}))
         .def("loadRemoteMD",
-             [](nixlAgent &agent, const std::string &remote_metadata) -> py::bytes {
-                 // python can only interpret text strings
-                 std::string remote_name("");
+             [](nixlAgent &agent,
+                const std::string &remote_metadata) -> nixlRemoteAgentH * {
+                 nixlRemoteAgentH *remote_agent = nullptr;
                  {
                      py::gil_scoped_release release;
-                     throw_nixl_exception(agent.loadRemoteMD(remote_metadata, remote_name));
+                     throw_nixl_exception(
+                         agent.loadRemoteMD(remote_metadata, remote_agent));
                  }
-                 return py::bytes(remote_name);
-             })
-        .def("invalidateRemoteMD", &nixlAgent::invalidateRemoteMD)
+                 return remote_agent;
+             },
+             py::return_value_policy::reference_internal)
+        .def("invalidateRemoteMD",
+             [](nixlAgent &agent, const nixlRemoteAgentH *remote_agent) {
+                 throw_nixl_exception(agent.invalidateRemoteMD(remote_agent));
+             },
+             py::call_guard<py::gil_scoped_release>())
         .def(
             "sendLocalMD",
             [](nixlAgent &agent, std::string ip_addr, int port) {

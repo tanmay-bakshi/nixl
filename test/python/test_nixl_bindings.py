@@ -28,6 +28,20 @@ logger = get_logger(__name__)
 # These should automatically be run by pytest because of function names
 
 
+def test_not_ready_status_binding() -> None:
+    """Expose retryable protocol readiness without conflating error classes."""
+    status = nixl.NIXL_ERR_NOT_READY
+
+    assert status == nixl.nixl_status_t(-13)
+    assert status.name == "NIXL_ERR_NOT_READY"
+    assert "NIXL_ERR_NOT_READY" in str(status)
+    assert (
+        nixl.nixlNotReadyError.__mro__[1:] == nixl.nixlNotAllowedError.__mro__[1:]
+    )
+    assert nixl.nixlNotReadyError is not nixl.nixlNotAllowedError
+    assert str(nixl.nixlNotReadyError(status.name)) == "NIXL_ERR_NOT_READY"
+
+
 def test_list():
     descs = [(1000, 105, 0), (2000, 30, 0), (1010, 20, 0)]
     test_list = nixl.nixlXferDList(nixl.DRAM_SEG, descs)
@@ -96,10 +110,13 @@ def test_agent():
     meta1 = agent1.getLocalMD()
     meta2 = agent2.getLocalMD()
 
-    ret_name = agent1.loadRemoteMD(meta2)
-    assert ret_name.decode(encoding="UTF-8") == name2
-    ret_name = agent2.loadRemoteMD(meta1)
-    assert ret_name.decode(encoding="UTF-8") == name1
+    remote2 = agent1.loadRemoteMD(meta2)
+    assert remote2.name == name2
+    duplicate_remote2 = agent1.loadRemoteMD(meta2)
+    assert duplicate_remote2 == remote2
+    assert hash(duplicate_remote2) == hash(remote2)
+    remote1 = agent2.loadRemoteMD(meta1)
+    assert remote1.name == name1
 
     offset = 8
     req_size = 8
@@ -118,7 +135,9 @@ def test_agent():
     logger.info("Source list: %s", src_list)
     logger.info("Destination list: %s", dst_list)
 
-    handle = agent1.createXferReq(nixl.NIXL_WRITE, src_list, dst_list, name2, noti_str)
+    handle = agent1.createXferReq(
+        nixl.NIXL_WRITE, src_list, dst_list, remote2, noti_str
+    )
     assert handle != 0
 
     logger.info("Transfer handle: %s", handle)
@@ -135,14 +154,17 @@ def test_agent():
             status = agent1.getXferStatus(handle)
 
         if len(notifMap) == 0:
-            notifMap = agent2.getNotifs(notifMap)
+            notifMap = agent2.getRemoteNotifs()
 
         assert status == nixl.NIXL_SUCCESS or status == nixl.NIXL_IN_PROG
 
     nixl_utils.verify_transfer(addr1 + offset, addr2 + offset, req_size)
-    assert len(notifMap[name1]) == 1
-    logger.info("Received notification: %s", notifMap[name1][0])
-    assert notifMap[name1][0] == noti_str.encode()
+    notification_remote1 = next(iter(notifMap))
+    assert notification_remote1 == remote1
+    assert hash(notification_remote1) == hash(remote1)
+    assert len(notifMap[remote1]) == 1
+    logger.info("Received notification: %s", notifMap[remote1][0])
+    assert notifMap[remote1][0] == noti_str.encode()
 
     logger.info("Transfer verified")
 
@@ -164,8 +186,8 @@ def test_agent():
     assert ret == nixl.NIXL_SUCCESS
 
     # Only initiator should call invalidate
-    agent1.invalidateRemoteMD(name2)
-    # agent2.invalidateRemoteMD(name1)
+    agent1.invalidateRemoteMD(remote2)
+    # agent2.invalidateRemoteMD(remote1)
 
     nixl_utils.free_passthru(addr1)
     nixl_utils.free_passthru(addr2)

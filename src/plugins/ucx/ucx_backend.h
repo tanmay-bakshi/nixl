@@ -21,6 +21,7 @@
 #include <cstring>
 #include <iostream>
 #include <thread>
+#include <unordered_map>
 #include <mutex>
 #include <memory>
 #include <condition_variable>
@@ -37,16 +38,62 @@
 #include "mem_list.h"
 #include "rkey.h"
 #include "ucx_attestation.h"
+#include "ucx_connection_metadata.h"
 #include "ucx_enums.h"
+#include "ucx_notif_state.h"
+#include "ucx_notif_wire.h"
 #include "ucx_utils.h"
+
+class nixlUcxNotificationQueue {
+public:
+    static constexpr size_t maxPendingNotifications = 65536;
+    static constexpr size_t maxPendingBytes = 64 * 1024 * 1024;
+    static constexpr size_t maxWireBytes = nixl::ucx::notif_wire_max_frame_size;
+
+    explicit nixlUcxNotificationQueue(
+        size_t max_notifications = maxPendingNotifications,
+        size_t max_bytes = maxPendingBytes)
+        : maxNotifications_(max_notifications), maxBytes_(max_bytes) {}
+
+    [[nodiscard]] nixl_status_t
+    push(nixlAuthenticatedNotification &&notification);
+    [[nodiscard]] nixl_status_t
+    drainLegacy(notif_list_t &notifications);
+    [[nodiscard]] nixl_status_t
+    drainAuthenticated(authenticated_notif_list_t &notifications);
+    void
+    poison();
+
+private:
+    const size_t maxNotifications_;
+    const size_t maxBytes_;
+    authenticated_notif_list_t notifications_;
+    size_t queuedBytes_ = 0;
+    bool failed_ = false;
+};
 
 class nixlUcxConnection : public nixlBackendConnMD {
     private:
+        const uint64_t identity_;
+        const nixl::ucx::connection_metadata_t metadata_;
         std::vector<std::unique_ptr<nixlUcxEp>> eps;
 
     public:
+        nixlUcxConnection(uint64_t identity, nixl::ucx::connection_metadata_t metadata)
+            : identity_(identity), metadata_(std::move(metadata)) {}
+
         [[nodiscard]] const std::unique_ptr<nixlUcxEp>& getEp(size_t ep_id) const noexcept {
             return eps[ep_id];
+        }
+
+        [[nodiscard]] uint64_t
+        getIdentity() const noexcept {
+            return identity_;
+        }
+
+        [[nodiscard]] const nixl::ucx::connection_metadata_t &
+        getMetadata() const noexcept {
+            return metadata_;
         }
 
     friend class nixlUcxEngine;
@@ -115,6 +162,11 @@ public:
         return true;
     }
 
+    bool
+    supportsAuthenticatedNotif() const override {
+        return true;
+    }
+
     nixl_mem_list_t
     getSupportedMems() const override;
 
@@ -131,6 +183,17 @@ public:
     connect(const std::string &remote_agent) override;
     nixl_status_t
     disconnect(const std::string &remote_agent) override;
+
+    nixl_status_t
+    queryRemoteAgentAuthority(const std::string &remote_agent,
+                              nixl_remote_agent_authority_t &authority) const override;
+
+    nixl_status_t
+    bindRemoteAgent(const nixlRemoteAgentBinding &binding) override;
+    nixl_status_t
+    retireRemoteAgent(const nixlRemoteAgentBinding &binding) override;
+    nixl_status_t
+    queryRemoteNotificationState(const nixlRemoteAgentBinding &binding) const override;
 
     nixl_status_t
     registerMem(const nixlBlobDesc &mem, const nixl_mem_t &nixl_mem, nixlBackendMD *&out) override;
@@ -196,7 +259,12 @@ public:
     nixl_status_t
     getNotifs(notif_list_t &notif_list) override;
     nixl_status_t
+    getAuthenticatedNotifs(authenticated_notif_list_t &notif_list) override;
+    nixl_status_t
     genNotif(const std::string &remote_agent, const std::string &msg) const override;
+    nixl_status_t
+    genNotif(const nixlRemoteAgentBinding &binding,
+             const std::string &msg) const override;
 
     // public function for UCX worker to mark connections as connected
     nixl_status_t
@@ -234,7 +302,9 @@ protected:
     }
 
     virtual void
-    appendNotif(std::string &&remote_name, std::string &&msg);
+    appendNotif(nixlAuthenticatedNotification &&notification) const;
+    virtual void
+    poisonNotifs() const;
 
     virtual nixl_status_t
     sendXferRange(const nixl_xfer_op_t &operation,
@@ -250,13 +320,25 @@ protected:
                              const nixl_xfer_op_t &operation,
                              const nixl_meta_dlist_t &local,
                              const nixl_meta_dlist_t &remote,
-                             const std::string &remote_agent) const;
+                             const std::string &remote_agent,
+                             const nixl_opt_b_args_t *opt_args) const;
 
     nixlUcxEngine(const nixlBackendInitParams &init_params);
 
-    notif_list_t notifList_;
+    mutable nixlUcxNotificationQueue notifQueue_;
 
 private:
+    struct notifCallbackContext {
+        nixlUcxEngine *engine;
+        size_t workerId;
+    };
+
+    struct exactRouteRecord {
+        nixl::ucx::notif_route_key_t route;
+        std::string remoteAgent;
+        uint64_t connectionIdentity;
+    };
+
     // Memory management helpers
     nixl_status_t
     internalMDHelper(const nixl_blob_t &blob, const std::string &agent, nixlBackendMD *&output);
@@ -271,13 +353,35 @@ private:
               const ucp_am_recv_param_t *param);
 
     nixl_status_t
-    notifSendPriv(const std::string &remote_agent,
-                  const std::string &msg,
+    notifSendPriv(std::vector<std::uint8_t> &&frame,
                   const std::unique_ptr<nixlUcxEp> &ep,
                   nixlUcxReq *req = nullptr) const;
 
+    nixl_status_t
+    sendControlFrame(const nixl::ucx::notif_wire_envelope_t &envelope,
+                     uint64_t connection_identity,
+                     size_t worker_id) const;
+
+    [[nodiscard]] nixl_status_t
+    makeRoute(const nixlRemoteAgentBinding &binding,
+              nixl::ucx::notif_route_key_t &route,
+              ucx_connection_ptr_t &connection) const;
+
+    [[nodiscard]] nixl_status_t
+    prepareDataFrame(const nixl_remote_agent_authority_t &authority,
+                     size_t worker_id,
+                     const std::string &msg,
+                     std::vector<std::uint8_t> &frame,
+                     ucx_connection_ptr_t &connection) const;
+
+    [[nodiscard]] std::optional<exactRouteRecord>
+    getExactRoute(uint64_t handle_identity, uint64_t generation) const;
+
     ucx_connection_ptr_t
     getConnection(const std::string &remote_agent) const;
+
+    ucx_connection_ptr_t
+    getConnection(uint64_t connection_identity) const;
 
     struct batchResult {
         nixl_status_t status;
@@ -305,11 +409,17 @@ private:
     /* UCX data */
     std::unique_ptr<nixlUcxContext> uc;
     std::vector<std::unique_ptr<nixlUcxWorker>> uws;
-    std::string workerAddr;
+    nixl::ucx::connection_metadata_t localConnectionMetadata_;
+    std::vector<notifCallbackContext> notifCallbackContexts_;
+    nixl::ucx::notif_wire_uuid_t localAgentIncarnationUuid_;
+    std::unique_ptr<nixl::ucx::notif_capability_state_t> notifState_;
     mutable std::atomic<size_t> sharedWorkerIndex_;
 
     // Map of agent name to saved nixlUcxConnection info
+    mutable std::mutex connectionMutex_;
     std::unordered_map<std::string, ucx_connection_ptr_t> remoteConnMap;
+    mutable std::mutex exactRouteMutex_;
+    std::unordered_map<uint64_t, exactRouteRecord> exactRoutes_;
 };
 
 class nixlUcxThread;
@@ -324,14 +434,18 @@ public:
 
     nixl_status_t
     getNotifs(notif_list_t &notif_list) override;
+    nixl_status_t
+    getAuthenticatedNotifs(authenticated_notif_list_t &notif_list) override;
 
 protected:
     void
-    appendNotif(std::string &&remote_name, std::string &&msg) override;
+    appendNotif(nixlAuthenticatedNotification &&notification) const override;
+    void
+    poisonNotifs() const override;
 
 private:
     std::unique_ptr<nixlUcxThread> thread_;
-    std::mutex notifMutex_;
+    mutable std::mutex notifMutex_;
 };
 
 namespace asio {
@@ -358,10 +472,14 @@ public:
 
     nixl_status_t
     getNotifs(notif_list_t &notif_list) override;
+    nixl_status_t
+    getAuthenticatedNotifs(authenticated_notif_list_t &notif_list) override;
 
 protected:
     void
-    appendNotif(std::string &&remote_name, std::string &&msg) override;
+    appendNotif(nixlAuthenticatedNotification &&notification) const override;
+    void
+    poisonNotifs() const override;
 
     nixl_status_t
     sendXferRange(const nixl_xfer_op_t &operation,
@@ -377,7 +495,7 @@ private:
     std::unique_ptr<nixlUcxThread> sharedThread_;
     std::vector<std::unique_ptr<nixlUcxThread>> dedicatedThreads_;
     size_t numSharedWorkers_;
-    std::mutex notifMutex_;
+    mutable std::mutex notifMutex_;
     size_t splitBatchSize_;
 };
 

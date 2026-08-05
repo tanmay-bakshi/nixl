@@ -41,6 +41,7 @@ class nixlBackendEngine {
         // Members that can be accessed by the child (localAgent cannot be modified)
         bool              initErr = false;
         const std::string localAgent;
+        const std::string localAgentIncarnation;
         const bool enableTelemetry_;
 
         [[nodiscard]] nixl_status_t
@@ -77,6 +78,7 @@ class nixlBackendEngine {
             : backendType(init_params->type),
               customParams(*init_params->customParams),
               localAgent(init_params->localAgent),
+              localAgentIncarnation(init_params->localAgentIncarnation),
               enableTelemetry_(init_params->enableTelemetry_) {}
 
         nixlBackendEngine(nixlBackendEngine&&) = delete;
@@ -109,6 +111,11 @@ class nixlBackendEngine {
         // Determines if a backend supports sending notifications. Related methods are not
         // pure virtual, and return errors, as parent shouldn't call if supportsNotif is false.
         virtual bool supportsNotif() const = 0;
+
+        virtual bool
+        supportsAuthenticatedNotif() const {
+            return false;
+        }
 
         virtual nixl_mem_list_t getSupportedMems() const = 0;  // TODO: Return by const-reference and mark noexcept?
 
@@ -201,14 +208,45 @@ class nixlBackendEngine {
             return NIXL_ERR_BACKEND;
         }
 
-        // Deserialize from string the connection info for a remote node, if supported
-        // The generated data should be deleted in nixlBackendEngine destructor
+        // Deserialize connection info for a remote node, if supported. Failure must leave
+        // backend state for remote_agent unchanged. A successful load is owned by the backend
+        // until disconnect(remote_agent) succeeds.
         virtual nixl_status_t loadRemoteConnInfo (const std::string &remote_agent,
                                                   const std::string &remote_conn_info) {
             return NIXL_ERR_BACKEND;
         }
 
-        // Load remote metadata, if supported.
+        virtual nixl_status_t
+        queryRemoteAgentAuthority(const std::string &,
+                                  nixl_remote_agent_authority_t &) const {
+            return NIXL_ERR_NOT_SUPPORTED;
+        }
+
+        // Install one immutable agent-owned generation after connection authority has been
+        // established. Failure must retain no binding. Retirement is idempotent and occurs before
+        // the corresponding connection is disconnected.
+        virtual nixl_status_t
+        bindRemoteAgent(const nixlRemoteAgentBinding &) {
+            return NIXL_ERR_NOT_SUPPORTED;
+        }
+
+        virtual nixl_status_t
+        retireRemoteAgent(const nixlRemoteAgentBinding &) {
+            return NIXL_ERR_NOT_SUPPORTED;
+        }
+
+        // Returns NIXL_SUCCESS only when new notification-bearing submissions are ready,
+        // NIXL_ERR_NOT_READY while the binding is converging, and a closed error after retirement
+        // or conflict.
+        virtual nixl_status_t
+        queryRemoteNotificationState(const nixlRemoteAgentBinding &) const {
+            return NIXL_ERR_NOT_SUPPORTED;
+        }
+
+
+        // Load remote metadata, if supported. The caller passes output == nullptr. Failure must
+        // leave output == nullptr and retain no backend-owned metadata. Success transfers one
+        // metadata object to the caller, which must release it with unloadMD() exactly once.
         virtual nixl_status_t loadRemoteMD (const nixlBlobDesc &input,
                                             const nixl_mem_t &nixl_mem,
                                             const std::string &remote_agent,
@@ -231,9 +269,19 @@ class nixlBackendEngine {
         // Populate an empty received notif list. Elements are released within backend then.
         virtual nixl_status_t getNotifs(notif_list_t &notif_list) { return NIXL_ERR_BACKEND; }
 
+
+        virtual nixl_status_t
+        getAuthenticatedNotifs(authenticated_notif_list_t &) {
+            return NIXL_ERR_NOT_SUPPORTED;
+        }
         // Generates a standalone notification, not bound to a transfer.
         virtual nixl_status_t genNotif(const std::string &remote_agent, const std::string &msg) const {
             return NIXL_ERR_BACKEND;
+        }
+
+        virtual nixl_status_t
+        genNotif(const nixlRemoteAgentBinding &, const std::string &) const {
+            return NIXL_ERR_NOT_SUPPORTED;
         }
 
 

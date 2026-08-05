@@ -22,7 +22,10 @@ namespace mocks {
 MockBackendEngine::MockBackendEngine(const nixlBackendInitParams *init_params)
     : nixlBackendEngine(init_params),
       gmock_backend_engine(GMockBackendEngine::GetFromParams(init_params->customParams)),
-      sharedState(1) {}
+      sharedState(1) {
+    gmock_backend_engine->backendInit(init_params->localAgent,
+                                      init_params->localAgentIncarnation);
+}
 
 nixl_status_t
 MockBackendEngine::registerMem(const nixlBlobDesc &mem,
@@ -98,6 +101,33 @@ MockBackendEngine::loadRemoteConnInfo(const std::string &remote_agent,
 }
 
 nixl_status_t
+MockBackendEngine::queryRemoteAgentAuthority(
+    const std::string &remote_agent,
+    nixl_remote_agent_authority_t &authority) const {
+    assert(sharedState > 0);
+    return gmock_backend_engine->queryRemoteAgentAuthority(remote_agent, authority);
+}
+
+nixl_status_t
+MockBackendEngine::bindRemoteAgent(const nixlRemoteAgentBinding &binding) {
+    sharedState++;
+    return gmock_backend_engine->bindRemoteAgent(binding);
+}
+
+nixl_status_t
+MockBackendEngine::retireRemoteAgent(const nixlRemoteAgentBinding &binding) {
+    sharedState++;
+    return gmock_backend_engine->retireRemoteAgent(binding);
+}
+
+nixl_status_t
+MockBackendEngine::queryRemoteNotificationState(
+    const nixlRemoteAgentBinding &binding) const {
+    assert(sharedState > 0);
+    return gmock_backend_engine->queryRemoteNotificationState(binding);
+}
+
+nixl_status_t
 MockBackendEngine::loadRemoteMD(const nixlBlobDesc &input,
                                 const nixl_mem_t &nixl_mem,
                                 const std::string &remote_agent,
@@ -119,9 +149,22 @@ MockBackendEngine::getNotifs(notif_list_t &notif_list) {
 }
 
 nixl_status_t
+MockBackendEngine::getAuthenticatedNotifs(authenticated_notif_list_t &notif_list) {
+    sharedState++;
+    return gmock_backend_engine->getAuthenticatedNotifs(notif_list);
+}
+
+nixl_status_t
 MockBackendEngine::genNotif(const std::string &remote_agent, const std::string &msg) const {
     assert(sharedState > 0);
     return gmock_backend_engine->genNotif(remote_agent, msg);
+}
+
+nixl_status_t
+MockBackendEngine::genNotif(const nixlRemoteAgentBinding &binding,
+                            const std::string &msg) const {
+    assert(sharedState > 0);
+    return gmock_backend_engine->genNotif(binding, msg);
 }
 
 } // namespace mocks

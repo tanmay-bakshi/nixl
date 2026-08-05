@@ -90,6 +90,7 @@ isCounterEvent(nixl_telemetry_event_type_t event_type) noexcept {
     case nixl_telemetry_event_type_t::AGENT_ERR_REMOTE_DISCONNECT:
     case nixl_telemetry_event_type_t::AGENT_ERR_CANCELED:
     case nixl_telemetry_event_type_t::AGENT_ERR_NO_TELEMETRY:
+    case nixl_telemetry_event_type_t::AGENT_ERR_NOT_READY:
         return false;
     }
     return false;
@@ -119,6 +120,7 @@ isGaugeEvent(nixl_telemetry_event_type_t event_type) noexcept {
     case nixl_telemetry_event_type_t::AGENT_ERR_REMOTE_DISCONNECT:
     case nixl_telemetry_event_type_t::AGENT_ERR_CANCELED:
     case nixl_telemetry_event_type_t::AGENT_ERR_NO_TELEMETRY:
+    case nixl_telemetry_event_type_t::AGENT_ERR_NOT_READY:
         return false;
     }
     return false;

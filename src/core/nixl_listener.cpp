@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include <algorithm>
 #include <fcntl.h>
 #include "nixl.h"
 #include "common/configuration.h"
@@ -433,7 +434,7 @@ public:
         for (const auto &agent : tmp_invalidated_agents) {
             NIXL_DEBUG << "Invalidated agent: " << agent;
             agentWatchers.erase(agent);
-            nixl_status_t ret = my_agent->invalidateRemoteMD(agent);
+            nixl_status_t ret = my_agent->invalidateRemoteMDByName(agent);
             if (ret != NIXL_SUCCESS)
                 NIXL_ERROR << "Failed to invalidate remote metadata for agent: " << agent << ": " << ret;
             else
@@ -697,7 +698,7 @@ nixlAgentData::commWorkerInternal(nixlAgent *myAgent) {
                     }
                 } else if(header == "INVL") {
                     std::string remote_agent = command.substr(4);
-                    myAgent->invalidateRemoteMD(remote_agent);
+                    myAgent->invalidateRemoteMDByName(remote_agent);
                     break;
                 } else {
                     NIXL_ERROR << "Received socket message with bad header" + header + " from peer "
@@ -742,49 +743,29 @@ void nixlAgentData::getCommWork(std::vector<nixl_comm_req_t> &req_list){
 }
 
 nixl_status_t
-nixlAgentData::loadConnInfo(const std::string &remote_name,
-                            const nixl_backend_t &backend,
-                            const nixl_blob_t &conn_info) {
-    if (backendEngines_.count(backend) == 0) {
-        NIXL_DEBUG << "Agent " << name_ << " does not support a remote backend: " << backend;
-        return NIXL_ERR_NOT_SUPPORTED;
+nixlAgentData::prepareRemoteSections(const std::string &remote_name,
+                                     nixlSerDes &sd,
+                                     nixlRemoteSectionUpdate &update) const {
+    const auto existing = remoteSections_.find(remote_name);
+    if (existing != remoteSections_.end()) {
+        return existing->second.prepareRemoteData(&sd, backendEngines_, update);
     }
 
-    // No need to reload same conn info, error if it changed
-    const auto r_it = remoteBackends_.find(remote_name);
-    if (r_it != remoteBackends_.end()) {
-        const auto rb_it = r_it->second.find(backend);
-        if (rb_it != r_it->second.end()) {
-            if (rb_it->second != conn_info) {
-                return NIXL_ERR_NOT_ALLOWED;
-            }
-            return NIXL_SUCCESS;
-        }
-    }
-
-    nixlBackendEngine *eng = backendEngines_[backend].get();
-    if (!eng->supportsRemote()) {
-        NIXL_DEBUG << backend << " does not support remote operations";
-        return NIXL_ERR_NOT_SUPPORTED;
-    }
-
-    const nixl_status_t ret = eng->loadRemoteConnInfo(remote_name, conn_info);
-    if (ret != NIXL_SUCCESS) {
-        return ret;
-    }
-
-    remoteBackends_[remote_name].emplace(backend, conn_info);
-    return NIXL_SUCCESS;
+    const nixlRemoteSection empty_section(remote_name);
+    return empty_section.prepareRemoteData(&sd, backendEngines_, update);
 }
 
 nixl_status_t
-nixlAgentData::loadRemoteSections(const std::string &remote_name, nixlSerDes &sd) {
+nixlAgentData::applyRemoteSections(const std::string &remote_name,
+                                   nixlRemoteSectionUpdate &&update,
+                                   bool &rollback_ambiguous) {
     const auto [it, inserted] = remoteSections_.try_emplace(remote_name, remote_name);
-    const nixl_status_t ret = it->second.loadRemoteData(&sd, backendEngines_);
-    // TODO: can be more graceful, if just the new MD blob was improper
+    const nixl_status_t ret =
+        it->second.applyRemoteData(std::move(update), rollback_ambiguous);
     if (ret != NIXL_SUCCESS) {
-        remoteSections_.erase(it);
-        remoteBackends_.erase(remote_name);
+        if (inserted) {
+            remoteSections_.erase(it);
+        }
         return ret;
     }
 
@@ -799,19 +780,78 @@ nixlAgentData::invalidateRemoteData(const std::string &remote_name) {
     }
 
     nixl_status_t ret = NIXL_ERR_NOT_FOUND;
+    nixl_status_t cleanup_status = NIXL_SUCCESS;
+    nixlRemoteAgentH *remote_handle = findActiveRemoteHandle(remote_name);
+    if (remote_handle == nullptr && remoteBackends_.count(remote_name) != 0) {
+        const auto handle = std::find_if(
+            remoteHandles_.rbegin(),
+            remoteHandles_.rend(),
+            [&remote_name](const std::unique_ptr<nixlRemoteAgentH> &candidate) {
+                return candidate->name_ == remote_name;
+            });
+        if (handle != remoteHandles_.rend()) {
+            remote_handle = handle->get();
+        }
+    }
+
+    deactivateRemoteHandle(remote_name);
+
+    std::unordered_set<nixlBackendEngine *> unretired_engines;
+    if (remote_handle != nullptr) {
+        ret = NIXL_SUCCESS;
+        for (auto &[engine, binding] : remote_handle->bindings_) {
+            const nixl_status_t retire_status = engine->retireRemoteAgent(binding);
+            if (retire_status == NIXL_SUCCESS) {
+                continue;
+            }
+            unretired_engines.insert(engine);
+            if (cleanup_status == NIXL_SUCCESS) {
+                cleanup_status = retire_status;
+            }
+        }
+    }
+
     if (remoteSections_.erase(remote_name) > 0) {
         ret = NIXL_SUCCESS;
     }
 
     auto it_backends = remoteBackends_.find(remote_name);
     if (it_backends != remoteBackends_.end()) {
-        for (auto &it : it_backends->second) {
-            backendEngines_[it.first]->disconnect(remote_name);
+        for (auto it = it_backends->second.begin(); it != it_backends->second.end();) {
+            const auto engine = backendEngines_.find(it->first);
+            if (engine == backendEngines_.end()) {
+                if (cleanup_status == NIXL_SUCCESS) {
+                    cleanup_status = NIXL_ERR_BACKEND;
+                }
+                ++it;
+                continue;
+            }
+            if (unretired_engines.count(engine->second.get()) != 0) {
+                ++it;
+                continue;
+            }
+
+            const nixl_status_t disconnect_status =
+                engine->second->disconnect(remote_name);
+            if (disconnect_status != NIXL_SUCCESS && cleanup_status == NIXL_SUCCESS) {
+                cleanup_status = disconnect_status;
+            }
+            if (disconnect_status == NIXL_SUCCESS) {
+                it = it_backends->second.erase(it);
+            } else {
+                ++it;
+            }
         }
 
-        remoteBackends_.erase(it_backends);
+        if (it_backends->second.empty()) {
+            remoteBackends_.erase(it_backends);
+        }
         ret = NIXL_SUCCESS;
     }
 
+    if (cleanup_status != NIXL_SUCCESS) {
+        quarantinedRemoteNames_.insert(remote_name);
+        return cleanup_status;
+    }
     return ret;
 }
