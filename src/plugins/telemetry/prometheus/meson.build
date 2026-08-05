@@ -26,12 +26,17 @@ cmake_opts.add_cmake_defines({
     'ENABLE_COMPRESSION': 'OFF',
     'ENABLE_TESTING': 'OFF',
     'USE_THIRDPARTY_LIBRARIES': 'ON',
-    'BUILD_SHARED_LIBS': 'ON',
+    'BUILD_SHARED_LIBS': 'OFF',
     'CMAKE_POSITION_INDEPENDENT_CODE': 'ON',
     'CMAKE_LINK_DEPENDS_USE_LINKER': 'OFF',
     'CMAKE_C_FLAGS': '-Wno-unused-but-set-variable',
     'CMAKE_CXX_FLAGS': '-Wno-unused-but-set-variable'
 })
+
+# The subproject's libraries are linked into the plugin, so they must not be
+# installed themselves: meson would place them in a bare {prefix}/lib, which
+# meson-python cannot map to a wheel directory.
+cmake_opts.set_install(false)
 
 prometheus_sub = cmake.subproject('prometheus-cpp', required: false, options: cmake_opts)
 if prometheus_sub.found()
