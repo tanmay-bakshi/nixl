@@ -31,6 +31,8 @@ class nixlBackendH;
 class nixlXferReqH;
 class nixlAgentData;
 class nixlRemoteAgentH;
+class nixlTerminalEventChannelH;
+class nixlTerminalEventSubscriptionH;
 
 
 /*** NIXL memory type, operation and status enums ***/
@@ -408,6 +410,101 @@ struct nixlXferAttestation {
 };
 
 using nixl_xfer_attestation_t = nixlXferAttestation;
+
+/**
+ * @enum nixl_terminal_event_kind_t
+ * @brief Kind of autonomous event delivered through an agent terminal channel.
+ */
+enum class nixl_terminal_event_kind_t {
+    TRANSFER,
+    CAPABILITY,
+};
+
+/**
+ * @enum nixl_terminal_capability_state_t
+ * @brief State of one exact remote notification route.
+ */
+enum class nixl_terminal_capability_state_t {
+    READY,
+    FAILED,
+    RETIRED,
+};
+
+/**
+ * @enum nixl_terminal_channel_fatal_t
+ * @brief Sticky process-fatal conditions reported by a terminal channel.
+ */
+enum class nixl_terminal_channel_fatal_t : uint32_t {
+    NONE = 0,
+    QUEUE_OVERFLOW = 1U << 0U,
+    EVENTFD_FAILURE = 1U << 1U,
+    ACTIVE_SUBSCRIPTIONS_ON_CLOSE = 1U << 2U,
+    INVALID_PUBLICATION = 1U << 3U,
+};
+
+/**
+ * @struct nixlTerminalEvent
+ * @brief Immutable-by-convention autonomous event drained from an agent channel.
+ */
+struct nixlTerminalEvent {
+    nixl_terminal_event_kind_t kind = nixl_terminal_event_kind_t::TRANSFER;
+    uint64_t ownerCookie = 0;
+    uint64_t identity = 0;
+    uint64_t generation = 0;
+    nixl_status_t transferStatus = NIXL_ERR_NOT_READY;
+    nixl_terminal_capability_state_t capabilityState =
+        nixl_terminal_capability_state_t::FAILED;
+    uint64_t capabilityEpoch = 0;
+    uint64_t nativeTimestampNs = 0;
+};
+
+using nixl_terminal_event_t = nixlTerminalEvent;
+
+/**
+ * @struct nixlTerminalChannelInventory
+ * @brief Fail-closed channel state and subscription inventory.
+ */
+struct nixlTerminalChannelInventory {
+    size_t capacity = 0;
+    size_t queuedChannelEvents = 0;
+    size_t activeChannelSubscriptions = 0;
+    size_t retainedPublicSubscriptions = 0;
+    size_t backendProducers = 0;
+    size_t activeCallbackSlots = 0;
+    size_t queuedOwnerContinuations = 0;
+    bool acceptingSubscriptions = false;
+    bool closed = false;
+    nixl_terminal_channel_fatal_t fatal = nixl_terminal_channel_fatal_t::NONE;
+    int eventfdError = 0;
+};
+
+using nixl_terminal_channel_inventory_t = nixlTerminalChannelInventory;
+
+/**
+ * @struct nixlTerminalEventBatch
+ * @brief One nonblocking drain result from a terminal channel.
+ */
+struct nixlTerminalEventBatch {
+    std::vector<nixl_terminal_event_t> events;
+    uint64_t wakeCount = 0;
+    nixl_terminal_channel_inventory_t inventory;
+};
+
+using nixl_terminal_event_batch_t = nixlTerminalEventBatch;
+
+/**
+ * @struct nixlTerminalSubscriptionInfo
+ * @brief Exact binding and lifecycle state of one agent-owned subscription.
+ */
+struct nixlTerminalSubscriptionInfo {
+    nixl_terminal_event_kind_t kind = nixl_terminal_event_kind_t::TRANSFER;
+    uint64_t ownerCookie = 0;
+    uint64_t identity = 0;
+    uint64_t generation = 0;
+    bool active = false;
+};
+
+using nixl_terminal_subscription_info_t = nixlTerminalSubscriptionInfo;
 /**
  * @struct nixlRemoteAgentAuthority
  * @brief Immutable authority captured from one active remote-agent generation.

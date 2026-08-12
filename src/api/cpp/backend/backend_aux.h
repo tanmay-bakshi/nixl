@@ -17,6 +17,9 @@
 #ifndef __BACKEND_AUX_H_
 #define __BACKEND_AUX_H_
 
+#include <cstddef>
+#include <cstdint>
+#include <memory>
 #include <mutex>
 #include <string>
 #include "nixl_types.h"
@@ -46,6 +49,87 @@ struct nixlRemoteAgentBinding {
     std::string remoteAgent;
     std::string agentIncarnation;
     nixl_remote_agent_authority_t authority;
+};
+
+/**
+ * @brief Exact identity of the next backend transfer submission.
+ */
+struct nixlBackendTransferEventBinding {
+    uint64_t handleIdentity = 0;
+    uint64_t generation = 0;
+};
+
+/**
+ * @brief Terminal transition emitted autonomously by a backend progress owner.
+ */
+struct nixlBackendTransferTransition {
+    nixlBackendTransferEventBinding binding;
+    nixl_status_t status = NIXL_ERR_NOT_READY;
+    uint64_t nativeTimestampNs = 0;
+};
+
+enum class nixl_backend_capability_state_t {
+    READY,
+    FAILED,
+    RETIRED,
+};
+
+/**
+ * @brief Exact notification-route transition emitted by a backend.
+ */
+struct nixlBackendCapabilityTransition {
+    uint64_t remoteHandleIdentity = 0;
+    uint64_t remoteHandleGeneration = 0;
+    nixl_backend_capability_state_t state = nixl_backend_capability_state_t::FAILED;
+    uint64_t capabilityEpoch = 0;
+    uint64_t nativeTimestampNs = 0;
+};
+
+/**
+ * @brief Externally owned sink for one exact transfer generation.
+ */
+class nixlBackendTransferTransitionSink {
+public:
+    virtual ~nixlBackendTransferTransitionSink() = default;
+
+    virtual void
+    publish(const nixlBackendTransferTransition &transition) noexcept = 0;
+};
+
+/**
+ * @brief Externally owned sink for one exact remote notification route.
+ */
+class nixlBackendCapabilityTransitionSink {
+public:
+    virtual ~nixlBackendCapabilityTransitionSink() = default;
+
+    virtual void
+    publish(const nixlBackendCapabilityTransition &transition) noexcept = 0;
+};
+
+/**
+ * @brief Per-subscription native lifecycle inventory.
+ */
+struct nixlBackendEventSubscriptionInventory {
+    size_t backendProducers = 0;
+    size_t activeCallbackSlots = 0;
+    size_t queuedOwnerContinuations = 0;
+};
+
+/**
+ * @brief Backend-owned lifetime for an autonomous event subscription.
+ */
+class nixlBackendEventSubscription {
+public:
+    virtual ~nixlBackendEventSubscription() = default;
+
+    virtual nixl_status_t
+    cancel() noexcept = 0;
+
+    virtual void
+    queryInventory(nixlBackendEventSubscriptionInventory &inventory) const noexcept {
+        inventory = {};
+    }
 };
 
 

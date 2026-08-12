@@ -363,6 +363,93 @@ class nixlAgent {
         nixl_status_t
         getXferStatus (nixlXferReqH* req_hndl) const;
 
+        /*** Autonomous terminal-event delivery ***/
+
+        /**
+         * @brief Create this agent's optional bounded terminal-event channel.
+         *
+         * Exactly one channel may be created during an agent lifetime.
+         *
+         * @param capacity Positive maximum number of queued events.
+         * @param channel [out] Agent-owned channel handle.
+         * @return nixl_status_t Error code if creation was not successful.
+         */
+        nixl_status_t
+        createTerminalEventChannel(size_t capacity,
+                                   nixlTerminalEventChannelH *&channel);
+
+        /**
+         * @brief Return the channel's borrowed poll descriptor.
+         */
+        nixl_status_t
+        getTerminalEventChannelFd(const nixlTerminalEventChannelH *channel,
+                                  int &fd) const;
+
+        /**
+         * @brief Drain all currently queued autonomous events without polling handles.
+         */
+        nixl_status_t
+        drainTerminalEvents(nixlTerminalEventChannelH *channel,
+                            nixl_terminal_event_batch_t &batch) const;
+
+        /**
+         * @brief Inspect channel capacity, subscriptions, and sticky fatal state.
+         */
+        nixl_status_t
+        queryTerminalEventChannel(const nixlTerminalEventChannelH *channel,
+                                  nixl_terminal_channel_inventory_t &inventory) const;
+
+        /**
+         * @brief Return the number of retained public subscription handles.
+         */
+        nixl_status_t
+        getTerminalEventSubscriptionCount(const nixlTerminalEventChannelH *channel,
+                                          size_t &count) const;
+
+        /**
+         * @brief Stop channel admission. Active subscriptions make closure fatal.
+         */
+        nixl_status_t
+        closeTerminalEventChannel(nixlTerminalEventChannelH *channel) const;
+
+        /**
+         * @brief Arm autonomous delivery for one transfer's exact next generation.
+         */
+        nixl_status_t
+        subscribeXferTerminal(nixlTerminalEventChannelH *channel,
+                              nixlXferReqH *req_hndl,
+                              uint64_t owner_cookie,
+                              nixlTerminalEventSubscriptionH *&subscription);
+
+        /**
+         * @brief Subscribe to capability transitions for an exact backend route.
+         */
+        nixl_status_t
+        subscribeRemoteNotificationState(
+            nixlTerminalEventChannelH *channel,
+            const nixlRemoteAgentH *remote_agent,
+            const nixlBackendH *backend,
+            uint64_t owner_cookie,
+            nixlTerminalEventSubscriptionH *&subscription);
+
+        /**
+         * @brief Query an agent-owned subscription's immutable binding and active state.
+         */
+        nixl_status_t
+        queryTerminalEventSubscription(
+            const nixlTerminalEventSubscriptionH *subscription,
+            nixl_terminal_subscription_info_t &info) const;
+
+        /**
+         * @brief Cancel or release an exact autonomous subscription.
+         *
+         * Active transfer cancellation retains the subscription until its exact terminal event.
+         * NIXL_IN_PROG requires a later release call after that event is drained. An already
+         * terminal subscription is destroyed immediately.
+         */
+        nixl_status_t
+        releaseTerminalEventSubscription(nixlTerminalEventSubscriptionH *subscription);
+
 
         /**
          * @brief  Get the telemetry data associated with `req_hndl`.

@@ -43,6 +43,7 @@ const std::vector<std::vector<std::string>> illegal_plugin_combinations = {
 };
 std::atomic<uint64_t> next_agent_identity{1};
 std::atomic<uint64_t> next_remote_handle_identity{1};
+std::atomic<uint64_t> next_terminal_subscription_identity{1};
 
 [[nodiscard]] uint64_t
 allocateIdentity(std::atomic<uint64_t> &next_identity) {
@@ -75,6 +76,67 @@ isCanonicalAgentIncarnation(const std::string &incarnation) {
         }
     }
     return true;
+}
+
+[[nodiscard]] nixl_terminal_capability_state_t
+toPublicCapabilityState(nixl::terminal_capability_state_t state) noexcept {
+    switch (state) {
+    case nixl::terminal_capability_state_t::READY:
+        return nixl_terminal_capability_state_t::READY;
+    case nixl::terminal_capability_state_t::FAILED:
+        return nixl_terminal_capability_state_t::FAILED;
+    case nixl::terminal_capability_state_t::RETIRED:
+        return nixl_terminal_capability_state_t::RETIRED;
+    }
+    return nixl_terminal_capability_state_t::FAILED;
+}
+
+[[nodiscard]] nixl_terminal_channel_inventory_t
+toPublicInventory(
+    const nixl::terminal_channel_inventory_t &inventory,
+    size_t retained_public_subscriptions,
+    const nixlBackendEventSubscriptionInventory &backend_inventory) noexcept {
+    return {
+        .capacity = inventory.capacity,
+        .queuedChannelEvents = inventory.queuedEvents,
+        .activeChannelSubscriptions = inventory.activeSubscriptions,
+        .retainedPublicSubscriptions = retained_public_subscriptions,
+        .backendProducers = backend_inventory.backendProducers,
+        .activeCallbackSlots = backend_inventory.activeCallbackSlots,
+        .queuedOwnerContinuations = backend_inventory.queuedOwnerContinuations,
+        .acceptingSubscriptions = inventory.acceptingSubscriptions,
+        .closed = inventory.closed,
+        .fatal = static_cast<nixl_terminal_channel_fatal_t>(inventory.health.fatal),
+        .eventfdError = inventory.health.eventfdError,
+    };
+}
+
+void
+addBackendInventory(nixlBackendEventSubscriptionInventory &aggregate,
+                    const nixlBackendEventSubscriptionInventory &inventory) noexcept {
+    aggregate.backendProducers += inventory.backendProducers;
+    aggregate.activeCallbackSlots += inventory.activeCallbackSlots;
+    aggregate.queuedOwnerContinuations += inventory.queuedOwnerContinuations;
+}
+
+[[nodiscard]] nixl_terminal_event_t
+toPublicEvent(const nixl::terminal_event_t &event) {
+    nixl_terminal_event_t result{
+        .kind = event.kind == nixl::terminal_event_kind_t::TRANSFER ?
+            nixl_terminal_event_kind_t::TRANSFER : nixl_terminal_event_kind_t::CAPABILITY,
+        .ownerCookie = event.ownerCookie,
+        .identity = event.identity,
+        .generation = event.generation,
+        .capabilityEpoch = event.epoch,
+        .nativeTimestampNs = event.nativeTimestampNs,
+    };
+    if (event.kind == nixl::terminal_event_kind_t::TRANSFER) {
+        result.transferStatus = std::get<nixl_status_t>(event.result);
+    } else {
+        result.capabilityState =
+            toPublicCapabilityState(std::get<nixl::terminal_capability_state_t>(event.result));
+    }
+    return result;
 }
 
 
@@ -376,7 +438,30 @@ nixlAgent::~nixlAgent() {
         data->listener.reset();
     }
 
+    std::vector<std::shared_ptr<nixlTerminalEventSubscriptionH>> terminal_subscriptions;
+    {
+        NIXL_LOCK_GUARD(data->lock);
+        for (const auto &[identity, subscription] : data->terminalSubscriptions_) {
+            static_cast<void>(identity);
+            terminal_subscriptions.push_back(subscription);
+        }
+        data->terminalSubscriptions_.clear();
+        data->ownedTerminalSubscriptions_.clear();
+    }
+    for (const std::shared_ptr<nixlTerminalEventSubscriptionH> &subscription :
+         terminal_subscriptions) {
+        const nixl_status_t status = subscription->requestCancellation();
+        if (status != NIXL_SUCCESS) {
+            NIXL_WARN << "Terminal subscription did not drain during agent destruction: "
+                      << status;
+        }
+        subscription->markTerminal();
+    }
+
     NIXL_LOCK_GUARD(data->lock);
+    if (data->terminalEventChannel_ != nullptr) {
+        static_cast<void>(data->terminalEventChannel_->channel_.close());
+    }
     std::unordered_set<std::string> remote_agents;
     for (const auto &remote_backend : data->remoteBackends_) {
         remote_agents.insert(remote_backend.first);
@@ -1097,6 +1182,7 @@ nixlAgent::makeXferReq (const nixl_xfer_op_t &operation,
     }
 
     req_hndl = handle.release();
+    data->ownedXferHandles_.insert(req_hndl);
     return NIXL_SUCCESS;
 }
 
@@ -1130,7 +1216,7 @@ nixlAgent::createXferReqImpl(const nixl_xfer_op_t &operation,
         total_bytes += local_descs[i].len;
     }
 
-    NIXL_SHARED_LOCK_GUARD(data->lock);
+    NIXL_LOCK_GUARD(data->lock);
     std::string resolved_agent = remote_agent_name;
     if (remote_agent != nullptr) {
         const nixl_status_t handle_status = data->validateRemoteHandle(remote_agent);
@@ -1259,6 +1345,7 @@ nixlAgent::createXferReqImpl(const nixl_xfer_op_t &operation,
     }
 
     req_hndl = handle.release();
+    data->ownedXferHandles_.insert(req_hndl);
     return NIXL_SUCCESS;
 }
 
@@ -1499,6 +1586,362 @@ nixlAgent::getXferStatus (nixlXferReqH *req_hndl) const {
 }
 
 nixl_status_t
+nixlAgent::createTerminalEventChannel(size_t capacity,
+                                      nixlTerminalEventChannelH *&channel) {
+    channel = nullptr;
+    if (capacity == 0) {
+        return NIXL_ERR_INVALID_PARAM;
+    }
+
+    NIXL_LOCK_GUARD(data->lock);
+    if (data->terminalEventChannel_ != nullptr) {
+        return NIXL_ERR_NOT_ALLOWED;
+    }
+
+    try {
+        data->terminalEventChannel_ =
+            std::unique_ptr<nixlTerminalEventChannelH>(
+                new nixlTerminalEventChannelH(data->identity_, capacity));
+    }
+    catch (const std::invalid_argument &) {
+        return NIXL_ERR_INVALID_PARAM;
+    }
+    catch (const std::system_error &) {
+        return NIXL_ERR_BACKEND;
+    }
+    channel = data->terminalEventChannel_.get();
+    return NIXL_SUCCESS;
+}
+
+nixl_status_t
+nixlAgent::getTerminalEventChannelFd(const nixlTerminalEventChannelH *channel,
+                                     int &fd) const {
+    fd = -1;
+    NIXL_SHARED_LOCK_GUARD(data->lock);
+    if (channel == nullptr || data->terminalEventChannel_.get() != channel ||
+        channel->ownerIdentity_ != data->identity_) {
+        return NIXL_ERR_INVALID_PARAM;
+    }
+    fd = channel->channel_.fileno();
+    return fd >= 0 ? NIXL_SUCCESS : NIXL_ERR_BACKEND;
+}
+
+nixl_status_t
+nixlAgent::drainTerminalEvents(nixlTerminalEventChannelH *channel,
+                               nixl_terminal_event_batch_t &batch) const {
+    NIXL_SHARED_LOCK_GUARD(data->lock);
+    if (channel == nullptr || data->terminalEventChannel_.get() != channel ||
+        channel->ownerIdentity_ != data->identity_) {
+        return NIXL_ERR_INVALID_PARAM;
+    }
+
+    const nixl::terminal_event_batch_t native_batch = channel->channel_.drain();
+    nixl_terminal_event_batch_t result;
+    result.events.reserve(native_batch.events.size());
+    for (const nixl::terminal_event_t &event : native_batch.events) {
+        result.events.push_back(toPublicEvent(event));
+    }
+    nixlBackendEventSubscriptionInventory backend_inventory;
+    for (const auto &[identity, subscription] : data->terminalSubscriptions_) {
+        static_cast<void>(identity);
+        addBackendInventory(backend_inventory, subscription->backendInventory());
+    }
+    result.wakeCount = native_batch.wakeCount;
+    result.inventory = toPublicInventory(
+        native_batch.inventory, data->terminalSubscriptions_.size(), backend_inventory);
+    batch = std::move(result);
+    return NIXL_SUCCESS;
+}
+
+nixl_status_t
+nixlAgent::queryTerminalEventChannel(
+    const nixlTerminalEventChannelH *channel,
+    nixl_terminal_channel_inventory_t &inventory) const {
+    NIXL_SHARED_LOCK_GUARD(data->lock);
+    if (channel == nullptr || data->terminalEventChannel_.get() != channel ||
+        channel->ownerIdentity_ != data->identity_) {
+        return NIXL_ERR_INVALID_PARAM;
+    }
+    nixlBackendEventSubscriptionInventory backend_inventory;
+    for (const auto &[identity, subscription] : data->terminalSubscriptions_) {
+        static_cast<void>(identity);
+        addBackendInventory(backend_inventory, subscription->backendInventory());
+    }
+    inventory = toPublicInventory(
+        channel->channel_.inventory(), data->terminalSubscriptions_.size(), backend_inventory);
+    return NIXL_SUCCESS;
+}
+
+nixl_status_t
+nixlAgent::getTerminalEventSubscriptionCount(
+    const nixlTerminalEventChannelH *channel,
+    size_t &count) const {
+    count = 0;
+    NIXL_SHARED_LOCK_GUARD(data->lock);
+    if (channel == nullptr || data->terminalEventChannel_.get() != channel ||
+        channel->ownerIdentity_ != data->identity_) {
+        return NIXL_ERR_INVALID_PARAM;
+    }
+    count = data->terminalSubscriptions_.size();
+    return NIXL_SUCCESS;
+}
+
+nixl_status_t
+nixlAgent::closeTerminalEventChannel(nixlTerminalEventChannelH *channel) const {
+    NIXL_LOCK_GUARD(data->lock);
+    if (channel == nullptr || data->terminalEventChannel_.get() != channel ||
+        channel->ownerIdentity_ != data->identity_) {
+        return NIXL_ERR_INVALID_PARAM;
+    }
+
+    const nixl::terminal_channel_close_result_t result = channel->channel_.close();
+    return result == nixl::terminal_channel_close_result_t::ACTIVE_SUBSCRIPTIONS ?
+        NIXL_ERR_NOT_ALLOWED : NIXL_SUCCESS;
+}
+
+nixl_status_t
+nixlAgent::subscribeXferTerminal(
+    nixlTerminalEventChannelH *channel,
+    nixlXferReqH *req_hndl,
+    uint64_t owner_cookie,
+    nixlTerminalEventSubscriptionH *&subscription) {
+    subscription = nullptr;
+    if (owner_cookie == 0) {
+        return NIXL_ERR_INVALID_PARAM;
+    }
+
+    NIXL_LOCK_GUARD(data->lock);
+    if (channel == nullptr || data->terminalEventChannel_.get() != channel ||
+        channel->ownerIdentity_ != data->identity_ || req_hndl == nullptr ||
+        data->ownedXferHandles_.count(req_hndl) == 0) {
+        return NIXL_ERR_INVALID_PARAM;
+    }
+    const nixl_status_t handle_status = validateXferRemoteHandleLocked(req_hndl);
+    if (handle_status != NIXL_SUCCESS) {
+        return handle_status;
+    }
+
+    nixl_xfer_attestation_t attestation;
+    nixl_status_t status =
+        req_hndl->engine->queryXferAttestation(req_hndl->backendHandle, attestation);
+    if (status != NIXL_SUCCESS) {
+        return status;
+    }
+    if (attestation.handleIdentity == 0 ||
+        attestation.generation == std::numeric_limits<uint64_t>::max()) {
+        return NIXL_ERR_NOT_ALLOWED;
+    }
+    status = validateXferAttestationLocked(req_hndl, attestation);
+    if (status != NIXL_SUCCESS) {
+        return status;
+    }
+
+    const nixlBackendTransferEventBinding binding{
+        .handleIdentity = attestation.handleIdentity,
+        .generation = attestation.generation + 1,
+    };
+    for (const auto &[identity, candidate] : data->terminalSubscriptions_) {
+        static_cast<void>(identity);
+        const nixl_terminal_subscription_info_t candidate_info = candidate->snapshot();
+        if (candidate_info.active &&
+            candidate_info.kind == nixl_terminal_event_kind_t::TRANSFER &&
+            candidate->backend_ == req_hndl->engine &&
+            candidate_info.identity == binding.handleIdentity &&
+            candidate_info.generation == binding.generation) {
+            return NIXL_ERR_NOT_ALLOWED;
+        }
+    }
+
+    const std::shared_ptr<nixl::terminalEventChannel::subscription> channel_subscription =
+        channel->channel_.subscribe({
+            .kind = nixl::terminal_event_kind_t::TRANSFER,
+            .ownerCookie = owner_cookie,
+            .identity = binding.handleIdentity,
+            .generation = binding.generation,
+        });
+    if (channel_subscription == nullptr) {
+        return NIXL_ERR_NOT_ALLOWED;
+    }
+    const auto adapter =
+        std::make_shared<nixlTerminalTransferAdapter>(binding, channel_subscription);
+    std::unique_ptr<nixlBackendEventSubscription> backend_subscription;
+    status = req_hndl->engine->subscribeXferTerminal(
+        req_hndl->backendHandle, binding, adapter, backend_subscription);
+    if (status != NIXL_SUCCESS || backend_subscription == nullptr) {
+        adapter->release();
+        return status == NIXL_SUCCESS ? NIXL_ERR_BACKEND : status;
+    }
+
+    const uint64_t subscription_identity =
+        allocateIdentity(next_terminal_subscription_identity);
+    nixl_terminal_subscription_info_t info{
+        .kind = nixl_terminal_event_kind_t::TRANSFER,
+        .ownerCookie = owner_cookie,
+        .identity = binding.handleIdentity,
+        .generation = binding.generation,
+        .active = true,
+    };
+    auto handle = std::shared_ptr<nixlTerminalEventSubscriptionH>(
+        new nixlTerminalEventSubscriptionH(
+            data->identity_,
+            subscription_identity,
+            info,
+            req_hndl->engine,
+            req_hndl,
+            std::move(backend_subscription),
+            adapter));
+    subscription = handle.get();
+    adapter->bindTerminalCallback([weak_handle = std::weak_ptr(handle)]() noexcept {
+        if (const std::shared_ptr<nixlTerminalEventSubscriptionH> retained =
+                weak_handle.lock();
+            retained != nullptr) {
+            retained->markTerminal();
+        }
+    });
+    data->ownedTerminalSubscriptions_.emplace(subscription, subscription_identity);
+    data->terminalSubscriptions_.emplace(subscription_identity, std::move(handle));
+    return NIXL_SUCCESS;
+}
+
+nixl_status_t
+nixlAgent::subscribeRemoteNotificationState(
+    nixlTerminalEventChannelH *channel,
+    const nixlRemoteAgentH *remote_agent,
+    const nixlBackendH *backend,
+    uint64_t owner_cookie,
+    nixlTerminalEventSubscriptionH *&subscription) {
+    subscription = nullptr;
+    if (owner_cookie == 0) {
+        return NIXL_ERR_INVALID_PARAM;
+    }
+
+    NIXL_LOCK_GUARD(data->lock);
+    if (channel == nullptr || data->terminalEventChannel_.get() != channel ||
+        channel->ownerIdentity_ != data->identity_ || backend == nullptr) {
+        return NIXL_ERR_INVALID_PARAM;
+    }
+    const nixl_status_t remote_status = data->validateRemoteHandle(remote_agent);
+    if (remote_status != NIXL_SUCCESS) {
+        return remote_status;
+    }
+
+    const auto backend_handle = data->backendHandles_.find(backend->getType());
+    if (backend_handle == data->backendHandles_.end() ||
+        backend_handle->second.get() != backend) {
+        return NIXL_ERR_INVALID_PARAM;
+    }
+    nixlBackendEngine *const engine = backend->engine;
+    const auto binding = remote_agent->bindings_.find(engine);
+    if (binding == remote_agent->bindings_.end()) {
+        return NIXL_ERR_NOT_SUPPORTED;
+    }
+
+    for (const auto &[identity, candidate] : data->terminalSubscriptions_) {
+        static_cast<void>(identity);
+        const nixl_terminal_subscription_info_t candidate_info = candidate->snapshot();
+        if (candidate_info.active &&
+            candidate_info.kind == nixl_terminal_event_kind_t::CAPABILITY &&
+            candidate->backend_ == engine &&
+            candidate_info.identity == remote_agent->identity_ &&
+            candidate_info.generation == remote_agent->generation_) {
+            return NIXL_ERR_NOT_ALLOWED;
+        }
+    }
+
+    const std::shared_ptr<nixl::terminalEventChannel::subscription> channel_subscription =
+        channel->channel_.subscribe({
+            .kind = nixl::terminal_event_kind_t::CAPABILITY,
+            .ownerCookie = owner_cookie,
+            .identity = remote_agent->identity_,
+            .generation = remote_agent->generation_,
+        });
+    if (channel_subscription == nullptr) {
+        return NIXL_ERR_NOT_ALLOWED;
+    }
+    const auto adapter = std::make_shared<nixlTerminalCapabilityAdapter>(
+        remote_agent->identity_, remote_agent->generation_, channel_subscription);
+    std::unique_ptr<nixlBackendEventSubscription> backend_subscription;
+    const nixl_status_t status = engine->subscribeRemoteNotificationState(
+        binding->second, adapter, backend_subscription);
+    if (status != NIXL_SUCCESS || backend_subscription == nullptr) {
+        adapter->release();
+        return status == NIXL_SUCCESS ? NIXL_ERR_BACKEND : status;
+    }
+
+    const uint64_t subscription_identity =
+        allocateIdentity(next_terminal_subscription_identity);
+    nixl_terminal_subscription_info_t info{
+        .kind = nixl_terminal_event_kind_t::CAPABILITY,
+        .ownerCookie = owner_cookie,
+        .identity = remote_agent->identity_,
+        .generation = remote_agent->generation_,
+        .active = true,
+    };
+    auto handle = std::shared_ptr<nixlTerminalEventSubscriptionH>(
+        new nixlTerminalEventSubscriptionH(
+            data->identity_,
+            subscription_identity,
+            info,
+            engine,
+            std::move(backend_subscription),
+            adapter));
+    subscription = handle.get();
+    adapter->bindTerminalCallback([weak_handle = std::weak_ptr(handle)]() noexcept {
+        if (const std::shared_ptr<nixlTerminalEventSubscriptionH> retained =
+                weak_handle.lock();
+            retained != nullptr) {
+            retained->markTerminal();
+        }
+    });
+    data->ownedTerminalSubscriptions_.emplace(subscription, subscription_identity);
+    data->terminalSubscriptions_.emplace(subscription_identity, std::move(handle));
+    return NIXL_SUCCESS;
+}
+
+nixl_status_t
+nixlAgent::queryTerminalEventSubscription(
+    const nixlTerminalEventSubscriptionH *subscription,
+    nixl_terminal_subscription_info_t &info) const {
+    NIXL_SHARED_LOCK_GUARD(data->lock);
+    if (subscription == nullptr ||
+        data->ownedTerminalSubscriptions_.count(subscription) == 0 ||
+        subscription->ownerIdentity_ != data->identity_) {
+        return NIXL_ERR_INVALID_PARAM;
+    }
+    info = subscription->snapshot();
+    return NIXL_SUCCESS;
+}
+
+nixl_status_t
+nixlAgent::releaseTerminalEventSubscription(
+    nixlTerminalEventSubscriptionH *subscription) {
+    std::shared_ptr<nixlTerminalEventSubscriptionH> retained;
+    uint64_t subscription_identity = 0;
+    {
+        NIXL_LOCK_GUARD(data->lock);
+        const auto owned = data->ownedTerminalSubscriptions_.find(subscription);
+        if (subscription == nullptr || owned == data->ownedTerminalSubscriptions_.end() ||
+            subscription->ownerIdentity_ != data->identity_) {
+            return NIXL_ERR_INVALID_PARAM;
+        }
+        subscription_identity = owned->second;
+        retained = data->terminalSubscriptions_.at(subscription_identity);
+    }
+
+    const nixl_status_t status = retained->requestCancellation();
+    if (status != NIXL_SUCCESS) {
+        return status;
+    }
+
+    {
+        NIXL_LOCK_GUARD(data->lock);
+        data->ownedTerminalSubscriptions_.erase(subscription);
+        data->terminalSubscriptions_.erase(subscription_identity);
+    }
+    return NIXL_SUCCESS;
+}
+
+nixl_status_t
 nixlAgent::getXferTelemetry(const nixlXferReqH *req_hndl, nixl_xfer_telem_t &telemetry) const {
 
     NIXL_SHARED_LOCK_GUARD(data->lock);
@@ -1589,7 +2032,16 @@ nixlAgent::takeXferCompletionAttestation(nixlXferReqH *req_hndl,
 nixl_status_t
 nixlAgent::releaseXferReq(nixlXferReqH *req_hndl) const {
 
-    NIXL_SHARED_LOCK_GUARD(data->lock);
+    NIXL_LOCK_GUARD(data->lock);
+    if (req_hndl == nullptr || data->ownedXferHandles_.count(req_hndl) == 0) {
+        return NIXL_ERR_INVALID_PARAM;
+    }
+    for (const auto &[identity, subscription] : data->terminalSubscriptions_) {
+        static_cast<void>(identity);
+        if (subscription->request_ == req_hndl) {
+            return NIXL_ERR_NOT_ALLOWED;
+        }
+    }
     //attempt to cancel request
     if(req_hndl->status == NIXL_IN_PROG) {
         req_hndl->status = req_hndl->engine->checkXfer(
@@ -1611,6 +2063,7 @@ nixlAgent::releaseXferReq(nixlXferReqH *req_hndl) const {
             req_hndl->backendHandle = nullptr;
         }
     }
+    data->ownedXferHandles_.erase(req_hndl);
     delete req_hndl;
     return NIXL_SUCCESS;
 }
