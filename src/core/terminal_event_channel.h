@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -95,6 +96,8 @@ class terminalEventChannel {
 public:
     class subscription {
     public:
+        using authority_commit_t = std::function<void()>;
+
         subscription(const subscription &) = delete;
         subscription &
         operator=(const subscription &) = delete;
@@ -108,11 +111,26 @@ public:
                           std::uint64_t epoch,
                           std::uint64_t native_timestamp_ns = 0) noexcept;
 
+        [[nodiscard]] terminal_event_publish_result_t
+        publishTransferAuthoritative(nixl_status_t status,
+                                     std::uint64_t native_timestamp_ns,
+                                     authority_commit_t authority_commit) noexcept;
+
+        [[nodiscard]] terminal_event_publish_result_t
+        publishCapabilityAuthoritative(terminal_capability_state_t capability_state,
+                                       std::uint64_t epoch,
+                                       std::uint64_t native_timestamp_ns,
+                                       bool terminal_on_success,
+                                       authority_commit_t authority_commit) noexcept;
+
         void
         release() noexcept;
 
         void
         failInvalidPublication() noexcept;
+
+        void
+        failInvalidPublicationAuthoritative(authority_commit_t authority_commit) noexcept;
 
     private:
         subscription(std::shared_ptr<terminalEventChannelState> state,
