@@ -191,6 +191,64 @@ testCapacityAndExpiryFailureAreFatal() {
 }
 
 void
+testFatalCallbackCanInspectOwner() {
+    terminal_deadline_owner_t *observed_owner = nullptr;
+    std::promise<void> callback_completed_promise;
+    std::future<void> callback_completed = callback_completed_promise.get_future();
+    terminal_deadline_owner_t owner(1, [&](nixl_status_t status) {
+        require(status == NIXL_ERR_BACKEND, "fatal callback changed exact status");
+        require(observed_owner != nullptr, "fatal callback ran before owner publication");
+        const terminal_deadline_snapshot_t snapshot = observed_owner->snapshot();
+        require(snapshot.inventory.fatalStatus == NIXL_ERR_BACKEND &&
+                    snapshot.inventory.active == 1 && snapshot.activeKeys.size() == 1,
+                "fatal callback could not inspect exact owner inventory");
+        require(observed_owner->fatalStatus() == NIXL_ERR_BACKEND,
+                "fatal callback could not query owner status");
+        callback_completed_promise.set_value();
+    });
+    observed_owner = &owner;
+    const std::uint64_t anchor = terminal_deadline_owner_t::monotonicTimestampNs();
+    require(owner.arm(key(30), anchor, 1'000'000'000, [](const auto &) { return NIXL_SUCCESS; }) ==
+                terminal_deadline_status_t::SUCCESS,
+            "fatal callback fixture registration failed");
+    require(owner.arm(key(31), anchor, 1'000'000'000, [](const auto &) { return NIXL_SUCCESS; }) ==
+                terminal_deadline_status_t::CAPACITY_EXCEEDED,
+            "fatal callback fixture did not fail at capacity");
+    require(callback_completed.wait_for(2s) == std::future_status::ready,
+            "fatal callback deadlocked while inspecting its owner");
+    require(owner.close() == NIXL_ERR_BACKEND,
+            "fatal callback fixture closed without its sticky failure");
+
+    terminal_deadline_owner_t *reactor_owner = nullptr;
+    std::promise<void> reactor_callback_completed_promise;
+    std::future<void> reactor_callback_completed = reactor_callback_completed_promise.get_future();
+    terminal_deadline_owner_t owner_thread_failure(1, [&](nixl_status_t status) {
+        require(status == NIXL_ERR_NOT_ALLOWED, "reactor fatal callback changed exact status");
+        require(reactor_owner != nullptr, "reactor fatal callback ran before owner publication");
+        const terminal_deadline_snapshot_t snapshot = reactor_owner->snapshot();
+        require(snapshot.inventory.fatalStatus == NIXL_ERR_NOT_ALLOWED &&
+                    snapshot.inventory.active == 1 && snapshot.activeKeys.size() == 1,
+                "reactor fatal callback could not inspect exact owner inventory");
+        reactor_callback_completed_promise.set_value();
+    });
+    reactor_owner = &owner_thread_failure;
+    const terminal_deadline_key_t reactor_key = key(32);
+    require(owner_thread_failure.arm(reactor_key,
+                                     terminal_deadline_owner_t::monotonicTimestampNs(),
+                                     10'000'000,
+                                     [](const auto &) { return NIXL_ERR_NOT_ALLOWED; }) ==
+                terminal_deadline_status_t::SUCCESS,
+            "reactor fatal callback fixture registration failed");
+    require(reactor_callback_completed.wait_for(2s) == std::future_status::ready,
+            "reactor fatal callback deadlocked while inspecting its owner");
+    require(owner_thread_failure.acknowledgeExpiry(reactor_key) ==
+                terminal_deadline_status_t::SUCCESS,
+            "reactor fatal callback fixture did not drain its claimed expiry");
+    require(owner_thread_failure.close() == NIXL_ERR_NOT_ALLOWED,
+            "reactor fatal callback fixture closed without its sticky failure");
+}
+
+void
 testRetirementAndExpiryHaveOneWinner() {
     constexpr std::size_t population = 256;
     terminal_deadline_owner_t owner(population);
@@ -302,6 +360,7 @@ main() {
         testExactExpiryAndNoReset();
         testRetirementWinsBeforeExpiry();
         testCapacityAndExpiryFailureAreFatal();
+        testFatalCallbackCanInspectOwner();
         testRetirementAndExpiryHaveOneWinner();
         testShutdownWaitsForForcedExpiryDispatch();
     }

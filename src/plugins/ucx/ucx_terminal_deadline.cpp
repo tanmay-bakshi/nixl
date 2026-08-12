@@ -82,6 +82,14 @@ terminal_deadline_owner_t::~terminal_deadline_owner_t() {
     static_cast<void>(::close(controlFd_));
 }
 
+terminal_deadline_owner_t::fatal_dispatch_guard_t::fatal_dispatch_guard_t(
+    terminal_deadline_owner_t &owner) noexcept
+    : owner_(owner) {}
+
+terminal_deadline_owner_t::fatal_dispatch_guard_t::~fatal_dispatch_guard_t() {
+    owner_.dispatchFatalNotification();
+}
+
 std::size_t
 terminal_deadline_owner_t::key_hash_t::operator()(
     const terminal_deadline_key_t &key) const noexcept {
@@ -107,6 +115,7 @@ terminal_deadline_owner_t::arm(const terminal_deadline_key_t &key,
                                std::uint64_t anchor_ns,
                                std::uint64_t timeout_ns,
                                expiry_t expiry) {
+    fatal_dispatch_guard_t fatal_dispatch(*this);
     if (key.handleIdentity == 0 || key.generation == 0 || anchor_ns == 0 || timeout_ns == 0 ||
         timeout_ns > std::numeric_limits<std::uint64_t>::max() - anchor_ns || !expiry) {
         return terminal_deadline_status_t::INVALID_ARGUMENT;
@@ -150,6 +159,7 @@ terminal_deadline_owner_t::arm(const terminal_deadline_key_t &key,
 
 terminal_deadline_status_t
 terminal_deadline_owner_t::retire(const terminal_deadline_key_t &key) {
+    fatal_dispatch_guard_t fatal_dispatch(*this);
     if (key.handleIdentity == 0 || key.generation == 0) {
         return terminal_deadline_status_t::INVALID_ARGUMENT;
     }
@@ -220,6 +230,7 @@ terminal_deadline_owner_t::acknowledgeExpiry(const terminal_deadline_key_t &key)
 
 nixl_status_t
 terminal_deadline_owner_t::beginShutdown() noexcept {
+    fatal_dispatch_guard_t fatal_dispatch(*this);
     std::unique_lock lock(mutex_);
     accepting_ = false;
     if (fatalStatus_ != NIXL_SUCCESS) {
@@ -260,6 +271,7 @@ nixl_status_t
 terminal_deadline_owner_t::close() noexcept {
     bool join = false;
     {
+        fatal_dispatch_guard_t fatal_dispatch(*this);
         const std::lock_guard lock(mutex_);
         accepting_ = false;
         if (!closing_) {
@@ -341,14 +353,30 @@ terminal_deadline_status_t
 terminal_deadline_owner_t::failLocked(nixl_status_t status) noexcept {
     if (fatalStatus_ == NIXL_SUCCESS) {
         fatalStatus_ = status < NIXL_SUCCESS ? status : NIXL_ERR_BACKEND;
+        if (fatal_) {
+            fatalNotificationPending_ = true;
+        }
     }
     accepting_ = false;
-    if (!fatalNotified_ && fatal_) {
-        fatalNotified_ = true;
-        fatal_(fatalStatus_);
-    }
     stateChanged_.notify_all();
     return terminal_deadline_status_t::OWNER_FAILED;
+}
+
+void
+terminal_deadline_owner_t::dispatchFatalNotification() noexcept {
+    nixl_status_t status = NIXL_SUCCESS;
+    {
+        const std::lock_guard lock(mutex_);
+        if (!fatalNotificationPending_ || fatalNotified_) {
+            return;
+        }
+        fatalNotificationPending_ = false;
+        fatalNotified_ = true;
+        status = fatalStatus_;
+    }
+    // The callback may inspect lifecycle inventory, so it must never execute
+    // while the owner mutex is held.
+    fatal_(status);
 }
 
 bool
@@ -440,12 +468,14 @@ terminal_deadline_owner_t::run() noexcept {
         expired.reserve(capacity_);
     }
     catch (const std::bad_alloc &) {
+        fatal_dispatch_guard_t fatal_dispatch(*this);
         const std::lock_guard lock(mutex_);
         ownerAlive_ = false;
         static_cast<void>(failLocked(NIXL_ERR_BACKEND));
         return;
     }
     {
+        fatal_dispatch_guard_t fatal_dispatch(*this);
         const std::lock_guard lock(mutex_);
         ownerAlive_ = true;
         if (!programTimerLocked()) {
@@ -458,6 +488,7 @@ terminal_deadline_owner_t::run() noexcept {
         {.fd = timerFd_, .events = POLLIN, .revents = 0},
     };
     while (true) {
+        fatal_dispatch_guard_t fatal_dispatch(*this);
         const int status = poll(descriptors, 2, -1);
         if (status < 0 && errno == EINTR) {
             continue;

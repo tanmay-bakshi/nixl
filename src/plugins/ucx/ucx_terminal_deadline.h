@@ -5,9 +5,9 @@
 #ifndef NIXL_SRC_PLUGINS_UCX_UCX_TERMINAL_DEADLINE_H
 #define NIXL_SRC_PLUGINS_UCX_UCX_TERMINAL_DEADLINE_H
 
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
-#include <condition_variable>
 #include <functional>
 #include <mutex>
 #include <queue>
@@ -101,6 +101,19 @@ public:
     monotonicTimestampNs() noexcept;
 
 private:
+    class fatal_dispatch_guard_t final {
+    public:
+        explicit fatal_dispatch_guard_t(terminal_deadline_owner_t &owner) noexcept;
+        ~fatal_dispatch_guard_t();
+
+        fatal_dispatch_guard_t(const fatal_dispatch_guard_t &) = delete;
+        fatal_dispatch_guard_t &
+        operator=(const fatal_dispatch_guard_t &) = delete;
+
+    private:
+        terminal_deadline_owner_t &owner_;
+    };
+
     struct key_hash_t {
         [[nodiscard]] std::size_t
         operator()(const terminal_deadline_key_t &key) const noexcept;
@@ -140,6 +153,8 @@ private:
 
     [[nodiscard]] terminal_deadline_status_t
     failLocked(nixl_status_t status) noexcept;
+    void
+    dispatchFatalNotification() noexcept;
     [[nodiscard]] bool
     findResolutionLocked(const terminal_deadline_key_t &key,
                          resolution_t &resolution) const noexcept;
@@ -169,6 +184,7 @@ private:
     std::uint64_t retired_ = 0;
     std::size_t expiryCallbacksInFlight_ = 0;
     nixl_status_t fatalStatus_ = NIXL_SUCCESS;
+    bool fatalNotificationPending_ = false;
     bool fatalNotified_ = false;
     bool accepting_ = true;
     bool closing_ = false;
