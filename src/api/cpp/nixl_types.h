@@ -466,8 +466,12 @@ using nixl_terminal_event_t = nixlTerminalEvent;
  */
 struct nixlTerminalChannelInventory {
     size_t capacity = 0;
-    size_t queuedEvents = 0;
-    size_t activeSubscriptions = 0;
+    size_t queuedChannelEvents = 0;
+    size_t activeChannelSubscriptions = 0;
+    size_t retainedPublicSubscriptions = 0;
+    size_t backendProducers = 0;
+    size_t activeCallbackSlots = 0;
+    size_t queuedOwnerContinuations = 0;
     bool acceptingSubscriptions = false;
     bool closed = false;
     nixl_terminal_channel_fatal_t fatal = nixl_terminal_channel_fatal_t::NONE;

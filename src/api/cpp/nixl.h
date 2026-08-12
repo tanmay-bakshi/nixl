@@ -441,7 +441,11 @@ class nixlAgent {
             nixl_terminal_subscription_info_t &info) const;
 
         /**
-         * @brief Cancel and release an exact autonomous subscription.
+         * @brief Cancel or release an exact autonomous subscription.
+         *
+         * Active transfer cancellation retains the subscription until its exact terminal event.
+         * NIXL_IN_PROG requires a later release call after that event is drained. An already
+         * terminal subscription is destroyed immediately.
          */
         nixl_status_t
         releaseTerminalEventSubscription(nixlTerminalEventSubscriptionH *subscription);

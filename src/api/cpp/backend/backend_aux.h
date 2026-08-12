@@ -17,6 +17,7 @@
 #ifndef __BACKEND_AUX_H_
 #define __BACKEND_AUX_H_
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -107,6 +108,15 @@ public:
 };
 
 /**
+ * @brief Per-subscription native lifecycle inventory.
+ */
+struct nixlBackendEventSubscriptionInventory {
+    size_t backendProducers = 0;
+    size_t activeCallbackSlots = 0;
+    size_t queuedOwnerContinuations = 0;
+};
+
+/**
  * @brief Backend-owned lifetime for an autonomous event subscription.
  */
 class nixlBackendEventSubscription {
@@ -115,6 +125,11 @@ public:
 
     virtual nixl_status_t
     cancel() noexcept = 0;
+
+    virtual void
+    queryInventory(nixlBackendEventSubscriptionInventory &inventory) const noexcept {
+        inventory = {};
+    }
 };
 
 

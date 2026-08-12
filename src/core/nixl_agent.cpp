@@ -92,16 +92,31 @@ toPublicCapabilityState(nixl::terminal_capability_state_t state) noexcept {
 }
 
 [[nodiscard]] nixl_terminal_channel_inventory_t
-toPublicInventory(const nixl::terminal_channel_inventory_t &inventory) noexcept {
+toPublicInventory(
+    const nixl::terminal_channel_inventory_t &inventory,
+    size_t retained_public_subscriptions,
+    const nixlBackendEventSubscriptionInventory &backend_inventory) noexcept {
     return {
         .capacity = inventory.capacity,
-        .queuedEvents = inventory.queuedEvents,
-        .activeSubscriptions = inventory.activeSubscriptions,
+        .queuedChannelEvents = inventory.queuedEvents,
+        .activeChannelSubscriptions = inventory.activeSubscriptions,
+        .retainedPublicSubscriptions = retained_public_subscriptions,
+        .backendProducers = backend_inventory.backendProducers,
+        .activeCallbackSlots = backend_inventory.activeCallbackSlots,
+        .queuedOwnerContinuations = backend_inventory.queuedOwnerContinuations,
         .acceptingSubscriptions = inventory.acceptingSubscriptions,
         .closed = inventory.closed,
         .fatal = static_cast<nixl_terminal_channel_fatal_t>(inventory.health.fatal),
         .eventfdError = inventory.health.eventfdError,
     };
+}
+
+void
+addBackendInventory(nixlBackendEventSubscriptionInventory &aggregate,
+                    const nixlBackendEventSubscriptionInventory &inventory) noexcept {
+    aggregate.backendProducers += inventory.backendProducers;
+    aggregate.activeCallbackSlots += inventory.activeCallbackSlots;
+    aggregate.queuedOwnerContinuations += inventory.queuedOwnerContinuations;
 }
 
 [[nodiscard]] nixl_terminal_event_t
@@ -435,16 +450,12 @@ nixlAgent::~nixlAgent() {
     }
     for (const std::shared_ptr<nixlTerminalEventSubscriptionH> &subscription :
          terminal_subscriptions) {
-        std::unique_ptr<nixlBackendEventSubscription> backend_subscription =
-            subscription->takeBackendSubscription();
-        if (backend_subscription != nullptr) {
-            const nixl_status_t status = backend_subscription->cancel();
-            if (status != NIXL_SUCCESS) {
-                NIXL_WARN << "Failed to cancel terminal subscription during agent destruction: "
-                          << status;
-            }
+        const nixl_status_t status = subscription->requestCancellation();
+        if (status != NIXL_SUCCESS) {
+            NIXL_WARN << "Terminal subscription did not drain during agent destruction: "
+                      << status;
         }
-        subscription->finishRelease();
+        subscription->markTerminal();
     }
 
     NIXL_LOCK_GUARD(data->lock);
@@ -1630,8 +1641,14 @@ nixlAgent::drainTerminalEvents(nixlTerminalEventChannelH *channel,
     for (const nixl::terminal_event_t &event : native_batch.events) {
         result.events.push_back(toPublicEvent(event));
     }
+    nixlBackendEventSubscriptionInventory backend_inventory;
+    for (const auto &[identity, subscription] : data->terminalSubscriptions_) {
+        static_cast<void>(identity);
+        addBackendInventory(backend_inventory, subscription->backendInventory());
+    }
     result.wakeCount = native_batch.wakeCount;
-    result.inventory = toPublicInventory(native_batch.inventory);
+    result.inventory = toPublicInventory(
+        native_batch.inventory, data->terminalSubscriptions_.size(), backend_inventory);
     batch = std::move(result);
     return NIXL_SUCCESS;
 }
@@ -1645,7 +1662,13 @@ nixlAgent::queryTerminalEventChannel(
         channel->ownerIdentity_ != data->identity_) {
         return NIXL_ERR_INVALID_PARAM;
     }
-    inventory = toPublicInventory(channel->channel_.inventory());
+    nixlBackendEventSubscriptionInventory backend_inventory;
+    for (const auto &[identity, subscription] : data->terminalSubscriptions_) {
+        static_cast<void>(identity);
+        addBackendInventory(backend_inventory, subscription->backendInventory());
+    }
+    inventory = toPublicInventory(
+        channel->channel_.inventory(), data->terminalSubscriptions_.size(), backend_inventory);
     return NIXL_SUCCESS;
 }
 
@@ -1768,14 +1791,11 @@ nixlAgent::subscribeXferTerminal(
             std::move(backend_subscription),
             adapter));
     subscription = handle.get();
-    if (adapter->isTerminal()) {
-        handle->finishRelease();
-    }
     adapter->bindTerminalCallback([weak_handle = std::weak_ptr(handle)]() noexcept {
         if (const std::shared_ptr<nixlTerminalEventSubscriptionH> retained =
                 weak_handle.lock();
             retained != nullptr) {
-            retained->finishRelease();
+            retained->markTerminal();
         }
     });
     data->ownedTerminalSubscriptions_.emplace(subscription, subscription_identity);
@@ -1866,14 +1886,11 @@ nixlAgent::subscribeRemoteNotificationState(
             std::move(backend_subscription),
             adapter));
     subscription = handle.get();
-    if (adapter->isTerminal()) {
-        handle->finishRelease();
-    }
     adapter->bindTerminalCallback([weak_handle = std::weak_ptr(handle)]() noexcept {
         if (const std::shared_ptr<nixlTerminalEventSubscriptionH> retained =
                 weak_handle.lock();
             retained != nullptr) {
-            retained->finishRelease();
+            retained->markTerminal();
         }
     });
     data->ownedTerminalSubscriptions_.emplace(subscription, subscription_identity);
@@ -1911,16 +1928,10 @@ nixlAgent::releaseTerminalEventSubscription(
         retained = data->terminalSubscriptions_.at(subscription_identity);
     }
 
-    std::unique_ptr<nixlBackendEventSubscription> backend_subscription =
-        retained->takeBackendSubscription();
-    if (backend_subscription != nullptr) {
-        const nixl_status_t status = backend_subscription->cancel();
-        if (status != NIXL_SUCCESS) {
-            retained->restoreBackendSubscription(std::move(backend_subscription));
-            return status;
-        }
+    const nixl_status_t status = retained->requestCancellation();
+    if (status != NIXL_SUCCESS) {
+        return status;
     }
-    retained->finishRelease();
 
     {
         NIXL_LOCK_GUARD(data->lock);
