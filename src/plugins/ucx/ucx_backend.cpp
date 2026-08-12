@@ -657,10 +657,10 @@ private:
 class nixlUcxCapabilitySubscription final : public nixlBackendEventSubscription {
 public:
     nixlUcxCapabilitySubscription(
-        nixl::ucx::notif_capability_state_t &state,
+        std::shared_ptr<nixl::ucx::notif_capability_state_t> state,
         nixl::ucx::notif_route_subscription_t subscription,
         std::shared_ptr<nixlUcxCapabilitySink> sink)
-        : state_(state),
+        : state_(std::move(state)),
           subscription_(std::move(subscription)),
           sink_(std::move(sink)) {}
 
@@ -686,7 +686,7 @@ public:
             return NIXL_SUCCESS;
         }
         const nixl_status_t status = notifSubscriptionToNixl(
-            state_.unsubscribeRemoteNotificationState(subscription_));
+            state_->unsubscribeRemoteNotificationState(subscription_));
         if (status == NIXL_SUCCESS) {
             canceled_ = true;
         }
@@ -696,7 +696,7 @@ public:
     void
     queryInventory(nixlBackendEventSubscriptionInventory &inventory) const noexcept override {
         const nixl::ucx::notif_route_subscription_inventory_t native_inventory =
-            state_.querySubscriptionInventory(subscription_);
+            state_->querySubscriptionInventory(subscription_);
         inventory = {
             .backendProducers = native_inventory.retainedSubscriptions,
             .activeCallbackSlots = native_inventory.inFlightDeliveries,
@@ -704,7 +704,7 @@ public:
     }
 
 private:
-    nixl::ucx::notif_capability_state_t &state_;
+    const std::shared_ptr<nixl::ucx::notif_capability_state_t> state_;
     const nixl::ucx::notif_route_subscription_t subscription_;
     const std::shared_ptr<nixlUcxCapabilitySink> sink_;
     mutable std::mutex mutex_;
@@ -1856,10 +1856,12 @@ nixlUcxEngine::nixlUcxEngine(const nixlBackendInitParams &init_params)
     for (const auto &worker : localConnectionMetadata_.workers) {
         local_worker_incarnations.push_back(worker.incarnation);
     }
-    notifState_ = std::make_unique<nixl::ucx::notif_capability_state_t>(
+    notifState_ = std::make_shared<nixl::ucx::notif_capability_state_t>(
         localAgentIncarnationUuid_,
         localConnectionMetadata_.backendIncarnation,
         std::move(local_worker_incarnations));
+    endpointFailureState_ =
+        std::make_shared<nixl::ucx::notif_endpoint_failure_state_t>(notifState_);
 
     notifCallbackContexts_.reserve(uws.size());
     for (size_t worker_id = 0; worker_id < uws.size(); ++worker_id) {
@@ -1997,27 +1999,6 @@ nixlUcxEngine::bindRemoteAgent(const nixlRemoteAgentBinding &binding) {
         return route_status;
     }
 
-    bool inserted_route = false;
-    {
-        const std::lock_guard lock(exactRouteMutex_);
-        const auto known = exactRoutes_.find(route.handleIdentity);
-        if (known != exactRoutes_.end()) {
-            if (known->second.route != route ||
-                known->second.remoteAgent != binding.remoteAgent ||
-                known->second.connectionIdentity != connection->getIdentity()) {
-                return NIXL_ERR_NOT_ALLOWED;
-            }
-        } else {
-            exactRoutes_.emplace(route.handleIdentity,
-                                 exactRouteRecord{
-                                     .route = route,
-                                     .remoteAgent = binding.remoteAgent,
-                                     .connectionIdentity = connection->getIdentity(),
-                                 });
-            inserted_route = true;
-        }
-    }
-
     nixl::ucx::notif_remote_binding_t remote_binding = {
         .route = route,
         .connectionIdentity = connection->getIdentity(),
@@ -2035,13 +2016,19 @@ nixlUcxEngine::bindRemoteAgent(const nixlRemoteAgentBinding &binding) {
 
     nixl::ucx::notif_route_snapshot_t snapshot;
     const nixl::ucx::notif_state_status_t bind_status =
-        notifState_->bindRemoteAgent(remote_binding, snapshot);
+        endpointFailureState_->bindRemoteAgent(
+            {
+                .route = route,
+                .remoteAgent = binding.remoteAgent,
+                .connectionIdentity = connection->getIdentity(),
+            },
+            remote_binding,
+            connection->endpointFailureObserved_,
+            snapshot);
     if (bind_status != nixl::ucx::notif_state_status_t::SUCCESS) {
-        if (inserted_route) {
-            const std::lock_guard lock(exactRouteMutex_);
-            exactRoutes_.erase(route.handleIdentity);
-        }
-        return notifStateToNixl(bind_status);
+        return connection->endpointFailureObserved() ?
+            NIXL_ERR_REMOTE_DISCONNECT :
+            notifStateToNixl(bind_status);
     }
 
     nixl::ucx::notif_wire_envelope_t offer;
@@ -2138,7 +2125,7 @@ nixlUcxEngine::subscribeRemoteNotificationState(
         return subscribe_status;
     }
     subscription = std::make_unique<nixlUcxCapabilitySubscription>(
-        *notifState_, native_subscription, adapter);
+        notifState_, native_subscription, adapter);
     return NIXL_SUCCESS;
 }
 
@@ -2164,23 +2151,33 @@ nixl_status_t nixlUcxEngine::loadRemoteConnInfo (const std::string &remote_agent
     for (size_t worker_id = 0; worker_id < uws.size(); ++worker_id) {
         const auto &remote_worker =
             conn->metadata_.workers[worker_id % conn->metadata_.workers.size()];
-        nixlUcxWorker *const worker = uws[worker_id].get();
+        const std::shared_ptr<nixl::ucx::ucx_worker_continuation_queue_t>
+            continuations = uws[worker_id]->getContinuationQueue();
         const std::weak_ptr<nixlUcxConnection> weak_connection = conn;
+        const std::shared_ptr<nixl::ucx::notif_endpoint_failure_state_t>
+            failure_state = endpointFailureState_;
         std::unique_ptr<nixlUcxEp> result = uws[worker_id]->connect(
             remote_worker.endpointAddress.data(),
             remote_worker.endpointAddress.size(),
-            [this, worker, weak_connection]() {
-                const std::shared_ptr<nixlUcxConnection> connection =
-                    weak_connection.lock();
-                if (connection == nullptr || !connection->claimFailurePublication()) {
+            [continuations, failure_state, weak_connection]() noexcept {
+                std::shared_ptr<nixlUcxConnection> connection = weak_connection.lock();
+                if (connection == nullptr || !connection->claimEndpointFailure()) {
                     return;
                 }
                 const uint64_t connection_identity = connection->getIdentity();
-                static_cast<void>(worker->enqueueContinuation(
-                    [this, connection_identity]() {
-                        failExactRoutesForConnection(connection_identity);
-                        return NIXL_SUCCESS;
-                    }));
+                const nixl_status_t enqueue_status = continuations->enqueueProducer(
+                    [failure_state,
+                     connection = std::move(connection),
+                     connection_identity]() noexcept {
+                        // Retaining the connection keeps every endpoint alive until its exact
+                        // routes have reached a terminal state.
+                        static_cast<void>(connection);
+                        return notifStateToNixl(
+                            failure_state->failRemoteConnection(connection_identity));
+                    });
+                if (enqueue_status != NIXL_SUCCESS) {
+                    static_cast<void>(continuations->fail(enqueue_status));
+                }
             });
         if (!result) {
             return NIXL_ERR_BACKEND;
@@ -3081,37 +3078,7 @@ nixlUcxEngine::getConnection(uint64_t connection_identity) const {
 std::optional<nixlUcxEngine::exactRouteRecord>
 nixlUcxEngine::getExactRoute(uint64_t handle_identity,
                              uint64_t generation) const {
-    const std::lock_guard lock(exactRouteMutex_);
-    const auto route = exactRoutes_.find(handle_identity);
-    if (route == exactRoutes_.end() ||
-        route->second.route.handleGeneration != generation) {
-        return std::nullopt;
-    }
-    return route->second;
-}
-
-void
-nixlUcxEngine::failExactRoutesForConnection(uint64_t connection_identity) noexcept {
-    std::vector<nixl::ucx::notif_route_key_t> routes;
-    {
-        const std::lock_guard lock(exactRouteMutex_);
-        for (const auto &[identity, record] : exactRoutes_) {
-            static_cast<void>(identity);
-            if (record.connectionIdentity == connection_identity) {
-                routes.push_back(record.route);
-            }
-        }
-    }
-    for (const nixl::ucx::notif_route_key_t &route : routes) {
-        const nixl::ucx::notif_state_status_t status =
-            notifState_->failRemoteAgent(route);
-        if (status != nixl::ucx::notif_state_status_t::SUCCESS &&
-            status != nixl::ucx::notif_state_status_t::ROUTE_FAILED &&
-            status != nixl::ucx::notif_state_status_t::ROUTE_RETIRED) {
-            NIXL_WARN << "Failed to publish exact-route endpoint failure for handle "
-                      << route.handleIdentity << ": " << static_cast<int>(status);
-        }
-    }
+    return endpointFailureState_->getExactRoute(handle_identity, generation);
 }
 
 nixl_status_t

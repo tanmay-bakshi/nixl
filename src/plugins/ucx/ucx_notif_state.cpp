@@ -288,7 +288,7 @@ notif_capability_state_t::retireRemoteAgent(const notif_route_key_t &route) {
         if (known == bindings_.end()) {
             return notif_state_status_t::UNKNOWN_ROUTE;
         }
-        if (known->second.retired) {
+        if (known->second.retired || known->second.failed) {
             return notif_state_status_t::SUCCESS;
         }
 
@@ -786,6 +786,89 @@ notif_capability_state_t::resolveData(const notif_wire_envelope_t &data) const {
     resolution.disposition = notif_data_disposition_t::DELIVER;
     resolution.status = notif_state_status_t::SUCCESS;
     return resolution;
+}
+
+notif_endpoint_failure_state_t::notif_endpoint_failure_state_t(
+    std::shared_ptr<notif_capability_state_t> notification_state)
+    : notificationState_(std::move(notification_state)) {
+    if (notificationState_ == nullptr) {
+        throw std::invalid_argument("endpoint failure state requires notification state");
+    }
+}
+
+notif_state_status_t
+notif_endpoint_failure_state_t::bindRemoteAgent(
+    const notif_exact_route_record_t &record,
+    const notif_remote_binding_t &binding,
+    const std::atomic<bool> &endpoint_failure_observed,
+    notif_route_snapshot_t &snapshot) {
+    if (record.remoteAgent.empty() || record.connectionIdentity == 0 ||
+        record.route != binding.route ||
+        record.connectionIdentity != binding.connectionIdentity) {
+        return notif_state_status_t::INVALID_ARGUMENT;
+    }
+
+    const std::lock_guard lock(mutex_);
+    if (endpoint_failure_observed.load(std::memory_order_acquire)) {
+        return notif_state_status_t::ROUTE_FAILED;
+    }
+
+    const auto known = exactRoutes_.find(record.route.handleIdentity);
+    bool inserted = false;
+    if (known != exactRoutes_.end()) {
+        if (known->second.route != record.route ||
+            known->second.remoteAgent != record.remoteAgent ||
+            known->second.connectionIdentity != record.connectionIdentity) {
+            return notif_state_status_t::ROUTE_CONFLICT;
+        }
+    } else {
+        exactRoutes_.emplace(record.route.handleIdentity, record);
+        inserted = true;
+    }
+
+    const notif_state_status_t status =
+        notificationState_->bindRemoteAgent(binding, snapshot);
+    if (status != notif_state_status_t::SUCCESS && inserted) {
+        exactRoutes_.erase(record.route.handleIdentity);
+    }
+    return status;
+}
+
+std::optional<notif_exact_route_record_t>
+notif_endpoint_failure_state_t::getExactRoute(
+    std::uint64_t handle_identity,
+    std::uint64_t generation) const {
+    const std::lock_guard lock(mutex_);
+    const auto route = exactRoutes_.find(handle_identity);
+    if (route == exactRoutes_.end() ||
+        route->second.route.handleGeneration != generation) {
+        return std::nullopt;
+    }
+    return route->second;
+}
+
+notif_state_status_t
+notif_endpoint_failure_state_t::failRemoteConnection(
+    std::uint64_t connection_identity) noexcept {
+    std::vector<notif_route_key_t> routes;
+    {
+        const std::lock_guard lock(mutex_);
+        for (const auto &[identity, record] : exactRoutes_) {
+            static_cast<void>(identity);
+            if (record.connectionIdentity == connection_identity) {
+                routes.push_back(record.route);
+            }
+        }
+    }
+
+    notif_state_status_t result = notif_state_status_t::SUCCESS;
+    for (const notif_route_key_t &route : routes) {
+        const notif_state_status_t status = notificationState_->failRemoteAgent(route);
+        if (status != notif_state_status_t::SUCCESS) {
+            result = status;
+        }
+    }
+    return result;
 }
 
 } // namespace nixl::ucx

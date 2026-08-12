@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
@@ -529,7 +530,7 @@ testOverflowDrainsCallbackOwnership() {
 void
 testNoProgressOwnerIsUnsupported() {
     nixlUcxContext context({},
-                           false,
+                           true,
                            1,
                            nixl_thread_sync_t::NIXL_THREAD_SYNC_STRICT,
                            0,
@@ -546,10 +547,113 @@ testNoProgressOwnerIsUnsupported() {
             "autonomous callback support appeared without a progress owner");
     require(worker.claimProgressOwner() == NIXL_SUCCESS,
             "progress owner claim failed");
+    require(state->registerChunk() == NIXL_SUCCESS &&
+                state->registerFlush() == NIXL_SUCCESS &&
+                state->completeChunk(NIXL_SUCCESS, 1) == NIXL_SUCCESS &&
+                state->sealPosting({}, 2) == NIXL_SUCCESS,
+            "claimed-owner cleanup state setup failed");
     require(worker.makeTerminalCallbackSlot(
                 state, ucx_callback_kind_t::ENDPOINT_FLUSH, slot) == NIXL_SUCCESS &&
                 slot != nullptr,
             "claimed progress owner could not allocate a stable callback slot");
+    require(slot->armPoster(nullptr, NIXL_SUCCESS, 3) == NIXL_SUCCESS &&
+                worker.drainContinuationsOnOwner() == NIXL_SUCCESS &&
+                worker.terminalLifecycleDrained(),
+            "claimed-owner callback lifecycle did not drain");
+}
+
+void
+testFailureProducerRunsOnlyOnOwner() {
+    nixlUcxContext context({},
+                           true,
+                           1,
+                           nixl_thread_sync_t::NIXL_THREAD_SYNC_STRICT,
+                           0,
+                           "TLS=self");
+    nixlUcxWorker worker(context);
+    require(worker.claimProgressOwner() == NIXL_SUCCESS,
+            "failure owner claim failed");
+
+    const std::thread::id owner_thread = std::this_thread::get_id();
+    std::thread::id execution_thread;
+    auto lifetime = std::make_shared<std::uint64_t>(37);
+    const std::weak_ptr<std::uint64_t> weak_lifetime = lifetime;
+    std::atomic<nixl_status_t> enqueue_status{NIXL_ERR_BACKEND};
+    std::thread producer([continuations = worker.getContinuationQueue(),
+                          lifetime,
+                          &enqueue_status,
+                          &execution_thread]() {
+        enqueue_status.store(
+            continuations->enqueueProducer([lifetime, &execution_thread]() noexcept {
+                execution_thread = std::this_thread::get_id();
+                return *lifetime == 37 ? NIXL_SUCCESS : NIXL_ERR_BACKEND;
+            }),
+            std::memory_order_release);
+    });
+    producer.join();
+    lifetime.reset();
+
+    require(enqueue_status.load(std::memory_order_acquire) == NIXL_SUCCESS &&
+                worker.getContinuationQueue()->producerCount() == 1 &&
+                !weak_lifetime.expired(),
+            "failure enqueue did not atomically retain producer ownership");
+    std::atomic<nixl_status_t> foreign_drain_status{NIXL_SUCCESS};
+    std::thread foreign_drain([&worker, &foreign_drain_status]() {
+        foreign_drain_status.store(
+            worker.drainContinuationsOnOwner(), std::memory_order_release);
+    });
+    foreign_drain.join();
+    require(foreign_drain_status.load(std::memory_order_acquire) ==
+                NIXL_ERR_NOT_ALLOWED &&
+                execution_thread == std::thread::id(),
+            "failure work escaped its progress owner");
+
+    require(worker.drainContinuationsOnOwner() == NIXL_SUCCESS &&
+                execution_thread == owner_thread &&
+                worker.getContinuationQueue()->producerCount() == 0 &&
+                worker.terminalLifecycleDrained() && weak_lifetime.expired(),
+            "owner did not execute and retire failure work exactly once");
+}
+
+void
+testFailureProducerOverflowDrainsOwnership() {
+    std::size_t wake_count = 0;
+    auto queue = makeQueue(1, wake_count);
+    std::size_t ordinary_runs = 0;
+    require(queue->enqueue([&ordinary_runs]() noexcept {
+                ++ordinary_runs;
+                return NIXL_SUCCESS;
+            }) == NIXL_SUCCESS,
+            "overflow setup continuation enqueue failed");
+
+    auto lifetime = std::make_shared<std::uint64_t>(41);
+    const std::weak_ptr<std::uint64_t> weak_lifetime = lifetime;
+    std::size_t failure_runs = 0;
+    require(queue->enqueueProducer([lifetime, &failure_runs]() noexcept {
+                ++failure_runs;
+                return *lifetime == 41 ? NIXL_SUCCESS : NIXL_ERR_BACKEND;
+            }) == NIXL_ERR_BACKEND,
+            "failure producer did not fail closed on queue overflow");
+    lifetime.reset();
+    require(queue->fatalStatus() == NIXL_ERR_BACKEND &&
+                queue->producerCount() == 1 && queue->size() == 2 &&
+                !weak_lifetime.expired(),
+            "overflow lost failure cleanup authority");
+    require(queue->close() == NIXL_ERR_BACKEND,
+            "teardown ignored an in-flight failure producer");
+    require(queue->drain() == 2 && ordinary_runs == 1 && failure_runs == 1 &&
+                queue->producerCount() == 0 && queue->size() == 0 &&
+                weak_lifetime.expired(),
+            "fatal drain did not conserve failure ownership");
+
+    std::size_t closed_wakes = 0;
+    auto closed_queue = makeQueue(1, closed_wakes);
+    require(closed_queue->close() == NIXL_SUCCESS,
+            "empty producer queue did not close cleanly");
+    require(closed_queue->enqueueProducer([]() noexcept { return NIXL_SUCCESS; }) ==
+                NIXL_ERR_NOT_ALLOWED &&
+                closed_queue->producerCount() == 0,
+            "pre-enqueue failure leaked producer inventory");
 }
 
 void
@@ -595,6 +699,8 @@ main() {
         testOverflowDrainsCallbackOwnership();
         testNoProgressOwnerIsUnsupported();
         testCallbackSlotAllocationFailureDoesNotRegisterProducer();
+        testFailureProducerRunsOnlyOnOwner();
+        testFailureProducerOverflowDrainsOwnership();
     }
     catch (const std::exception &error) {
         std::cerr << "ucx terminal progress test failed: " << error.what() << '\n';

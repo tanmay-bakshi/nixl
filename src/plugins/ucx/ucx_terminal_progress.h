@@ -65,6 +65,8 @@ public:
     [[nodiscard]] nixl_status_t
     enqueue(continuation_t continuation);
     [[nodiscard]] nixl_status_t
+    enqueueProducer(continuation_t continuation);
+    [[nodiscard]] nixl_status_t
     fail(nixl_status_t status);
     [[nodiscard]] nixl_status_t
     registerProducer();
@@ -86,6 +88,8 @@ public:
     size() const;
 
 private:
+    [[nodiscard]] nixl_status_t
+    enqueueImpl(continuation_t continuation, bool lifecycle_counted);
     [[nodiscard]] nixl_status_t
     failLocked(nixl_status_t status);
 

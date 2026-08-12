@@ -77,7 +77,7 @@ class nixlUcxConnection : public nixlBackendConnMD {
         const uint64_t identity_;
         const nixl::ucx::connection_metadata_t metadata_;
         std::vector<std::unique_ptr<nixlUcxEp>> eps;
-        std::atomic<bool> failurePublished_{false};
+        std::atomic<bool> endpointFailureObserved_{false};
 
     public:
         nixlUcxConnection(uint64_t identity, nixl::ucx::connection_metadata_t metadata)
@@ -98,10 +98,15 @@ class nixlUcxConnection : public nixlBackendConnMD {
         }
 
         [[nodiscard]] bool
-        claimFailurePublication() noexcept {
+        claimEndpointFailure() noexcept {
             bool expected = false;
-            return failurePublished_.compare_exchange_strong(
+            return endpointFailureObserved_.compare_exchange_strong(
                 expected, true, std::memory_order_acq_rel);
+        }
+
+        [[nodiscard]] bool
+        endpointFailureObserved() const noexcept {
+            return endpointFailureObserved_.load(std::memory_order_acquire);
         }
 
     friend class nixlUcxEngine;
@@ -354,11 +359,7 @@ private:
         size_t workerId;
     };
 
-    struct exactRouteRecord {
-        nixl::ucx::notif_route_key_t route;
-        std::string remoteAgent;
-        uint64_t connectionIdentity;
-    };
+    using exactRouteRecord = nixl::ucx::notif_exact_route_record_t;
 
     // Memory management helpers
     nixl_status_t
@@ -399,9 +400,6 @@ private:
     [[nodiscard]] std::optional<exactRouteRecord>
     getExactRoute(uint64_t handle_identity, uint64_t generation) const;
 
-    void
-    failExactRoutesForConnection(uint64_t connection_identity) noexcept;
-
     ucx_connection_ptr_t
     getConnection(const std::string &remote_agent) const;
 
@@ -437,14 +435,13 @@ private:
     nixl::ucx::connection_metadata_t localConnectionMetadata_;
     std::vector<notifCallbackContext> notifCallbackContexts_;
     nixl::ucx::notif_wire_uuid_t localAgentIncarnationUuid_;
-    std::unique_ptr<nixl::ucx::notif_capability_state_t> notifState_;
+    std::shared_ptr<nixl::ucx::notif_capability_state_t> notifState_;
+    std::shared_ptr<nixl::ucx::notif_endpoint_failure_state_t> endpointFailureState_;
     mutable std::atomic<size_t> sharedWorkerIndex_;
 
     // Map of agent name to saved nixlUcxConnection info
     mutable std::mutex connectionMutex_;
     std::unordered_map<std::string, ucx_connection_ptr_t> remoteConnMap;
-    mutable std::mutex exactRouteMutex_;
-    std::unordered_map<uint64_t, exactRouteRecord> exactRoutes_;
 };
 
 class nixlUcxThread;

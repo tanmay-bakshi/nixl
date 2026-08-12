@@ -15,6 +15,8 @@
  * limitations under the License.
  */
 
+#include <atomic>
+#include <barrier>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -26,6 +28,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -513,10 +516,8 @@ testCapabilitySubscriptionTransitions() {
 
     require(state.retireRemoteAgent(route) == notif_state_status_t::SUCCESS,
             "subscribed route retirement failed");
-    require(sink->transitions().size() == 4 &&
-                sink->transitions()[3].state == notif_route_transition_state_t::RETIRED &&
-                sink->transitions()[3].capabilityEpoch == 21,
-            "route retirement did not publish after failure");
+    require(sink->transitions().size() == 3,
+            "route retirement published a second terminal state after failure");
     require(state.unsubscribeRemoteNotificationState(subscription) ==
                     notif_route_subscription_status_t::SUCCESS &&
                 state.unsubscribeRemoteNotificationState(subscription) ==
@@ -727,6 +728,13 @@ testCapabilityEndpointFailureTransition() {
     require(state.failRemoteAgent(route) == notif_state_status_t::SUCCESS &&
                 sink->transitions().size() == 2,
             "idempotent endpoint failure published a duplicate transition");
+    require(state.retireRemoteAgent(route) == notif_state_status_t::SUCCESS &&
+                sink->transitions().size() == 2,
+            "FAILED route published a second RETIRED terminal transition");
+    require(state.queryRemoteNotificationState(route, failed_snapshot) ==
+                    notif_state_status_t::SUCCESS &&
+                failed_snapshot.state == notif_route_state_t::FAILED,
+            "retirement replaced an exact-route endpoint failure");
     const notif_route_subscription_inventory_t before_unsubscribe =
         state.querySubscriptionInventory(subscription);
     require(before_unsubscribe.retainedSubscriptions == 1 &&
@@ -763,6 +771,9 @@ testRetiredCapabilitySubscriptionInventoryDrains() {
                 sink->transitions().size() == 1 &&
                 sink->transitions()[0].state == notif_route_transition_state_t::RETIRED,
             "retirement inventory route did not publish RETIRED");
+    require(state.failRemoteAgent(route) == notif_state_status_t::SUCCESS &&
+                sink->transitions().size() == 1,
+            "RETIRED route published a second FAILED terminal transition");
     require(state.querySubscriptionInventory(subscription).retainedSubscriptions == 1,
             "terminal RETIRED route lost its retained subscription inventory");
     require(state.unsubscribeRemoteNotificationState(subscription) ==
@@ -772,6 +783,124 @@ testRetiredCapabilitySubscriptionInventoryDrains() {
         state.querySubscriptionInventory(subscription);
     require(inventory.retainedSubscriptions == 0 && inventory.inFlightDeliveries == 0,
             "terminal RETIRED route subscription survived cancellation");
+}
+
+void
+testEndpointFailureBindingRaceNeverLeavesLiveRoute() {
+    constexpr std::size_t attempts = 128;
+    for (std::size_t attempt = 0; attempt < attempts; ++attempt) {
+        const notif_wire_uuid_t local_agent = makeUuid(11);
+        const notif_wire_uuid_t local_backend = makeUuid(12);
+        const notif_wire_uuid_t local_worker = makeUuid(13);
+        const notif_wire_uuid_t remote_agent = makeUuid(14);
+        const notif_wire_uuid_t remote_backend = makeUuid(15);
+        const notif_wire_uuid_t remote_worker = makeUuid(16);
+        auto notification_state = std::make_shared<notif_capability_state_t>(
+            local_agent, local_backend, std::vector{local_worker});
+        notif_endpoint_failure_state_t failure_state(notification_state);
+        const std::uint64_t handle_identity = 2000 + attempt;
+        const std::uint64_t connection_identity = 3000 + attempt;
+        const notif_route_key_t route =
+            makeRoute(handle_identity, 1, remote_agent, remote_backend);
+        const notif_remote_binding_t binding =
+            makeBinding(route, connection_identity, {{remote_worker, 4000 + attempt}});
+        const notif_exact_route_record_t record = {
+            .route = route,
+            .remoteAgent = "peer",
+            .connectionIdentity = connection_identity,
+        };
+        std::atomic<bool> failure_observed{false};
+        std::barrier start(3);
+        notif_state_status_t bind_status = notif_state_status_t::INVALID_ARGUMENT;
+        notif_state_status_t failure_status = notif_state_status_t::INVALID_ARGUMENT;
+        notif_route_snapshot_t snapshot;
+
+        std::thread binder([&]() {
+            start.arrive_and_wait();
+            bind_status = failure_state.bindRemoteAgent(
+                record, binding, failure_observed, snapshot);
+        });
+        std::thread failure([&]() {
+            start.arrive_and_wait();
+            failure_observed.store(true, std::memory_order_release);
+            failure_status =
+                failure_state.failRemoteConnection(connection_identity);
+        });
+        start.arrive_and_wait();
+        binder.join();
+        failure.join();
+
+        require(failure_status == notif_state_status_t::SUCCESS,
+                "connection failure publication failed during bind race");
+        notif_route_snapshot_t terminal_snapshot;
+        const notif_state_status_t query_status =
+            notification_state->queryRemoteNotificationState(route, terminal_snapshot);
+        if (bind_status == notif_state_status_t::SUCCESS) {
+            require(query_status == notif_state_status_t::SUCCESS &&
+                        terminal_snapshot.state == notif_route_state_t::FAILED &&
+                        failure_state.getExactRoute(handle_identity, 1).has_value(),
+                    "bound route escaped concurrent endpoint failure");
+            continue;
+        }
+        require(bind_status == notif_state_status_t::ROUTE_FAILED &&
+                    query_status == notif_state_status_t::UNKNOWN_ROUTE &&
+                    !failure_state.getExactRoute(handle_identity, 1).has_value(),
+                "post-failure bind created a live exact route");
+    }
+}
+
+void
+testEndpointFailureStateRetainsNativeSubscriptions() {
+    const notif_wire_uuid_t local_agent = makeUuid(31);
+    const notif_wire_uuid_t local_backend = makeUuid(32);
+    const notif_wire_uuid_t local_worker = makeUuid(33);
+    const notif_wire_uuid_t remote_agent = makeUuid(34);
+    const notif_wire_uuid_t remote_backend = makeUuid(35);
+    const notif_wire_uuid_t remote_worker = makeUuid(36);
+    auto notification_state = std::make_shared<notif_capability_state_t>(
+        local_agent, local_backend, std::vector{local_worker});
+    const std::weak_ptr<notif_capability_state_t> weak_state = notification_state;
+    auto failure_state =
+        std::make_unique<notif_endpoint_failure_state_t>(notification_state);
+    const notif_route_key_t route =
+        makeRoute(5001, 1, remote_agent, remote_backend);
+    const notif_remote_binding_t binding =
+        makeBinding(route, 5002, {{remote_worker, 5003}});
+    const notif_exact_route_record_t record = {
+        .route = route,
+        .remoteAgent = "peer",
+        .connectionIdentity = 5002,
+    };
+    std::atomic<bool> failure_observed{false};
+    notif_route_snapshot_t snapshot;
+    require(failure_state->bindRemoteAgent(
+                record, binding, failure_observed, snapshot) ==
+                notif_state_status_t::SUCCESS,
+            "shared-lifetime exact route binding failed");
+
+    const auto sink = std::make_shared<querying_transition_sink_t>(
+        *notification_state, route);
+    notif_route_subscription_t subscription;
+    require(notification_state->subscribeRemoteNotificationState(
+                route, sink, subscription) ==
+                notif_route_subscription_status_t::SUCCESS,
+            "shared-lifetime subscription failed");
+    notification_state.reset();
+    require(!weak_state.expired() &&
+                failure_state->failRemoteConnection(5002) ==
+                    notif_state_status_t::SUCCESS &&
+                sink->transitions().size() == 1 &&
+                sink->transitions()[0].state ==
+                    notif_route_transition_state_t::FAILED,
+            "endpoint owner released notification state before failure publication");
+    const std::shared_ptr<notif_capability_state_t> retained_state = weak_state.lock();
+    require(retained_state != nullptr &&
+                retained_state->unsubscribeRemoteNotificationState(subscription) ==
+                    notif_route_subscription_status_t::SUCCESS &&
+                retained_state->querySubscriptionInventory(subscription)
+                        .retainedSubscriptions == 0,
+            "shared native subscription did not drain after endpoint failure");
+    failure_state.reset();
 }
 
 } // namespace
@@ -788,6 +917,8 @@ main() {
         testCapabilitySubscriptionCancellationDrainsInFlightDelivery();
         testCapabilityEndpointFailureTransition();
         testRetiredCapabilitySubscriptionInventoryDrains();
+        testEndpointFailureBindingRaceNeverLeavesLiveRoute();
+        testEndpointFailureStateRetainsNativeSubscriptions();
     }
     catch (const std::exception &error) {
         std::cerr << "ucx_notif_state_test failed: " << error.what() << '\n';
