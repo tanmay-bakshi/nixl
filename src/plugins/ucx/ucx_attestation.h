@@ -74,11 +74,15 @@ public:
     [[nodiscard]] nixl_status_t
     finishSubmission();
 
-    void
+    [[nodiscard]] nixl_status_t
     completeFlush(uint64_t generation, uint64_t endpoint_identity);
 
     void
     fail(uint64_t generation, nixl_status_t status, const std::string &error);
+
+    [[nodiscard]] nixl_status_t
+    recordTerminalProgress(uint64_t generation,
+                           const nixl_xfer_terminal_progress_t &progress);
 
     [[nodiscard]] uint64_t
     getGeneration() const;

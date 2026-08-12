@@ -18,6 +18,7 @@
 #define NIXL_SRC_UTILS_UCX_UCX_UTILS_H
 
 #include <memory>
+#include <atomic>
 #include <string>
 #include <type_traits>
 #include <thread>
@@ -70,6 +71,7 @@ private:
     const uint64_t workerIdentity_;
     const uint64_t identity_;
     size_t requestInfoSize_ = 0;
+    std::function<void()> failureHandler_;
 
     void
     setState(nixl::ucx::ep_state_t new_state);
@@ -84,6 +86,8 @@ private:
     sendAmCallback(void *request, ucs_status_t status, void *user_data);
 
 public:
+    using failure_handler_t = std::function<void()>;
+
     void
     err_cb(ucp_ep_h ucp_ep, ucs_status_t status);
 
@@ -95,7 +99,8 @@ public:
     nixlUcxEp(ucp_worker_h worker,
               uint64_t worker_identity,
               const void *addr,
-              ucp_err_handling_mode_t err_handling_mode);
+              ucp_err_handling_mode_t err_handling_mode,
+              failure_handler_t failure_handler = {});
     ~nixlUcxEp();
     nixlUcxEp(const nixlUcxEp &) = delete;
     nixlUcxEp &
@@ -112,7 +117,8 @@ public:
            size_t len,
            uint32_t flags,
            nixlUcxReq *req = nullptr,
-           const am_deleter_t &deleter = nullptr);
+           const am_deleter_t &deleter = nullptr,
+           nixl::ucx::ucx_callback_slot_t *terminal_slot = nullptr);
 
     /* Data access */
     [[nodiscard]] nixl_status_t
@@ -123,7 +129,8 @@ public:
          size_t size,
          nixlUcxReq &req,
          std::string &request_info,
-         std::vector<nixl_xfer_attestation_transport_t> &selected_transports);
+         std::vector<nixl_xfer_attestation_transport_t> &selected_transports,
+         nixl::ucx::ucx_callback_slot_t *terminal_slot = nullptr);
     [[nodiscard]] nixl_status_t
     write(void *laddr,
           nixlUcxMem &mem,
@@ -132,7 +139,8 @@ public:
           size_t size,
           nixlUcxReq &req,
           std::string &request_info,
-          std::vector<nixl_xfer_attestation_transport_t> &selected_transports);
+          std::vector<nixl_xfer_attestation_transport_t> &selected_transports,
+          nixl::ucx::ucx_callback_slot_t *terminal_slot = nullptr);
     [[nodiscard]] nixl_status_t
     queryTransports(std::vector<nixl_xfer_attestation_transport_t> &transports) const;
     nixl_status_t
@@ -141,7 +149,8 @@ public:
                  std::chrono::microseconds &err_margin,
                  nixl_cost_t &method);
     nixl_status_t
-    flushEp(nixlUcxReq &req);
+    flushEp(nixlUcxReq &req,
+            nixl::ucx::ucx_callback_slot_t *terminal_slot = nullptr);
 
     [[nodiscard]] ucp_ep_h
     getEp() const noexcept {
@@ -245,7 +254,9 @@ public:
     [[nodiscard]] std::string
     epAddr();
     [[nodiscard]] std::unique_ptr<nixlUcxEp>
-    connect(const void *addr, size_t size);
+    connect(const void *addr,
+            size_t size,
+            nixlUcxEp::failure_handler_t failure_handler = {});
 
     /* Active message handling */
     int
@@ -278,6 +289,10 @@ public:
     [[nodiscard]] nixl_status_t
     drainContinuationsOnOwner();
 
+    [[nodiscard]] nixl_status_t
+    enqueueContinuation(
+        nixl::ucx::ucx_worker_continuation_queue_t::continuation_t continuation);
+
     [[nodiscard]] bool
     hasProgressOwner() const noexcept {
         return hasProgressOwner_;
@@ -291,11 +306,23 @@ public:
     [[nodiscard]] nixl_status_t
     closeContinuations();
 
+    [[nodiscard]] std::size_t
+    activeTerminalCallbackCount() const noexcept {
+        return activeTerminalCallbacks_.load(std::memory_order_acquire);
+    }
+
+    [[nodiscard]] bool
+    terminalLifecycleDrained() const noexcept;
+
     [[nodiscard]] nixl_status_t
     makeTerminalCallbackSlot(
         std::shared_ptr<nixl::ucx::terminal_submission_state_t> state,
         nixl::ucx::ucx_callback_kind_t kind,
-        std::shared_ptr<nixl::ucx::ucx_callback_slot_t> &slot);
+        std::shared_ptr<nixl::ucx::ucx_callback_slot_t> &slot,
+        nixl::ucx::ucx_callback_slot_t::owner_before_completion_t
+            owner_before_completion = {},
+        nixl::ucx::ucx_callback_slot_t::owner_after_completion_t
+            owner_after_completion = {});
 
     /* GPU signal management */
     void
@@ -321,6 +348,7 @@ private:
     std::shared_ptr<nixl::ucx::ucx_worker_continuation_queue_t> continuations_;
     bool hasProgressOwner_ = false;
     std::thread::id progressOwnerThread_;
+    std::atomic<std::size_t> activeTerminalCallbacks_{0};
     static constexpr std::size_t maxPendingContinuations = 65536;
 };
 

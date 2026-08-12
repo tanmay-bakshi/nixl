@@ -116,6 +116,11 @@ struct notif_route_subscription_t {
     std::uint64_t generation = 0;
 };
 
+struct notif_route_subscription_inventory_t {
+    std::size_t retainedSubscriptions = 0;
+    std::size_t inFlightDeliveries = 0;
+};
+
 enum class notif_route_subscription_status_t {
     SUCCESS,
     INVALID_ARGUMENT,
@@ -169,6 +174,9 @@ public:
     retireRemoteAgent(const notif_route_key_t &route);
 
     [[nodiscard]] notif_state_status_t
+    failRemoteAgent(const notif_route_key_t &route);
+
+    [[nodiscard]] notif_state_status_t
     queryRemoteNotificationState(const notif_route_key_t &route,
                                  notif_route_snapshot_t &snapshot) const;
 
@@ -178,11 +186,15 @@ public:
                                      notif_route_subscription_t &subscription);
 
     /**
-     * Cancels future delivery for one exact subscription generation. A callback already invoking
-     * publish() may finish after this method returns; shared sink ownership keeps that race safe.
+     * Cancels future delivery for one exact subscription generation and drains any callback which
+     * already entered publish(). A sink must not call this blocking operation from its own
+     * publish() callback.
      */
     [[nodiscard]] notif_route_subscription_status_t
     unsubscribeRemoteNotificationState(const notif_route_subscription_t &subscription) noexcept;
+
+    [[nodiscard]] notif_route_subscription_inventory_t
+    querySubscriptionInventory(const notif_route_subscription_t &subscription) const noexcept;
 
     [[nodiscard]] notif_state_status_t
     makeOffer(const notif_route_key_t &route,
@@ -247,6 +259,7 @@ private:
     struct route_subscription_record_t {
         std::uint64_t generation = 0;
         std::shared_ptr<route_delivery_state_t> delivery;
+        bool closing = false;
     };
 
     struct pending_route_delivery_t {

@@ -381,6 +381,30 @@ struct nixlRuntimeArtifact {
 using nixl_runtime_artifact_t = nixlRuntimeArtifact;
 
 /**
+ * @struct nixlXferTerminalProgress
+ * @brief Native callback and owner-queue evidence for one autonomous submission.
+ */
+struct nixlXferTerminalProgress {
+    bool autonomous = false;
+    size_t dataCallbacks = 0;
+    size_t endpointFlushCallbacks = 0;
+    size_t notificationCallbacks = 0;
+    size_t asynchronousRequests = 0;
+    size_t immediateCompletions = 0;
+    size_t callbacksBeforePosterReturn = 0;
+    size_t peakContinuationDepth = 0;
+    size_t activeCallbackSlotsAtTerminal = 0;
+    size_t continuationDepthAtTerminal = 0;
+    uint64_t lastDataCallbackTimestampNs = 0;
+    uint64_t lastFlushCallbackTimestampNs = 0;
+    uint64_t notificationCallbackTimestampNs = 0;
+    uint64_t terminalPublishTimestampNs = 0;
+    nixl_status_t terminalStatus = NIXL_ERR_NOT_POSTED;
+};
+
+using nixl_xfer_terminal_progress_t = nixlXferTerminalProgress;
+
+/**
  * @struct nixlXferAttestation
  * @brief Handle-bound evidence for one transfer submission generation.
  */
@@ -403,6 +427,7 @@ struct nixlXferAttestation {
     nixl_mem_t remoteMemoryType = DRAM_SEG;
     std::vector<nixl_xfer_attestation_segment_t> segments;
     std::vector<nixl_xfer_attestation_endpoint_t> endpoints;
+    nixl_xfer_terminal_progress_t terminalProgress;
     std::vector<nixl_runtime_artifact_t> runtimeArtifacts;
     std::string descriptorDigest;
     std::string evidenceDigest;

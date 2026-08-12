@@ -15,10 +15,14 @@
  * limitations under the License.
  */
 
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <future>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -133,6 +137,47 @@ private:
     notif_route_key_t route_;
     std::vector<notif_route_transition_t> transitions_;
     bool reentrantQuerySucceeded_ = false;
+};
+
+class blocking_transition_sink_t final : public notif_route_transition_sink_t {
+public:
+    void
+    publish(const notif_route_transition_t &) noexcept override {
+        std::unique_lock lock(mutex_);
+        ++enteredCount_;
+        entered_.notify_all();
+        release_.wait(lock, [this] { return released_; });
+        ++completedCount_;
+    }
+
+    void
+    waitUntilEntered() {
+        std::unique_lock lock(mutex_);
+        const bool entered = entered_.wait_for(
+            lock, std::chrono::seconds(5), [this] { return enteredCount_ == 1; });
+        require(entered, "route transition callback did not enter");
+    }
+
+    void
+    release() {
+        const std::lock_guard lock(mutex_);
+        released_ = true;
+        release_.notify_all();
+    }
+
+    [[nodiscard]] std::size_t
+    completedCount() const {
+        const std::lock_guard lock(mutex_);
+        return completedCount_;
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::condition_variable entered_;
+    std::condition_variable release_;
+    std::size_t enteredCount_ = 0;
+    std::size_t completedCount_ = 0;
+    bool released_ = false;
 };
 
 void
@@ -579,6 +624,156 @@ testCapabilitySubscriptionSnapshotAndCancellation() {
             "unknown-route subscription did not fail without output mutation");
 }
 
+void
+testCapabilitySubscriptionCancellationDrainsInFlightDelivery() {
+    const notif_wire_uuid_t local_agent = makeUuid(201);
+    const notif_wire_uuid_t local_backend = makeUuid(202);
+    const notif_wire_uuid_t local_worker = makeUuid(203);
+    const notif_wire_uuid_t remote_agent = makeUuid(211);
+    const notif_wire_uuid_t remote_backend = makeUuid(212);
+    const notif_wire_uuid_t remote_worker = makeUuid(213);
+    notif_capability_state_t state(local_agent, local_backend, {local_worker});
+    const notif_route_key_t route = makeRoute(801, 4, remote_agent, remote_backend);
+    bind(state, makeBinding(route, 8001, {{remote_worker, 12001}}));
+
+    const auto sink = std::make_shared<blocking_transition_sink_t>();
+    notif_route_subscription_t subscription;
+    require(state.subscribeRemoteNotificationState(route, sink, subscription) ==
+                notif_route_subscription_status_t::SUCCESS,
+            "blocking subscription setup failed");
+
+    notif_wire_envelope_t local_offer;
+    require(state.makeOffer(route, local_worker, local_offer) == notif_state_status_t::SUCCESS,
+            "blocking subscription OFFER generation failed");
+    const notif_wire_envelope_t remote_offer =
+        makeInbound(local_offer, notif_wire_type_t::OFFER, remote_worker, makeUuid(214), 40);
+    auto publisher = std::async(std::launch::async, [&state, &remote_offer, local_worker] {
+        notif_offer_acceptance_t acceptance;
+        return state.acceptOffer(remote_offer, local_worker, acceptance);
+    });
+    sink->waitUntilEntered();
+    const notif_route_subscription_inventory_t in_flight =
+        state.querySubscriptionInventory(subscription);
+    require(in_flight.retainedSubscriptions == 1 && in_flight.inFlightDeliveries == 1,
+            "active route delivery was absent from subscription inventory");
+
+    require(state.retireRemoteAgent(route) == notif_state_status_t::SUCCESS,
+            "retirement could not queue behind an active callback");
+    auto cancellation = std::async(std::launch::async, [&state, &subscription] {
+        return state.unsubscribeRemoteNotificationState(subscription);
+    });
+
+    const std::future_status blocked_status =
+        cancellation.wait_for(std::chrono::milliseconds(100));
+    sink->release();
+    require(publisher.get() == notif_state_status_t::SUCCESS,
+            "readiness publisher failed after callback release");
+    const notif_route_subscription_status_t cancellation_status = cancellation.get();
+    require(blocked_status == std::future_status::timeout,
+            "unsubscribe returned while a route callback remained in flight");
+    require(cancellation_status == notif_route_subscription_status_t::SUCCESS,
+            "in-flight subscription cancellation failed");
+    require(sink->completedCount() == 1,
+            "cancellation did not drain the active callback or cancel queued delivery");
+}
+
+void
+testCapabilityEndpointFailureTransition() {
+    const notif_wire_uuid_t local_agent = makeUuid(221);
+    const notif_wire_uuid_t local_backend = makeUuid(222);
+    const notif_wire_uuid_t local_worker = makeUuid(223);
+    const notif_wire_uuid_t remote_agent = makeUuid(231);
+    const notif_wire_uuid_t remote_backend = makeUuid(232);
+    const notif_wire_uuid_t remote_worker = makeUuid(233);
+    notif_capability_state_t state(local_agent, local_backend, {local_worker});
+    const notif_route_key_t route = makeRoute(901, 6, remote_agent, remote_backend);
+    bind(state, makeBinding(route, 9001, {{remote_worker, 13001}}));
+
+    notif_wire_envelope_t local_offer;
+    require(state.makeOffer(route, local_worker, local_offer) == notif_state_status_t::SUCCESS,
+            "endpoint-failure OFFER generation failed");
+    notif_offer_acceptance_t acceptance;
+    require(state.acceptOffer(makeInbound(local_offer,
+                                          notif_wire_type_t::OFFER,
+                                          remote_worker,
+                                          makeUuid(234),
+                                          50),
+                              local_worker,
+                              acceptance) == notif_state_status_t::SUCCESS,
+            "endpoint-failure route did not become ready");
+
+    const auto sink = std::make_shared<querying_transition_sink_t>(state, route);
+    notif_route_subscription_t subscription;
+    require(state.subscribeRemoteNotificationState(route, sink, subscription) ==
+                notif_route_subscription_status_t::SUCCESS &&
+                sink->transitions().size() == 1 &&
+                sink->transitions()[0].state == notif_route_transition_state_t::READY,
+            "endpoint-failure subscription did not snapshot READY");
+    require(state.failRemoteAgent(route) == notif_state_status_t::SUCCESS &&
+                sink->transitions().size() == 2 &&
+                sink->transitions()[1].state == notif_route_transition_state_t::FAILED &&
+                sink->transitions()[1].capabilityEpoch == 50,
+            "endpoint failure did not publish exact-route FAILED");
+
+    notif_route_snapshot_t failed_snapshot;
+    require(state.queryRemoteNotificationState(route, failed_snapshot) ==
+                    notif_state_status_t::SUCCESS &&
+                failed_snapshot.state == notif_route_state_t::FAILED,
+            "endpoint failure left a stale READY route snapshot");
+    notif_wire_envelope_t rejected_offer;
+    require(state.makeOffer(route, local_worker, rejected_offer) ==
+                notif_state_status_t::ROUTE_FAILED,
+            "endpoint-failed route remained usable");
+    require(state.failRemoteAgent(route) == notif_state_status_t::SUCCESS &&
+                sink->transitions().size() == 2,
+            "idempotent endpoint failure published a duplicate transition");
+    const notif_route_subscription_inventory_t before_unsubscribe =
+        state.querySubscriptionInventory(subscription);
+    require(before_unsubscribe.retainedSubscriptions == 1 &&
+                before_unsubscribe.inFlightDeliveries == 0,
+            "terminal FAILED route lost its retained subscription inventory");
+    require(state.unsubscribeRemoteNotificationState(subscription) ==
+                notif_route_subscription_status_t::SUCCESS,
+            "endpoint-failure subscription cancellation failed");
+    const notif_route_subscription_inventory_t after_unsubscribe =
+        state.querySubscriptionInventory(subscription);
+    require(after_unsubscribe.retainedSubscriptions == 0 &&
+                after_unsubscribe.inFlightDeliveries == 0,
+            "terminal FAILED route subscription survived cancellation");
+}
+
+void
+testRetiredCapabilitySubscriptionInventoryDrains() {
+    const notif_wire_uuid_t local_agent = makeUuid(241);
+    const notif_wire_uuid_t local_backend = makeUuid(242);
+    const notif_wire_uuid_t local_worker = makeUuid(243);
+    const notif_wire_uuid_t remote_agent = makeUuid(244);
+    const notif_wire_uuid_t remote_backend = makeUuid(245);
+    const notif_wire_uuid_t remote_worker = makeUuid(246);
+    notif_capability_state_t state(local_agent, local_backend, {local_worker});
+    const notif_route_key_t route = makeRoute(1001, 8, remote_agent, remote_backend);
+    bind(state, makeBinding(route, 10001, {{remote_worker, 14001}}));
+
+    const auto sink = std::make_shared<querying_transition_sink_t>(state, route);
+    notif_route_subscription_t subscription;
+    require(state.subscribeRemoteNotificationState(route, sink, subscription) ==
+                notif_route_subscription_status_t::SUCCESS,
+            "retirement inventory subscription failed");
+    require(state.retireRemoteAgent(route) == notif_state_status_t::SUCCESS &&
+                sink->transitions().size() == 1 &&
+                sink->transitions()[0].state == notif_route_transition_state_t::RETIRED,
+            "retirement inventory route did not publish RETIRED");
+    require(state.querySubscriptionInventory(subscription).retainedSubscriptions == 1,
+            "terminal RETIRED route lost its retained subscription inventory");
+    require(state.unsubscribeRemoteNotificationState(subscription) ==
+                notif_route_subscription_status_t::SUCCESS,
+            "terminal RETIRED subscription cancellation failed");
+    const notif_route_subscription_inventory_t inventory =
+        state.querySubscriptionInventory(subscription);
+    require(inventory.retainedSubscriptions == 0 && inventory.inFlightDeliveries == 0,
+            "terminal RETIRED route subscription survived cancellation");
+}
+
 } // namespace
 
 int
@@ -590,6 +785,9 @@ main() {
         testSiblingIsolationAndUnknownCapability();
         testCapabilitySubscriptionTransitions();
         testCapabilitySubscriptionSnapshotAndCancellation();
+        testCapabilitySubscriptionCancellationDrainsInFlightDelivery();
+        testCapabilityEndpointFailureTransition();
+        testRetiredCapabilitySubscriptionInventoryDrains();
     }
     catch (const std::exception &error) {
         std::cerr << "ucx_notif_state_test failed: " << error.what() << '\n';

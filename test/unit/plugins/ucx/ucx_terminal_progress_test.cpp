@@ -57,6 +57,7 @@ testCallbackBeforePosterReturn() {
     auto sink = std::make_shared<recording_sink_t>();
     auto state = std::make_shared<terminal_submission_state_t>(
         11, 101, 7, 1, 1, false, sink);
+    require(state->registerChunk() == NIXL_SUCCESS, "chunk registration failed");
     require(state->registerFlush() == NIXL_SUCCESS, "flush registration failed");
     require(state->completeChunk(NIXL_SUCCESS, 10) == NIXL_SUCCESS,
             "chunk completion failed");
@@ -95,6 +96,43 @@ testCallbackBeforePosterReturn() {
 }
 
 void
+testCallbackCanScheduleBeforePosterArms() {
+    std::size_t wake_count = 0;
+    std::size_t release_count = 0;
+    auto queue = makeQueue(8, wake_count);
+    auto sink = std::make_shared<recording_sink_t>();
+    auto state = std::make_shared<terminal_submission_state_t>(
+        20, 110, 16, 1, 1, false, sink);
+    require(state->registerChunk() == NIXL_SUCCESS,
+            "scheduled-before-poster chunk registration failed");
+    require(state->registerFlush() == NIXL_SUCCESS,
+            "scheduled-before-poster flush registration failed");
+    require(state->completeChunk(NIXL_SUCCESS, 110) == NIXL_SUCCESS,
+            "scheduled-before-poster chunk completion failed");
+    require(state->sealPosting({}, 111) == NIXL_SUCCESS,
+            "scheduled-before-poster posting seal failed");
+
+    void *request = reinterpret_cast<void *>(0xb000);
+    auto slot = ucx_callback_slot_t::create(
+        state,
+        ucx_callback_kind_t::ENDPOINT_FLUSH,
+        queue,
+        [&](void *completed) {
+            require(completed == request,
+                    "scheduled-before-poster request identity changed");
+            ++release_count;
+        });
+    slot->recordCallback(request, NIXL_SUCCESS, 112);
+    require(slot->armPoster(request, NIXL_IN_PROG, 113) == NIXL_SUCCESS,
+            "poster rejected an early callback after scheduling");
+    require(queue->drain() == 1 && release_count == 1 && slot->isDelivered(),
+            "scheduled-before-poster callback ownership did not drain");
+    require(sink->results.size() == 1 &&
+                sink->results[0].status == NIXL_SUCCESS,
+            "scheduled-before-poster path did not terminate successfully");
+}
+
+void
 testNotificationAfterFlush() {
     std::size_t wake_count = 0;
     auto queue = makeQueue(8, wake_count);
@@ -123,6 +161,7 @@ testNotificationAfterFlush() {
             order.emplace_back("flush-release");
         });
 
+    require(state->registerChunk() == NIXL_SUCCESS, "chunk registration failed");
     require(state->registerFlush() == NIXL_SUCCESS, "flush registration failed");
     require(state->completeChunk(NIXL_SUCCESS, 30) == NIXL_SUCCESS,
             "chunk completion failed");
@@ -157,12 +196,87 @@ testNotificationAfterFlush() {
 }
 
 void
+testCallbacksBeforePostingSeal() {
+    std::size_t wake_count = 0;
+    auto queue = makeQueue(8, wake_count);
+    auto sink = std::make_shared<recording_sink_t>();
+    auto state = std::make_shared<terminal_submission_state_t>(
+        18, 108, 14, 1, 1, true, sink);
+    std::vector<std::string> order;
+    void *data_request = reinterpret_cast<void *>(0x6000);
+    void *flush_request = reinterpret_cast<void *>(0x7000);
+    void *notification_request = reinterpret_cast<void *>(0x8000);
+
+    auto data_slot = ucx_callback_slot_t::create(
+        state,
+        ucx_callback_kind_t::DATA_CHUNK,
+        queue,
+        [&](void *completed) {
+            require(completed == data_request, "data request identity changed");
+            order.emplace_back("data-release");
+        });
+    auto flush_slot = ucx_callback_slot_t::create(
+        state,
+        ucx_callback_kind_t::ENDPOINT_FLUSH,
+        queue,
+        [&](void *completed) {
+            require(completed == flush_request, "flush request identity changed");
+            order.emplace_back("flush-release");
+        });
+    auto notification_slot = ucx_callback_slot_t::create(
+        state,
+        ucx_callback_kind_t::NOTIFICATION,
+        queue,
+        [&](void *completed) {
+            require(completed == notification_request,
+                    "notification request identity changed");
+            order.emplace_back("notification-release");
+        });
+
+    require(state->registerChunk() == NIXL_SUCCESS, "chunk registration failed");
+    require(state->registerFlush() == NIXL_SUCCESS, "flush registration failed");
+    data_slot->recordCallback(data_request, NIXL_SUCCESS, 90);
+    require(data_slot->armPoster(data_request, NIXL_IN_PROG, 91) == NIXL_SUCCESS,
+            "data poster handshake failed");
+    flush_slot->recordCallback(flush_request, NIXL_SUCCESS, 92);
+    require(flush_slot->armPoster(flush_request, NIXL_IN_PROG, 93) == NIXL_SUCCESS,
+            "flush poster handshake failed");
+    require(queue->drain() == 2, "early data callbacks were not delivered");
+    require(state->phase() == terminal_submission_phase_t::POSTING &&
+                sink->results.empty(),
+            "callbacks completed the submission before posting was sealed");
+
+    require(state->sealPosting(
+                [&]() {
+                    order.emplace_back("notification-post");
+                    notification_slot->recordCallback(
+                        notification_request, NIXL_SUCCESS, 94);
+                    require(notification_slot->armPoster(
+                                notification_request, NIXL_IN_PROG, 95) == NIXL_SUCCESS,
+                            "notification poster handshake failed");
+                    return NIXL_IN_PROG;
+                },
+                96) == NIXL_SUCCESS,
+            "posting seal stranded notification dispatch");
+    require(order == std::vector<std::string>(
+                         {"data-release", "flush-release", "notification-post"}),
+            "posting seal did not dispatch notification after early callbacks");
+    require(queue->drain() == 1, "notification continuation was not delivered");
+    require(sink->results.size() == 1 &&
+                sink->results[0].status == NIXL_SUCCESS &&
+                sink->results[0].nativeTimestampNs == 95,
+            "early-callback submission did not publish one terminal result");
+    require(wake_count == 3, "early callback path emitted unexpected wake count");
+}
+
+void
 testCancellationAndFailure() {
     std::size_t wake_count = 0;
     auto queue = makeQueue(8, wake_count);
     auto sink = std::make_shared<recording_sink_t>();
     auto state = std::make_shared<terminal_submission_state_t>(
         13, 103, 9, 1, 1, false, sink);
+    require(state->registerChunk() == NIXL_SUCCESS, "chunk registration failed");
     require(state->registerFlush() == NIXL_SUCCESS, "flush registration failed");
     require(state->completeChunk(NIXL_SUCCESS, 50) == NIXL_SUCCESS,
             "chunk completion failed");
@@ -181,6 +295,8 @@ testCancellationAndFailure() {
     auto mismatch_sink = std::make_shared<recording_sink_t>();
     auto mismatch_state = std::make_shared<terminal_submission_state_t>(
         14, 104, 10, 1, 1, false, mismatch_sink);
+    require(mismatch_state->registerChunk() == NIXL_SUCCESS,
+            "mismatch chunk registration failed");
     require(mismatch_state->registerFlush() == NIXL_SUCCESS,
             "mismatch flush registration failed");
     require(mismatch_state->completeChunk(NIXL_SUCCESS, 60) == NIXL_SUCCESS,
@@ -204,6 +320,7 @@ testNotificationFailure() {
     auto sink = std::make_shared<recording_sink_t>();
     auto state = std::make_shared<terminal_submission_state_t>(
         15, 105, 11, 1, 1, true, sink);
+    require(state->registerChunk() == NIXL_SUCCESS, "chunk registration failed");
     require(state->registerFlush() == NIXL_SUCCESS, "flush registration failed");
     require(state->completeChunk(NIXL_SUCCESS, 70) == NIXL_SUCCESS,
             "chunk completion failed");
@@ -223,6 +340,8 @@ testCompositeFolding() {
     auto state = std::make_shared<terminal_submission_state_t>(
         16, 106, 12, 3, 3, false, sink);
     for (std::size_t index = 0; index < 3; ++index) {
+        require(state->registerChunk() == NIXL_SUCCESS,
+                "composite chunk registration failed");
         require(state->registerFlush() == NIXL_SUCCESS,
                 "composite flush registration failed");
     }
@@ -284,6 +403,66 @@ testContinuationOverflowAndShutdown() {
 }
 
 void
+testOverflowDrainsCallbackOwnership() {
+    std::size_t wake_count = 0;
+    auto queue = makeQueue(1, wake_count);
+    auto sink = std::make_shared<recording_sink_t>();
+    auto state = std::make_shared<terminal_submission_state_t>(
+        19, 109, 15, 1, 2, false, sink);
+    require(state->registerChunk() == NIXL_SUCCESS,
+            "overflow chunk registration failed");
+    require(state->registerFlush() == NIXL_SUCCESS &&
+                state->registerFlush() == NIXL_SUCCESS,
+            "overflow flush registration failed");
+    require(state->completeChunk(NIXL_SUCCESS, 100) == NIXL_SUCCESS,
+            "overflow chunk completion failed");
+    require(state->sealPosting({}, 101) == NIXL_SUCCESS,
+            "overflow posting seal failed");
+
+    std::size_t release_count = 0;
+    std::size_t retired_count = 0;
+    require(queue->registerProducer() == NIXL_SUCCESS &&
+                queue->registerProducer() == NIXL_SUCCESS,
+            "overflow producer registration failed");
+    auto make_slot = [&](void *request) {
+        return ucx_callback_slot_t::create(
+            state,
+            ucx_callback_kind_t::ENDPOINT_FLUSH,
+            queue,
+            [&, request](void *completed) {
+                require(completed == request, "overflow request identity changed");
+                ++release_count;
+            },
+            {},
+            [&]() {
+                ++retired_count;
+                static_cast<void>(queue->retireProducer());
+            });
+    };
+    void *first_request = reinterpret_cast<void *>(0x9000);
+    void *second_request = reinterpret_cast<void *>(0xa000);
+    auto first = make_slot(first_request);
+    auto second = make_slot(second_request);
+    first->recordCallback(first_request, NIXL_SUCCESS, 102);
+    require(first->armPoster(first_request, NIXL_IN_PROG, 103) == NIXL_SUCCESS,
+            "first overflow callback was not queued");
+    second->recordCallback(second_request, NIXL_SUCCESS, 104);
+    require(second->armPoster(second_request, NIXL_IN_PROG, 105) ==
+                NIXL_ERR_BACKEND,
+            "overflow callback did not report sticky fatal status");
+    require(queue->size() == 2 && queue->fatalStatus() == NIXL_ERR_BACKEND,
+            "overflow cleanup authority was not retained");
+    require(queue->drain() == 2,
+            "overflow owner did not drain both callback continuations");
+    require(release_count == 2 && retired_count == 2 && queue->size() == 0 &&
+                first->isDelivered() && second->isDelivered(),
+            "overflow callback ownership was not conserved");
+    require(sink->results.size() == 1 &&
+                sink->results[0].status == NIXL_SUCCESS,
+            "overflow cleanup changed transfer terminality");
+}
+
+void
 testNoProgressOwnerIsUnsupported() {
     nixlUcxContext context({},
                            false,
@@ -315,11 +494,14 @@ int
 main() {
     try {
         testCallbackBeforePosterReturn();
+        testCallbackCanScheduleBeforePosterArms();
         testNotificationAfterFlush();
+        testCallbacksBeforePostingSeal();
         testCancellationAndFailure();
         testNotificationFailure();
         testCompositeFolding();
         testContinuationOverflowAndShutdown();
+        testOverflowDrainsCallbackOwnership();
         testNoProgressOwnerIsUnsupported();
     }
     catch (const std::exception &error) {

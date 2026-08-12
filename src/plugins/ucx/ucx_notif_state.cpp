@@ -18,6 +18,7 @@
 #include "ucx_notif_state.h"
 
 #include <algorithm>
+#include <condition_variable>
 #include <ctime>
 #include <deque>
 #include <limits>
@@ -102,23 +103,40 @@ public:
                 transition = std::move(pending_.front());
                 pending_.pop_front();
                 sink = sink_;
+                ++callbacksInFlight_;
             }
             sink->publish(transition);
+            {
+                const std::lock_guard lock(mutex_);
+                --callbacksInFlight_;
+                if (callbacksInFlight_ == 0) {
+                    callbacksDrained_.notify_all();
+                }
+            }
         }
     }
 
     void
     cancel() noexcept {
-        const std::lock_guard lock(mutex_);
+        std::unique_lock lock(mutex_);
         cancelled_ = true;
         pending_.clear();
         sink_.reset();
+        callbacksDrained_.wait(lock, [this] { return callbacksInFlight_ == 0; });
+    }
+
+    [[nodiscard]] std::size_t
+    inFlightCount() const noexcept {
+        const std::lock_guard lock(mutex_);
+        return callbacksInFlight_;
     }
 
 private:
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
+    std::condition_variable callbacksDrained_;
     std::shared_ptr<notif_route_transition_sink_t> sink_;
     std::deque<notif_route_transition_t> pending_;
+    std::size_t callbacksInFlight_ = 0;
     bool dispatching_ = false;
     bool cancelled_ = false;
 };
@@ -293,6 +311,38 @@ notif_capability_state_t::retireRemoteAgent(const notif_route_key_t &route) {
     return notif_state_status_t::SUCCESS;
 }
 
+notif_state_status_t
+notif_capability_state_t::failRemoteAgent(const notif_route_key_t &route) {
+    pending_route_delivery_t pending;
+    {
+        const std::lock_guard lock(mutex_);
+        const auto known = bindings_.find(route);
+        if (known == bindings_.end()) {
+            return notif_state_status_t::UNKNOWN_ROUTE;
+        }
+        if (known->second.retired || known->second.failed) {
+            return notif_state_status_t::SUCCESS;
+        }
+
+        known->second.failed = true;
+        const peer_key_t peer = {
+            .agentIncarnation = route.remoteAgentIncarnation,
+            .backendIncarnation = route.remoteBackendIncarnation,
+        };
+        const auto active = activePeers_.find(peer);
+        if (active != activePeers_.end() && active->second == route) {
+            activePeers_.erase(active);
+        }
+        const std::uint64_t epoch = known->second.remoteCapabilityEpoch != 0 ?
+            known->second.remoteCapabilityEpoch :
+            known->second.localCapabilityEpoch;
+        pending =
+            enqueueRouteTransitionLocked(route, notif_route_transition_state_t::FAILED, epoch);
+    }
+    dispatchRouteTransition(std::move(pending));
+    return notif_state_status_t::SUCCESS;
+}
+
 notif_route_snapshot_t
 notif_capability_state_t::makeSnapshotLocked(const binding_state_t &binding) const {
     notif_route_state_t route_state = notif_route_state_t::NOT_READY;
@@ -425,14 +475,42 @@ notif_capability_state_t::unsubscribeRemoteNotificationState(
         const std::lock_guard lock(mutex_);
         const auto known = routeSubscriptions_.find(subscription.route);
         if (known == routeSubscriptions_.end() ||
-            known->second.generation != subscription.generation) {
+            known->second.generation != subscription.generation || known->second.closing) {
             return notif_route_subscription_status_t::UNKNOWN_SUBSCRIPTION;
         }
-        delivery = std::move(known->second.delivery);
-        routeSubscriptions_.erase(known);
+        known->second.closing = true;
+        delivery = known->second.delivery;
     }
     delivery->cancel();
+
+    // Keep the exact generation registered until its copied callback has drained. This makes
+    // successful unsubscribe the lifecycle boundary backend inventory can safely project.
+    const std::lock_guard lock(mutex_);
+    const auto known = routeSubscriptions_.find(subscription.route);
+    if (known != routeSubscriptions_.end() &&
+        known->second.generation == subscription.generation && known->second.closing) {
+        routeSubscriptions_.erase(known);
+    }
     return notif_route_subscription_status_t::SUCCESS;
+}
+
+notif_route_subscription_inventory_t
+notif_capability_state_t::querySubscriptionInventory(
+    const notif_route_subscription_t &subscription) const noexcept {
+    std::shared_ptr<route_delivery_state_t> delivery;
+    {
+        const std::lock_guard lock(mutex_);
+        const auto known = routeSubscriptions_.find(subscription.route);
+        if (known == routeSubscriptions_.end() ||
+            known->second.generation != subscription.generation) {
+            return {};
+        }
+        delivery = known->second.delivery;
+    }
+    return {
+        .retainedSubscriptions = 1,
+        .inFlightDeliveries = delivery->inFlightCount(),
+    };
 }
 
 notif_wire_envelope_t
