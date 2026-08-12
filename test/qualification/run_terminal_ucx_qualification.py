@@ -286,7 +286,7 @@ def run(paths: RunnerPaths) -> Path:
     native_receipt = paths.output_root / "terminal-ucx-native.json"
     sealed_receipt = paths.output_root / "terminal-ucx-sealed.json"
     receipt: dict[str, object] = {
-        "schema": "nixl-terminal-ucx-qualification/v3",
+        "schema": "nixl-terminal-ucx-qualification/v4",
         "status": "pass",
         "nixl_revision": _git_revision(paths.nixl_source),
         "ucx_revision": _git_revision(paths.ucx_source),

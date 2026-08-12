@@ -6,10 +6,15 @@ import hashlib
 import json
 from pathlib import Path
 
-_SCHEMA = "nixl-terminal-ucx-qualification/v3"
+_SCHEMA = "nixl-terminal-ucx-qualification/v4"
 _TRANSPORTS = {"self", "tcp"}
 _ENGINES = {"shared", "thread_pool"}
-_POPULATIONS = {"small", "large"}
+_BASE_POPULATIONS = ("small", "large")
+_THREAD_POOL_REPOST_POPULATIONS = (
+    "thread_pool_repost_generation_1",
+    "thread_pool_repost_generation_2",
+)
+_POPULATIONS = set(_BASE_POPULATIONS + _THREAD_POOL_REPOST_POPULATIONS)
 _RUNTIME_COMPONENTS = {"libnixl", "libucp", "ucx-plugin"}
 _SELF_NA_REASON = (
     "ucx_self_is_same_worker_only_and_nixl_local_routes_have_no_remote_agent_handle"
@@ -187,14 +192,48 @@ def _validate_registration(registration: object, context: str) -> tuple[int, int
     return int(address), int(byte_capacity)
 
 
+def _validate_endpoint_flushes(endpoint_flushes: object) -> int:
+    """Validate immutable endpoint identities and completed flush authority.
+
+    :param endpoint_flushes: Endpoint evidence copied from the transfer attestation.
+    :returns: Number of distinct endpoints flushed by the submission.
+    :raises ValueError: If endpoint identity aliases or flush authority is incomplete.
+    """
+    _require(
+        isinstance(endpoint_flushes, list) and len(endpoint_flushes) > 0,
+        "endpoint flush evidence is missing",
+    )
+    identities: set[tuple[int, int, int]] = set()
+    for endpoint in endpoint_flushes:
+        _require(isinstance(endpoint, dict), "endpoint flush is not an object")
+        worker_id = endpoint.get("worker_id")
+        worker_identity = endpoint.get("worker_identity")
+        endpoint_identity = endpoint.get("endpoint_identity")
+        _require(_is_int(worker_id), "endpoint worker ID is invalid")
+        _require(_is_int(worker_identity, 1), "endpoint worker identity is invalid")
+        _require(_is_int(endpoint_identity, 1), "endpoint identity is invalid")
+        _require(endpoint.get("flush_posted") is True, "endpoint flush was not posted")
+        _require(
+            endpoint.get("remote_flushed") is True, "endpoint was not remote-flushed"
+        )
+        identities.add((int(worker_id), int(worker_identity), int(endpoint_identity)))
+    _require(
+        len(identities) == len(endpoint_flushes),
+        "endpoint flush identities are not unique",
+    )
+    return len(endpoint_flushes)
+
+
 def _validate_terminal_progress(
     progress: object,
     transport: str,
+    endpoint_count: int,
 ) -> tuple[int, int]:
     """Validate native callback, flush, notification, and queue evidence.
 
     :param progress: Attested terminal-progress observation.
     :param transport: Observed UCX transport.
+    :param endpoint_count: Number of distinct attested endpoint flushes.
     :returns: Before-return and after-return callback counts.
     :raises ValueError: If callback accounting or terminal ordering is unsound.
     """
@@ -218,7 +257,6 @@ def _validate_terminal_progress(
     ):
         _require(_is_int(value), f"{name} count is invalid")
     _require(int(data_callbacks) > 0, "no data completion callback was observed")
-    _require(int(flush_callbacks) > 0, "no endpoint-flush callback was observed")
     expected_notifications = 0 if transport == "self" else 1
     _require(
         int(notification_callbacks) == expected_notifications,
@@ -227,9 +265,10 @@ def _validate_terminal_progress(
     callback_count = (
         int(data_callbacks) + int(flush_callbacks) + int(notification_callbacks)
     )
+    post_count = int(asynchronous_requests) + int(immediate_completions)
     _require(
-        int(asynchronous_requests) + int(immediate_completions) == callback_count,
-        "immediate and asynchronous completion counts do not conserve",
+        post_count >= callback_count,
+        "callback observations exceed native post observations",
     )
     _require(
         int(before_return) <= callback_count, "before-return callbacks exceed total"
@@ -252,21 +291,44 @@ def _validate_terminal_progress(
     notification_timestamp = progress.get("notification_callback_timestamp_ns")
     terminal_timestamp = progress.get("terminal_publish_timestamp_ns")
     _require(_is_int(data_timestamp, 1), "data callback timestamp is missing")
-    _require(_is_int(flush_timestamp, 1), "flush callback timestamp is missing")
     _require(
         _is_int(terminal_timestamp, 1), "terminal publication timestamp is missing"
     )
-    _require(
-        int(flush_timestamp) >= int(data_timestamp), "flush preceded data completion"
-    )
     if transport == "self":
+        _require(int(asynchronous_requests) == 0, "self completion was not immediate")
+        _require(
+            int(flush_callbacks) == 0, "self unexpectedly invoked a flush callback"
+        )
+        _require(flush_timestamp == 0, "self emitted a flush callback timestamp")
+        _require(
+            post_count - callback_count == endpoint_count,
+            "self immediate flush completions differ from endpoint authority",
+        )
         _require(
             notification_timestamp == 0, "self emitted a remote notification timestamp"
         )
         _require(
-            int(terminal_timestamp) >= int(flush_timestamp), "terminal preceded flush"
+            int(terminal_timestamp) >= int(data_timestamp),
+            "self terminal publication preceded data completion",
         )
     else:
+        _require(
+            int(flush_callbacks) == endpoint_count,
+            "TCP flush callbacks differ from endpoint authority",
+        )
+        _require(
+            post_count == callback_count,
+            "TCP completion bypassed its native callback",
+        )
+        _require(
+            int(asynchronous_requests) > 0,
+            "TCP did not exercise asynchronous completion",
+        )
+        _require(_is_int(flush_timestamp, 1), "flush callback timestamp is missing")
+        _require(
+            int(flush_timestamp) >= int(data_timestamp),
+            "flush preceded data completion",
+        )
         _require(
             _is_int(notification_timestamp, 1), "notification timestamp is missing"
         )
@@ -285,12 +347,14 @@ def _validate_terminal_progress(
     return int(before_return), after_return
 
 
-def _validate_population(population: object, transport: str) -> tuple[str, int, int]:
+def _validate_population(
+    population: object, transport: str
+) -> tuple[str, int, int, int, int]:
     """Validate one small or large transfer population.
 
     :param population: Population receipt.
     :param transport: Observed UCX transport.
-    :returns: Population name and callback ordering counts.
+    :returns: Population name, callback ordering counts, handle identity, and generation.
     :raises ValueError: If byte integrity or completion authority is incomplete.
     """
     _require(isinstance(population, dict), "completion population is not an object")
@@ -330,6 +394,10 @@ def _validate_population(population: object, transport: str) -> tuple[str, int, 
         _is_sha256(population.get("attestation_sha256")),
         "attestation digest is malformed",
     )
+    handle_identity = population.get("attestation_handle_identity")
+    generation = population.get("attestation_generation")
+    _require(_is_int(handle_identity, 1), "attestation handle identity is invalid")
+    _require(_is_int(generation, 1), "attestation generation is invalid")
     _require(population.get("completion_claimed") is True, "completion was not claimed")
     _require(
         population.get("take_once_second_status") == "NIXL_ERR_NOT_ALLOWED",
@@ -353,10 +421,11 @@ def _validate_population(population: object, transport: str) -> tuple[str, int, 
         >= int(population["event_native_timestamp_ns"]),
         "terminal event drain ordering is invalid",
     )
+    endpoint_count = _validate_endpoint_flushes(population.get("endpoint_flushes"))
     before, after = _validate_terminal_progress(
-        population.get("terminal_progress"), transport
+        population.get("terminal_progress"), transport, endpoint_count
     )
-    return str(name), before, after
+    return str(name), before, after, int(handle_identity), int(generation)
 
 
 def _validate_capability_route(
@@ -575,21 +644,43 @@ def _validate_case(case: object) -> tuple[str, str]:
     )
     _require(source_capacity == destination_capacity, "registration capacities differ")
     populations = case.get("completion_populations")
+    expected_populations = list(_BASE_POPULATIONS)
+    if engine == "thread_pool":
+        expected_populations.extend(_THREAD_POOL_REPOST_POPULATIONS)
     _require(
-        isinstance(populations, list) and len(populations) == 2,
-        "populations are incomplete",
+        isinstance(populations, list) and len(populations) == len(expected_populations),
+        "population matrix is incomplete",
     )
-    population_names: set[str] = set()
+    _require(
+        [
+            population.get("population")
+            for population in populations
+            if isinstance(population, dict)
+        ]
+        == expected_populations,
+        "population order or names differ from the engine contract",
+    )
     before_return = 0
     after_return = 0
+    population_authority: list[tuple[str, int, int]] = []
     for population in populations:
-        name, before, after = _validate_population(population, str(transport))
-        population_names.add(name)
+        name, before, after, handle_identity, generation = _validate_population(
+            population, str(transport)
+        )
+        population_authority.append((name, handle_identity, generation))
         before_return += before
         after_return += after
-    _require(
-        population_names == _POPULATIONS, "small and large populations are not unique"
-    )
+    if engine == "thread_pool":
+        first_repost = population_authority[-2]
+        second_repost = population_authority[-1]
+        _require(
+            first_repost[1] == second_repost[1],
+            "thread-pool repost changed request identity",
+        )
+        _require(
+            second_repost[2] > first_repost[2],
+            "thread-pool repost did not advance transfer generation",
+        )
     if transport == "self":
         _require(before_return > 0, "self did not prove callback-before-poster-return")
     else:
