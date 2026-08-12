@@ -796,7 +796,7 @@ runTcpEndpointFailureFixture(const std::string &engine) {
                   NIXL_SUCCESS,
                   "query endpoint-failure transfer subscription");
     require(transfer_info.active && transfer_info.identity == prepared_attestation.handleIdentity &&
-                transfer_info.generation == prepared_attestation.generation,
+                transfer_info.generation == prepared_attestation.generation + 1,
             "endpoint-failure subscription changed transfer generation");
     const nixl_status_t post_status = source.agent.postXferReq(request);
     require(post_status == NIXL_IN_PROG, "endpoint-failure transfer completed before peer death");
@@ -894,7 +894,7 @@ runTcpNotificationFailureFixture(const std::string &engine) {
                   NIXL_SUCCESS,
                   "query notification-failure transfer subscription");
     require(transfer_info.active && transfer_info.identity == prepared_attestation.handleIdentity &&
-                transfer_info.generation == prepared_attestation.generation,
+                transfer_info.generation == prepared_attestation.generation + 1,
             "notification-failure subscription changed transfer generation");
     const std::size_t terminal_byte_offset = notification_failure_bytes - 1;
     peer.armStopAfterWrite(terminal_byte_offset, source.memory->byteAt(terminal_byte_offset));
