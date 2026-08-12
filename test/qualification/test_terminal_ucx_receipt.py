@@ -31,13 +31,14 @@ def _not_applicable() -> dict[str, object]:
     }
 
 
-def _inventory() -> dict[str, object]:
+def _inventory(capacity: int = 64) -> dict[str, object]:
     """Build one clean public lifecycle inventory.
 
+    :param capacity: Channel capacity represented by the inventory.
     :returns: Valid zero-inventory receipt.
     """
     return {
-        "capacity": 64,
+        "capacity": capacity,
         "queued_channel_events": 0,
         "active_channel_subscriptions": 0,
         "retained_public_subscriptions": 0,
@@ -106,7 +107,7 @@ def _population(
     :returns: Valid population receipt.
     """
     digest = hashlib.sha256(f"{transport}:{engine}:{population}".encode()).hexdigest()
-    byte_count = 4096 if population == "small" else 16 * 1024 * 1024
+    byte_count = 1024 if population == "small" else 64 * 1024 * 1024
     endpoint_count = 2 if engine == "thread_pool" and population != "small" else 1
     endpoint_flushes = [
         {
@@ -120,7 +121,7 @@ def _population(
     ]
     return {
         "population": population,
-        "descriptor_count": 1 if population == "small" else 4,
+        "descriptor_count": 1 if population == "small" else 8,
         "byte_count": byte_count,
         "destination_byte_count": byte_count,
         "source_sha256": digest,
@@ -235,7 +236,10 @@ def _faults(transport: str) -> dict[str, object]:
     faults["remote_failure"] = _terminal_fault("NIXL_ERR_REMOTE_DISCONNECT")
     notification_failure = _terminal_fault("NIXL_ERR_REMOTE_DISCONNECT")
     notification_failure["data_remote_flushed_before_failure"] = True
-    notification_failure["notification_pending_at_remote_flush"] = True
+    notification_failure["notification_failed_after_remote_flush"] = True
+    notification_failure["source_progress_mode"] = "production"
+    notification_failure["fault_peer_engine"] = "thread_pool"
+    notification_failure["fault_peer_shared_worker_quiesced"] = True
     faults["notification_failure"] = notification_failure
     return faults
 
@@ -286,13 +290,13 @@ def _case(transport: str, engine: str, address_seed: int) -> dict[str, object]:
                 "status": "NIXL_SUCCESS",
                 "memory_type": "DRAM",
                 "base_address": address_seed,
-                "byte_capacity": 16 * 1024 * 1024,
+                "byte_capacity": 64 * 1024 * 1024,
             },
             "destination": {
                 "status": "NIXL_SUCCESS",
                 "memory_type": "DRAM",
                 "base_address": address_seed + 4096,
-                "byte_capacity": 16 * 1024 * 1024,
+                "byte_capacity": 64 * 1024 * 1024,
             },
         },
         "completion_populations": populations,
@@ -306,12 +310,23 @@ def _case(transport: str, engine: str, address_seed: int) -> dict[str, object]:
         ),
         "faults": _faults(transport),
         "runtime_artifacts": [
-            {"component": "libnixl", "path": "/tmp/libnixl.so", "build_id": "aa"},
-            {"component": "libucp", "path": "/tmp/libucp.so", "build_id": "bb"},
+            {
+                "component": "libnixl",
+                "path": "/tmp/libnixl.so",
+                "build_id": "aa",
+                "version": "1.3.2",
+            },
+            {
+                "component": "libucp",
+                "path": "/tmp/libucp.so",
+                "build_id": "bb",
+                "version": "1.21.0",
+            },
             {
                 "component": "ucx-plugin",
                 "path": "/tmp/libplugin_UCX.so",
                 "build_id": "cc",
+                "version": "1.3.2",
             },
         ],
         "shutdown": _inventory(),
@@ -331,20 +346,39 @@ def _invocation(transport: str, engine: str) -> dict[str, object]:
         transport,
         "--engine",
         engine,
+        "--output",
+        f"/workspace/evidence/{transport}-{engine}.json",
     ]
+    environment = {
+        "CUDA_VISIBLE_DEVICES": "",
+        "NVIDIA_VISIBLE_DEVICES": "void",
+        "UCX_TLS": transport,
+        "NIXL_PLUGIN_DIR": "/workspace/build/src/plugins",
+        "LD_LIBRARY_PATH": "/workspace/build/src/core",
+        "NIXL_TELEMETRY_ENABLE": "n",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+    }
+    if transport == "tcp":
+        environment["UCX_NET_DEVICES"] = "lo"
     return {
         "transport": transport,
         "engine": engine,
         "argv": argv,
-        "trace_argv": ["/usr/bin/strace", "-f", *argv],
-        "environment": {
-            "CUDA_VISIBLE_DEVICES": "",
-            "NVIDIA_VISIBLE_DEVICES": "void",
-            "UCX_TLS": transport,
-            "UCX_NET_DEVICES": "lo" if transport == "tcp" else None,
-            "NIXL_PLUGIN_DIR": "/workspace/build/src/plugins",
-            "LD_LIBRARY_PATH": "/workspace/build/src/core",
-        },
+        "trace_argv": [
+            "/usr/bin/strace",
+            "-f",
+            "-qq",
+            "-e",
+            "trace=open,openat,openat2",
+            "-o",
+            f"/workspace/evidence/{transport}-{engine}.strace",
+            *argv,
+        ],
+        "environment": environment,
+        "stdout_path": f"/workspace/evidence/{transport}-{engine}.stdout.log",
+        "stderr_path": f"/workspace/evidence/{transport}-{engine}.stderr.log",
+        "strace_path": f"/workspace/evidence/{transport}-{engine}.strace",
     }
 
 
@@ -382,7 +416,7 @@ def _receipt() -> dict[str, object]:
             "evidence_sources": ["strace", "/proc/<pid>/fd"],
         },
         "cases": cases,
-        "shutdown": _inventory(),
+        "shutdown": _inventory(capacity=len(cases) * 64),
     }
 
 
@@ -526,7 +560,7 @@ def test_validate_receipt_accepts_transport_aware_matrix() -> None:
                 2,
                 "faults",
                 "notification_failure",
-                "notification_pending_at_remote_flush",
+                "notification_failed_after_remote_flush",
             ),
             False,
         ),
@@ -536,6 +570,17 @@ def test_validate_receipt_accepts_transport_aware_matrix() -> None:
         ),
         (("cases", 2, "shutdown", "active_callback_slots"), 1),
         (("runtime_artifacts", 0, "build_id"), "not-hex"),
+        (("nixl_revision",), "g" * 40),
+        (("invocations", 0, "argv", 2), "tcp"),
+        (("invocations", 0, "trace_argv", 7), "/tmp/other-executable"),
+        (("invocations", 0, "environment", "PYTHONPATH"), "/tmp/injected"),
+        (("invocations", 0, "stdout_path"), "relative.stdout"),
+        (("cases", 0, "registrations", "source", "byte_capacity"), 1024),
+        (("cases", 0, "completion_populations", 0, "byte_count"), 4096),
+        (("cases", 0, "completion_populations", 1, "descriptor_count"), 4),
+        (("cases", 0, "runtime_artifacts", 0, "build_id"), "dd"),
+        (("runtime_artifacts", 0, "version"), ""),
+        (("shutdown", "capacity"), 64),
     ],
 )
 def test_validate_receipt_rejects_false_authority(

@@ -16,6 +16,20 @@ _THREAD_POOL_REPOST_POPULATIONS = (
 )
 _POPULATIONS = set(_BASE_POPULATIONS + _THREAD_POOL_REPOST_POPULATIONS)
 _RUNTIME_COMPONENTS = {"libnixl", "libucp", "ucx-plugin"}
+_ARENA_BYTES = 64 * 1024 * 1024
+_POPULATION_GEOMETRY = {
+    "small": (1, 1024),
+    "large": (8, _ARENA_BYTES),
+    "thread_pool_repost_generation_1": (8, _ARENA_BYTES),
+    "thread_pool_repost_generation_2": (8, _ARENA_BYTES),
+}
+_COMMON_ENVIRONMENT = {
+    "CUDA_VISIBLE_DEVICES": "",
+    "NVIDIA_VISIBLE_DEVICES": "void",
+    "NIXL_TELEMETRY_ENABLE": "n",
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
+}
 _SELF_NA_REASON = (
     "ucx_self_is_same_worker_only_and_nixl_local_routes_have_no_remote_agent_handle"
 )
@@ -31,6 +45,13 @@ _INVENTORY_ZERO_FIELDS = {
     "backend_producers",
     "active_callback_slots",
     "queued_owner_continuations",
+}
+_INVENTORY_FIELDS = _INVENTORY_ZERO_FIELDS | {
+    "capacity",
+    "accepting_subscriptions",
+    "closed",
+    "fatal",
+    "eventfd_error",
 }
 
 
@@ -62,6 +83,21 @@ def _is_sha256(value: object) -> bool:
     :returns: Whether the value is a lowercase hexadecimal digest.
     """
     if not isinstance(value, str) or len(value) != 64 or value != value.lower():
+        return False
+    try:
+        int(value, 16)
+    except ValueError:
+        return False
+    return True
+
+
+def _is_git_revision(value: object) -> bool:
+    """Return whether a value is a full hexadecimal Git object identifier.
+
+    :param value: Value to inspect.
+    :returns: Whether the value is a full SHA-1 object identifier.
+    """
+    if not isinstance(value, str) or len(value) != 40 or value != value.lower():
         return False
     try:
         int(value, 16)
@@ -104,6 +140,10 @@ def _validate_zero_inventory(inventory: object, context: str) -> None:
     :raises ValueError: If work, subscriptions, or fatal state remain.
     """
     _require(isinstance(inventory, dict), f"{context} inventory is missing")
+    _require(
+        set(inventory) == _INVENTORY_FIELDS,
+        f"{context} inventory fields differ from the public lifecycle schema",
+    )
     _require(_is_int(inventory.get("capacity"), 1), f"{context} capacity is invalid")
     for field in _INVENTORY_ZERO_FIELDS:
         _require(inventory.get(field) == 0, f"{context} retained {field}")
@@ -116,11 +156,11 @@ def _validate_zero_inventory(inventory: object, context: str) -> None:
     _require(inventory.get("eventfd_error") == 0, f"{context} eventfd failed")
 
 
-def _validate_invocation(invocation: object) -> tuple[str, str]:
+def _validate_invocation(invocation: object) -> tuple[str, str, str]:
     """Validate one exact real-UCX process invocation.
 
     :param invocation: Invocation receipt.
-    :returns: Transport and engine coordinate.
+    :returns: Transport, engine, and qualification executable path.
     :raises ValueError: If argv or process environment is incomplete.
     """
     _require(isinstance(invocation, dict), "invocation is not an object")
@@ -128,37 +168,71 @@ def _validate_invocation(invocation: object) -> tuple[str, str]:
     engine = invocation.get("engine")
     _require(transport in _TRANSPORTS, "invocation transport is invalid")
     _require(engine in _ENGINES, "invocation engine is invalid")
+    _require(
+        set(invocation)
+        == {
+            "transport",
+            "engine",
+            "argv",
+            "trace_argv",
+            "environment",
+            "stdout_path",
+            "stderr_path",
+            "strace_path",
+        },
+        "invocation fields differ from the sealed runner schema",
+    )
     argv = invocation.get("argv")
     trace_argv = invocation.get("trace_argv")
     _require(
         isinstance(argv, list)
-        and len(argv) > 0
+        and len(argv) == 7
         and all(isinstance(argument, str) and len(argument) > 0 for argument in argv),
         "invocation argv is missing",
     )
+    executable = str(argv[0])
+    output_path = str(argv[6])
     _require(
-        Path(str(argv[0])).is_absolute(), "qualification executable is not absolute"
+        Path(executable).is_absolute(), "qualification executable is not absolute"
     )
     _require(
+        argv[1:6] == ["--transport", transport, "--engine", engine, "--output"],
+        "qualification argv differs from its coordinate",
+    )
+    _require(
+        Path(output_path).is_absolute(), "qualification output path is not absolute"
+    )
+    strace_path = invocation.get("strace_path")
+    _require(
         isinstance(trace_argv, list)
-        and len(trace_argv) > len(argv)
+        and len(trace_argv) == len(argv) + 7
         and Path(str(trace_argv[0])).is_absolute(),
         "device-open trace invocation is missing",
     )
+    _require(
+        trace_argv[1:6] == ["-f", "-qq", "-e", "trace=open,openat,openat2", "-o"]
+        and trace_argv[6] == strace_path
+        and trace_argv[7:] == argv,
+        "device-open trace invocation differs from the native invocation",
+    )
+    for field in ("stdout_path", "stderr_path", "strace_path"):
+        value = invocation.get(field)
+        _require(
+            isinstance(value, str) and Path(value).is_absolute(),
+            f"invocation {field} is not an absolute path",
+        )
     environment = invocation.get("environment")
     _require(isinstance(environment, dict), "invocation environment is missing")
+    expected_environment = dict(_COMMON_ENVIRONMENT)
+    expected_environment["UCX_TLS"] = transport
+    if transport == "tcp":
+        expected_environment["UCX_NET_DEVICES"] = "lo"
     _require(
-        environment.get("CUDA_VISIBLE_DEVICES") == "", "CUDA visibility was not empty"
+        set(environment) == set(expected_environment) | {"NIXL_PLUGIN_DIR", "LD_LIBRARY_PATH"},
+        "invocation environment contains unbound state",
     )
-    _require(
-        environment.get("NVIDIA_VISIBLE_DEVICES") == "void",
-        "NVIDIA visibility was not void",
-    )
-    _require(environment.get("UCX_TLS") == transport, "UCX_TLS differs from coordinate")
-    _require(
-        environment.get("UCX_NET_DEVICES") == ("lo" if transport == "tcp" else None),
-        "UCX_NET_DEVICES differs from coordinate",
-    )
+    for name, expected in expected_environment.items():
+        _require(environment.get(name) == expected, f"invocation {name} changed")
     plugin_directory = environment.get("NIXL_PLUGIN_DIR")
     _require(
         isinstance(plugin_directory, str) and Path(plugin_directory).is_absolute(),
@@ -169,7 +243,7 @@ def _validate_invocation(invocation: object) -> tuple[str, str]:
         and len(str(environment["LD_LIBRARY_PATH"])) > 0,
         "LD_LIBRARY_PATH is missing",
     )
-    return str(transport), str(engine)
+    return str(transport), str(engine), executable
 
 
 def _validate_registration(registration: object, context: str) -> tuple[int, int]:
@@ -360,11 +434,14 @@ def _validate_population(
     _require(isinstance(population, dict), "completion population is not an object")
     name = population.get("population")
     _require(name in _POPULATIONS, "population name is invalid")
+    expected_descriptor_count, expected_byte_count = _POPULATION_GEOMETRY[str(name)]
     _require(
-        _is_int(population.get("descriptor_count"), 1), "descriptor count is invalid"
+        population.get("descriptor_count") == expected_descriptor_count,
+        f"{name} descriptor count differs from the frozen geometry",
     )
     _require(
-        _is_int(population.get("byte_count"), 1), "population transferred no bytes"
+        population.get("byte_count") == expected_byte_count,
+        f"{name} byte count differs from the frozen geometry",
     )
     _require(
         population.get("destination_byte_count") == population.get("byte_count"),
@@ -604,8 +681,17 @@ def _validate_faults(faults: object, transport: str) -> None:
         "notification failure lacked all-endpoint remote-flush authority",
     )
     _require(
-        notification_failure.get("notification_pending_at_remote_flush") is True,
-        "notification was terminal before the remote-flush failure boundary",
+        notification_failure.get("notification_failed_after_remote_flush") is True,
+        "notification failure did not follow the final remote-flush callback",
+    )
+    _require(
+        notification_failure.get("source_progress_mode") == "production",
+        "notification fixture did not retain the production source progress mode",
+    )
+    _require(
+        notification_failure.get("fault_peer_engine") == "thread_pool"
+        and notification_failure.get("fault_peer_shared_worker_quiesced") is True,
+        "notification fixture did not prove controlled fault-peer quiescence",
     )
 
 
@@ -647,6 +733,10 @@ def _validate_case(case: object) -> tuple[str, str]:
         source_address != destination_address, "source and destination buffers alias"
     )
     _require(source_capacity == destination_capacity, "registration capacities differ")
+    _require(
+        source_capacity == _ARENA_BYTES,
+        "registration capacity differs from the frozen arena geometry",
+    )
     populations = case.get("completion_populations")
     expected_populations = list(_BASE_POPULATIONS)
     if engine == "thread_pool":
@@ -703,6 +793,7 @@ def _validate_case(case: object) -> tuple[str, str]:
             "TCP attached-notification success coverage is incomplete",
         )
     _validate_faults(case.get("faults"), str(transport))
+    _validate_runtime_artifacts(case.get("runtime_artifacts"))
     _validate_zero_inventory(case.get("shutdown"), f"{transport}/{engine}")
     return str(transport), str(engine)
 
@@ -713,7 +804,10 @@ def _validate_runtime_artifacts(artifacts: object) -> None:
     :param artifacts: Runtime artifact inventory.
     :raises ValueError: If paths, build IDs, or components are incomplete.
     """
-    _require(isinstance(artifacts, list), "runtime artifact inventory is missing")
+    _require(
+        isinstance(artifacts, list) and len(artifacts) == len(_RUNTIME_COMPONENTS),
+        "runtime artifact inventory is missing",
+    )
     _require(
         all(isinstance(artifact, dict) for artifact in artifacts),
         "runtime artifact is not an object",
@@ -723,8 +817,13 @@ def _validate_runtime_artifacts(artifacts: object) -> None:
         "runtime artifact components are incomplete",
     )
     for artifact in artifacts:
+        _require(
+            set(artifact) == {"component", "path", "build_id", "version"},
+            "runtime artifact fields differ from the sealed schema",
+        )
         path = artifact.get("path")
         build_id = artifact.get("build_id")
+        version = artifact.get("version")
         _require(
             isinstance(path, str) and Path(path).is_absolute(),
             "runtime artifact path is not absolute",
@@ -732,6 +831,10 @@ def _validate_runtime_artifacts(artifacts: object) -> None:
         _require(
             isinstance(build_id, str) and len(build_id) > 0 and len(build_id) % 2 == 0,
             "runtime artifact build ID is malformed",
+        )
+        _require(
+            isinstance(version, str) and len(version) > 0,
+            "runtime artifact version is missing",
         )
         try:
             int(build_id, 16)
@@ -747,32 +850,31 @@ def validate_receipt(receipt: dict[str, object]) -> None:
     """
     _require(receipt.get("schema") == _SCHEMA, "unexpected receipt schema")
     _require(receipt.get("status") == "pass", "native qualification did not pass")
-    _require(
-        isinstance(receipt.get("nixl_revision"), str)
-        and len(str(receipt["nixl_revision"])) == 40,
-        "invalid NIXL revision",
-    )
-    _require(
-        isinstance(receipt.get("ucx_revision"), str)
-        and len(str(receipt["ucx_revision"])) == 40,
-        "invalid UCX revision",
-    )
+    _require(_is_git_revision(receipt.get("nixl_revision")), "invalid NIXL revision")
+    _require(_is_git_revision(receipt.get("ucx_revision")), "invalid UCX revision")
     _require(_is_sha256(receipt.get("executable_sha256")), "invalid executable digest")
     invocations = receipt.get("invocations")
     _require(
         isinstance(invocations, list) and len(invocations) == 4,
         "invocation matrix is incomplete",
     )
+    invocation_results = [_validate_invocation(invocation) for invocation in invocations]
     invocation_coordinates = {
-        _validate_invocation(invocation) for invocation in invocations
+        (transport, engine) for transport, engine, executable in invocation_results
     }
+    executable_paths = {executable for _, _, executable in invocation_results}
+    _require(
+        len(executable_paths) == 1,
+        "qualification executable changed across coordinates",
+    )
     expected_coordinates = {
         (transport, engine) for transport in _TRANSPORTS for engine in _ENGINES
     }
     _require(
         invocation_coordinates == expected_coordinates, "invocation coordinates differ"
     )
-    _validate_runtime_artifacts(receipt.get("runtime_artifacts"))
+    runtime_artifacts = receipt.get("runtime_artifacts")
+    _validate_runtime_artifacts(runtime_artifacts)
     zero_gpu = receipt.get("zero_gpu")
     _require(isinstance(zero_gpu, dict), "zero-GPU evidence is missing")
     _require(zero_gpu.get("cuda_visible_devices") == "", "GPU visibility was not empty")
@@ -793,13 +895,30 @@ def validate_receipt(receipt: dict[str, object]) -> None:
     )
     cases = receipt.get("cases")
     _require(isinstance(cases, list) and len(cases) == 4, "case matrix is incomplete")
-    case_coordinates = {_validate_case(case) for case in cases}
+    case_coordinates: set[tuple[str, str]] = set()
+    for case in cases:
+        case_coordinates.add(_validate_case(case))
+        _require(
+            isinstance(case, dict) and case.get("runtime_artifacts") == runtime_artifacts,
+            "runtime artifact identity changed across coordinates",
+        )
     _require(case_coordinates == expected_coordinates, "case coordinates differ")
     _require(
         case_coordinates == invocation_coordinates,
         "executed and evidenced cases differ",
     )
-    _validate_zero_inventory(receipt.get("shutdown"), "aggregate shutdown")
+    aggregate_shutdown = receipt.get("shutdown")
+    _validate_zero_inventory(aggregate_shutdown, "aggregate shutdown")
+    _require(isinstance(aggregate_shutdown, dict), "aggregate shutdown is missing")
+    coordinate_capacity = sum(
+        int(case["shutdown"]["capacity"])
+        for case in cases
+        if isinstance(case, dict) and isinstance(case.get("shutdown"), dict)
+    )
+    _require(
+        aggregate_shutdown.get("capacity") == coordinate_capacity,
+        "aggregate shutdown capacity does not conserve coordinate inventories",
+    )
 
 
 def seal_receipt(input_path: Path, output_path: Path) -> None:
