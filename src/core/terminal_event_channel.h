@@ -43,6 +43,7 @@ enum class terminal_channel_fatal_t : std::uint32_t {
     QUEUE_OVERFLOW = 1U << 0U,
     EVENTFD_FAILURE = 1U << 1U,
     ACTIVE_SUBSCRIPTIONS_ON_CLOSE = 1U << 2U,
+    INVALID_PUBLICATION = 1U << 3U,
 };
 
 enum class terminal_channel_close_result_t {
@@ -107,6 +108,9 @@ public:
 
         void
         release() noexcept;
+
+        void
+        failInvalidPublication() noexcept;
 
     private:
         subscription(std::shared_ptr<terminalEventChannelState> state,

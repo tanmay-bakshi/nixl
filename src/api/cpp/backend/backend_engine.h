@@ -172,6 +172,21 @@ class nixlBackendEngine {
             return NIXL_ERR_NOT_SUPPORTED;
         }
 
+        /**
+         * Subscribe to autonomous terminal delivery for the next submission generation.
+         *
+         * The backend atomically binds the exact next generation before returning. The
+         * returned lifetime owns cancellation; callbacks retain the shared sink independently.
+         */
+        virtual nixl_status_t
+        subscribeXferTerminal(
+            nixlBackendReqH *,
+            const nixlBackendTransferEventBinding &,
+            const std::shared_ptr<nixlBackendTransferTransitionSink> &,
+            std::unique_ptr<nixlBackendEventSubscription> &) {
+            return NIXL_ERR_NOT_SUPPORTED;
+        }
+
         //Backend aborts the transfer if necessary, and destructs the relevant objects
         virtual nixl_status_t releaseReqH(nixlBackendReqH* handle) const = 0;
 
@@ -240,6 +255,20 @@ class nixlBackendEngine {
         // or conflict.
         virtual nixl_status_t
         queryRemoteNotificationState(const nixlRemoteAgentBinding &) const {
+            return NIXL_ERR_NOT_SUPPORTED;
+        }
+
+        /**
+         * Subscribe to exact-route notification capability transitions.
+         *
+         * Implementations deliver an already-terminal snapshot before returning and never invoke
+         * the sink while holding a route-state mutex.
+         */
+        virtual nixl_status_t
+        subscribeRemoteNotificationState(
+            const nixlRemoteAgentBinding &,
+            const std::shared_ptr<nixlBackendCapabilityTransitionSink> &,
+            std::unique_ptr<nixlBackendEventSubscription> &) {
             return NIXL_ERR_NOT_SUPPORTED;
         }
 
