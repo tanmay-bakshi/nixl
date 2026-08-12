@@ -790,9 +790,10 @@ runTcpEndpointFailureFixture(const std::string &engine) {
     require(transfer_info.active && transfer_info.identity == prepared_attestation.handleIdentity &&
                 transfer_info.generation == prepared_attestation.generation + 1,
             "endpoint-failure subscription changed transfer generation");
+    peer.armExitAfterWrite(0, source.memory->byteAt(0));
     const nixl_status_t post_status = source.agent.postXferReq(request);
     require(post_status == NIXL_IN_PROG, "endpoint-failure transfer completed before peer death");
-    const bool peer_exited_by_signal = peer.killAndWait();
+    const bool peer_exited_by_signal = peer.waitForExitSignal(SIGKILL);
     require(peer_exited_by_signal, "TCP endpoint peer did not exit by SIGKILL");
 
     const observed_event_t transfer =
