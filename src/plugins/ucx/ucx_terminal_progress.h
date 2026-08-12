@@ -166,6 +166,7 @@ private:
 };
 
 enum class ucx_callback_kind_t {
+    DATA_CHUNK,
     ENDPOINT_FLUSH,
     NOTIFICATION,
 };

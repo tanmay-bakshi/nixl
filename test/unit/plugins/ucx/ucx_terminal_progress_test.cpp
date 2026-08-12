@@ -157,6 +157,79 @@ testNotificationAfterFlush() {
 }
 
 void
+testCallbacksBeforePostingSeal() {
+    std::size_t wake_count = 0;
+    auto queue = makeQueue(8, wake_count);
+    auto sink = std::make_shared<recording_sink_t>();
+    auto state = std::make_shared<terminal_submission_state_t>(
+        18, 108, 14, 1, 1, true, sink);
+    std::vector<std::string> order;
+    void *data_request = reinterpret_cast<void *>(0x6000);
+    void *flush_request = reinterpret_cast<void *>(0x7000);
+    void *notification_request = reinterpret_cast<void *>(0x8000);
+
+    auto data_slot = ucx_callback_slot_t::create(
+        state,
+        ucx_callback_kind_t::DATA_CHUNK,
+        queue,
+        [&](void *completed) {
+            require(completed == data_request, "data request identity changed");
+            order.emplace_back("data-release");
+        });
+    auto flush_slot = ucx_callback_slot_t::create(
+        state,
+        ucx_callback_kind_t::ENDPOINT_FLUSH,
+        queue,
+        [&](void *completed) {
+            require(completed == flush_request, "flush request identity changed");
+            order.emplace_back("flush-release");
+        });
+    auto notification_slot = ucx_callback_slot_t::create(
+        state,
+        ucx_callback_kind_t::NOTIFICATION,
+        queue,
+        [&](void *completed) {
+            require(completed == notification_request,
+                    "notification request identity changed");
+            order.emplace_back("notification-release");
+        });
+
+    require(state->registerFlush() == NIXL_SUCCESS, "flush registration failed");
+    data_slot->recordCallback(data_request, NIXL_SUCCESS, 90);
+    require(data_slot->armPoster(data_request, NIXL_IN_PROG, 91) == NIXL_SUCCESS,
+            "data poster handshake failed");
+    flush_slot->recordCallback(flush_request, NIXL_SUCCESS, 92);
+    require(flush_slot->armPoster(flush_request, NIXL_IN_PROG, 93) == NIXL_SUCCESS,
+            "flush poster handshake failed");
+    require(queue->drain() == 2, "early data callbacks were not delivered");
+    require(state->phase() == terminal_submission_phase_t::POSTING &&
+                sink->results.empty(),
+            "callbacks completed the submission before posting was sealed");
+
+    require(state->sealPosting(
+                [&]() {
+                    order.emplace_back("notification-post");
+                    notification_slot->recordCallback(
+                        notification_request, NIXL_SUCCESS, 94);
+                    require(notification_slot->armPoster(
+                                notification_request, NIXL_IN_PROG, 95) == NIXL_SUCCESS,
+                            "notification poster handshake failed");
+                    return NIXL_IN_PROG;
+                },
+                96) == NIXL_SUCCESS,
+            "posting seal stranded notification dispatch");
+    require(order == std::vector<std::string>(
+                         {"data-release", "flush-release", "notification-post"}),
+            "posting seal did not dispatch notification after early callbacks");
+    require(queue->drain() == 1, "notification continuation was not delivered");
+    require(sink->results.size() == 1 &&
+                sink->results[0].status == NIXL_SUCCESS &&
+                sink->results[0].nativeTimestampNs == 95,
+            "early-callback submission did not publish one terminal result");
+    require(wake_count == 3, "early callback path emitted unexpected wake count");
+}
+
+void
 testCancellationAndFailure() {
     std::size_t wake_count = 0;
     auto queue = makeQueue(8, wake_count);
@@ -316,6 +389,7 @@ main() {
     try {
         testCallbackBeforePosterReturn();
         testNotificationAfterFlush();
+        testCallbacksBeforePostingSeal();
         testCancellationAndFailure();
         testNotificationFailure();
         testCompositeFolding();

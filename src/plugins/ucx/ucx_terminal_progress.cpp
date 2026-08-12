@@ -207,7 +207,7 @@ terminal_submission_state_t::sealPosting(notification_post_t notification_post,
             transition = advanceLocked(timestamp_ns);
         }
     }
-    return finishTransition(std::move(transition));
+    return finishDataTransition(std::move(transition), timestamp_ns);
 }
 
 nixl_status_t
@@ -474,9 +474,18 @@ ucx_callback_slot_t::deliverOnOwner() noexcept {
         requestRelease_(request);
     }
 
-    nixl_status_t completion_status = kind_ == ucx_callback_kind_t::ENDPOINT_FLUSH ?
-        state_->completeFlush(status, timestamp_ns) :
-        state_->completeNotification(status, timestamp_ns);
+    nixl_status_t completion_status = NIXL_ERR_BACKEND;
+    switch (kind_) {
+    case ucx_callback_kind_t::DATA_CHUNK:
+        completion_status = state_->completeChunk(status, timestamp_ns);
+        break;
+    case ucx_callback_kind_t::ENDPOINT_FLUSH:
+        completion_status = state_->completeFlush(status, timestamp_ns);
+        break;
+    case ucx_callback_kind_t::NOTIFICATION:
+        completion_status = state_->completeNotification(status, timestamp_ns);
+        break;
+    }
     if (completion_status != NIXL_SUCCESS) {
         return completion_status;
     }
