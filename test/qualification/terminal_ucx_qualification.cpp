@@ -635,15 +635,13 @@ runShutdownCancellation(const options_t &options, std::uint64_t suffix) {
     const bool drained = inventory.backendProducers == 0 && inventory.activeCallbackSlots == 0 &&
         inventory.queuedOwnerContinuations == 0 && inventory.activeChannelSubscriptions == 0 &&
         inventory.retainedPublicSubscriptions == 0;
-    return {
-        {
-            .terminalStatus = event.transferStatus,
-            .terminalEventCount = 1,
-            .ownerWoken = true,
-        },
-        .cancelStatus = cancel_status,
-        .drained = drained,
-    };
+    shutdown_result_t result;
+    result.terminalStatus = event.transferStatus;
+    result.terminalEventCount = 1;
+    result.ownerWoken = true;
+    result.cancelStatus = cancel_status;
+    result.drained = drained;
+    return result;
 }
 
 [[nodiscard]] queue_overflow_result_t
