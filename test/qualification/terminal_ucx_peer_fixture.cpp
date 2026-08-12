@@ -242,12 +242,13 @@ namespace {
         require(engine == "shared" || engine == "thread_pool", "peer fixture engine is invalid");
         nixl_b_params_t parameters;
         parameters["ucx_error_handling_mode"] = "peer";
-        parameters["split_batch_size"] = "2";
         if (engine == "shared") {
+            parameters["split_batch_size"] = "2";
             parameters["num_workers"] = "2";
             parameters["num_threads"] = "0";
             return parameters;
         }
+        parameters["split_batch_size"] = "1";
         parameters["num_workers"] = "3";
         parameters["num_threads"] = "2";
         return parameters;
@@ -316,7 +317,10 @@ namespace {
         transferList(std::size_t size) const {
             require(size > 0 && size <= bytes_.size(), "peer transfer exceeds registered DRAM");
             nixl_xfer_dlist_t descriptors(DRAM_SEG);
-            descriptors.addDesc(nixlBasicDesc(address(), size, device_id));
+            const std::size_t first_size = size / 2;
+            descriptors.addDesc(nixlBasicDesc(address(), first_size, device_id));
+            descriptors.addDesc(
+                nixlBasicDesc(address() + first_size, size - first_size, device_id));
             return descriptors;
         }
 
@@ -613,7 +617,10 @@ namespace {
     remoteTransferList(const peer_hello_t &hello, std::size_t size) {
         require(size > 0 && size <= hello.capacity, "fault transfer exceeds peer registration");
         nixl_xfer_dlist_t descriptors(DRAM_SEG);
-        descriptors.addDesc(nixlBasicDesc(hello.address, size, device_id));
+        const std::size_t first_size = size / 2;
+        descriptors.addDesc(nixlBasicDesc(hello.address, first_size, device_id));
+        descriptors.addDesc(
+            nixlBasicDesc(hello.address + first_size, size - first_size, device_id));
         return descriptors;
     }
 
