@@ -386,6 +386,23 @@ namespace {
             stopped_ = true;
         }
 
+        void
+        stopAndWait() const {
+            require(pid_ > 0 && !waited_, "peer worker is not live");
+            if (::kill(pid_, SIGSTOP) != 0) {
+                throw peer_fixture_error("failed to stop TCP peer worker");
+            }
+            int status = 0;
+            while (::waitpid(pid_, &status, WUNTRACED) < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                throw peer_fixture_error("failed to observe stopped TCP peer worker");
+            }
+            require(WIFSTOPPED(status) && WSTOPSIG(status) == SIGSTOP,
+                    "TCP peer worker did not stop at the fault boundary");
+        }
+
         [[nodiscard]] bool
         killAndWait() {
             require(pid_ > 0 && !waited_, "peer worker is not live");
@@ -763,6 +780,9 @@ runTcpEndpointFailureFixture(const std::string &engine) {
     require(transfer_info.active && transfer_info.identity == prepared_attestation.handleIdentity &&
                 transfer_info.generation == prepared_attestation.generation + 1,
             "endpoint-failure subscription changed transfer generation");
+    // A stopped peer cannot drain its UCX TCP socket. Stop it immediately before
+    // posting so endpoint death, rather than a completed write, is terminal.
+    peer.stopAndWait();
     const nixl_status_t post_status = source.agent.postXferReq(request);
     require(post_status == NIXL_IN_PROG, "endpoint-failure transfer completed before peer death");
     const bool peer_exited_by_signal = peer.killAndWait();
