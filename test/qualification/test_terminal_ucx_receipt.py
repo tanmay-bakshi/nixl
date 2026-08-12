@@ -37,7 +37,8 @@ def _case(transport: str, engine: str, completion_mode: str) -> dict[str, object
         "terminal_native_timestamp_ns": 10,
         "drain_timestamp_ns": 11,
         "subscription_before_post": True,
-        "notification_after_terminal": True,
+        "terminal_after_notification_completion": True,
+        "callback_before_return_observed": transport == "self" and engine == "shared",
         "capability_snapshot_ready": True,
         "capability_retired": True,
     }
@@ -54,6 +55,37 @@ def _receipt() -> dict[str, object]:
         "nixl_revision": "1" * 40,
         "ucx_revision": "2" * 40,
         "executable_sha256": "3" * 64,
+        "commands": [
+            ["terminal_ucx_qualification", "--transport", "self", "--engine", "shared"],
+            [
+                "terminal_ucx_qualification",
+                "--transport",
+                "self",
+                "--engine",
+                "thread_pool",
+            ],
+            ["terminal_ucx_qualification", "--transport", "tcp", "--engine", "shared"],
+            [
+                "terminal_ucx_qualification",
+                "--transport",
+                "tcp",
+                "--engine",
+                "thread_pool",
+            ],
+        ],
+        "environment": {
+            "CUDA_VISIBLE_DEVICES": "",
+            "NVIDIA_VISIBLE_DEVICES": "void",
+        },
+        "runtime_artifacts": [
+            {"component": "libnixl", "path": "/tmp/libnixl.so", "build_id": "aa"},
+            {"component": "libucp", "path": "/tmp/libucp.so", "build_id": "bb"},
+            {
+                "component": "ucx-plugin",
+                "path": "/tmp/libplugin_UCX.so",
+                "build_id": "cc",
+            },
+        ],
         "zero_gpu": {
             "cuda_visible_devices": "",
             "nvidia_visible_devices": "void",
@@ -91,6 +123,8 @@ def test_validate_receipt_accepts_complete_matrix() -> None:
         (("cases", 0, "destination_sha256"), "0" * 64),
         (("cases", 0, "selected_transports"), ["tcp"]),
         (("cases", 0, "take_once_second_status"), "NIXL_SUCCESS"),
+        (("cases", 0, "terminal_after_notification_completion"), False),
+        (("runtime_artifacts", 0, "build_id"), "not-hex"),
     ],
 )
 def test_validate_receipt_rejects_false_authority(

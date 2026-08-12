@@ -19,7 +19,9 @@ from completion attestation rather than trusting the requested environment.
 The native executable must cover subscription-before-post, immediate and
 asynchronous completion populations, notification terminality, capability
 snapshot-after-ready and retirement, destination byte/SHA-256 verification,
-completion-attestation digest and take-once authority, and exact zero
+completion-attestation digest and take-once authority, explicit
+callback-before-return observations, loaded runtime paths/build IDs, exact
+argv/environment, and exact zero
 subscription/producer inventory at shutdown. `terminal_ucx_receipt.py`
 validates and seals the combined matrix.
 

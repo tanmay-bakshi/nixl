@@ -9,6 +9,7 @@ from pathlib import Path
 _SCHEMA = "nixl-terminal-ucx-qualification/v1"
 _TRANSPORTS = {"self", "tcp"}
 _ENGINES = {"shared", "thread_pool"}
+_RUNTIME_COMPONENTS = {"libnixl", "libucp", "ucx-plugin"}
 
 
 def _require(condition: bool, message: str) -> None:
@@ -66,7 +67,12 @@ def _validate_case(case: dict[str, object]) -> None:
         "subscription was not armed before post",
     )
     _require(
-        case.get("notification_after_terminal") is True, "notification ordering failed"
+        case.get("terminal_after_notification_completion") is True,
+        "terminal event preceded notification completion",
+    )
+    _require(
+        case.get("callback_before_return_observed") in {True, False},
+        "callback/poster ordering observation is missing",
     )
     _require(
         case.get("capability_snapshot_ready") is True,
@@ -100,6 +106,59 @@ def validate_receipt(receipt: dict[str, object]) -> None:
         and len(str(receipt["executable_sha256"])) == 64,
         "invalid executable digest",
     )
+
+    commands = receipt.get("commands")
+    _require(
+        isinstance(commands, list) and len(commands) == 4, "command matrix is missing"
+    )
+    for command in commands:
+        _require(
+            isinstance(command, list) and len(command) > 0,
+            "command is not an argv vector",
+        )
+        _require(
+            all(
+                isinstance(argument, str) and len(argument) > 0 for argument in command
+            ),
+            "command contains an invalid argument",
+        )
+
+    environment = receipt.get("environment")
+    _require(isinstance(environment, dict), "qualification environment is missing")
+    _require(
+        environment.get("CUDA_VISIBLE_DEVICES") == "", "CUDA visibility intent changed"
+    )
+    _require(
+        environment.get("NVIDIA_VISIBLE_DEVICES") == "void",
+        "NVIDIA visibility intent changed",
+    )
+
+    runtime_artifacts = receipt.get("runtime_artifacts")
+    _require(
+        isinstance(runtime_artifacts, list), "runtime artifact inventory is missing"
+    )
+    _require(
+        {artifact.get("component") for artifact in runtime_artifacts}
+        == _RUNTIME_COMPONENTS,
+        "runtime artifact components are incomplete",
+    )
+    for artifact in runtime_artifacts:
+        _require(isinstance(artifact, dict), "runtime artifact is not an object")
+        _require(
+            isinstance(artifact.get("path"), str)
+            and str(artifact["path"]).startswith("/"),
+            "runtime artifact path is not absolute",
+        )
+        _require(
+            isinstance(artifact.get("build_id"), str)
+            and len(str(artifact["build_id"])) > 0
+            and len(str(artifact["build_id"])) % 2 == 0,
+            "runtime artifact build ID is malformed",
+        )
+        try:
+            int(str(artifact["build_id"]), 16)
+        except ValueError as error:
+            raise ValueError("runtime artifact build ID is not hexadecimal") from error
 
     zero_gpu = receipt.get("zero_gpu")
     _require(isinstance(zero_gpu, dict), "zero-GPU evidence is missing")
