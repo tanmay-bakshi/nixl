@@ -19,6 +19,8 @@ namespace nixl {
 
 class terminalEventChannelState;
 
+inline constexpr std::size_t terminal_event_channel_max_capacity = 1U << 24U;
+
 enum class terminal_event_kind_t {
     TRANSFER,
     CAPABILITY,

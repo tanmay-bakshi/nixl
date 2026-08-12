@@ -4,6 +4,7 @@
  */
 #include "terminal_event_api.h"
 
+#include <array>
 #include <atomic>
 #include <barrier>
 #include <functional>
@@ -81,6 +82,21 @@ public:
     backendInventory(const std::shared_ptr<nixlTerminalEventSubscriptionH> &handle) {
         return handle->backendInventory();
     }
+
+    static bool
+    claimPublicRelease(const std::shared_ptr<nixlTerminalEventSubscriptionH> &handle) {
+        return handle->claimPublicRelease();
+    }
+
+    static void
+    restorePublicRelease(const std::shared_ptr<nixlTerminalEventSubscriptionH> &handle) {
+        handle->restorePublicRelease();
+    }
+
+    static nixl_status_t
+    drainCancellation(const std::shared_ptr<nixlTerminalEventSubscriptionH> &handle) {
+        return handle->drainCancellation();
+    }
 };
 
 namespace {
@@ -88,8 +104,10 @@ namespace {
 class testBackendSubscription final : public nixlBackendEventSubscription {
 public:
     explicit testBackendSubscription(
-        std::function<nixl_status_t()> cancel = []() { return NIXL_SUCCESS; })
-        : cancel_(std::move(cancel)) {}
+        std::function<nixl_status_t()> cancel = []() { return NIXL_SUCCESS; },
+        std::function<nixl_status_t()> drain = []() { return NIXL_SUCCESS; })
+        : cancel_(std::move(cancel)),
+          drain_(std::move(drain)) {}
 
     nixl_status_t
     cancel() noexcept override {
@@ -102,11 +120,30 @@ public:
         inventory = inventory_;
     }
 
+    nixl_status_t
+    drainCancellation() noexcept override {
+        ++drainCount;
+        return drain_();
+    }
+
     std::atomic<int> cancelCount = 0;
+    std::atomic<int> drainCount = 0;
     nixlBackendEventSubscriptionInventory inventory_;
 
 private:
     std::function<nixl_status_t()> cancel_;
+    std::function<nixl_status_t()> drain_;
+};
+
+class cancelOnlyBackendSubscription final : public nixlBackendEventSubscription {
+public:
+    nixl_status_t
+    cancel() noexcept override {
+        ++cancelCount;
+        return NIXL_IN_PROG;
+    }
+
+    std::atomic<int> cancelCount = 0;
 };
 
 TEST(TerminalEventApi, TransferAdapterPublishesExactTerminalOnce) {
@@ -394,6 +431,63 @@ TEST(TerminalEventApi, SynchronousTransferCancellationCanCompleteInOneCall) {
     EXPECT_EQ(backend_subscription_ptr->cancelCount.load(), 1);
 }
 
+TEST(TerminalEventApi, DrainCancellationWaitsForExactTerminalCallback) {
+    nixl::terminalEventChannel channel(1);
+    const auto channel_subscription = channel.subscribe({
+        .kind = nixl::terminal_event_kind_t::TRANSFER,
+        .ownerCookie = 9,
+        .identity = 30,
+        .generation = 5,
+    });
+    const auto adapter = std::make_shared<nixlTerminalTransferAdapter>(
+        nixlBackendTransferEventBinding{30, 5}, channel_subscription);
+    auto backend_subscription = std::make_unique<testBackendSubscription>(
+        []() { return NIXL_IN_PROG; },
+        [adapter]() {
+            adapter->publish({{30, 5}, NIXL_ERR_CANCELED, 1000});
+            return NIXL_SUCCESS;
+        });
+    testBackendSubscription *const backend_subscription_ptr = backend_subscription.get();
+    const auto handle = nixlTerminalEventSubscriptionTestPeer::makeTransfer(
+        std::move(backend_subscription), adapter);
+    nixlTerminalEventSubscriptionTestPeer::bind(handle, adapter);
+
+    EXPECT_EQ(nixlTerminalEventSubscriptionTestPeer::requestCancellation(handle),
+              NIXL_IN_PROG);
+    EXPECT_TRUE(nixlTerminalEventSubscriptionTestPeer::snapshot(handle).active);
+    EXPECT_EQ(nixlTerminalEventSubscriptionTestPeer::drainCancellation(handle),
+              NIXL_SUCCESS);
+    EXPECT_FALSE(nixlTerminalEventSubscriptionTestPeer::snapshot(handle).active);
+    EXPECT_EQ(channel.inventory().activeSubscriptions, 0U);
+    EXPECT_EQ(backend_subscription_ptr->cancelCount.load(), 1);
+    EXPECT_EQ(backend_subscription_ptr->drainCount.load(), 1);
+}
+
+TEST(TerminalEventApi, MissingCancellationDrainFailsClosedWithoutRecanceling) {
+    nixl::terminalEventChannel channel(1);
+    const auto channel_subscription = channel.subscribe({
+        .kind = nixl::terminal_event_kind_t::TRANSFER,
+        .ownerCookie = 9,
+        .identity = 30,
+        .generation = 5,
+    });
+    const auto adapter = std::make_shared<nixlTerminalTransferAdapter>(
+        nixlBackendTransferEventBinding{30, 5}, channel_subscription);
+    auto backend_subscription = std::make_unique<cancelOnlyBackendSubscription>();
+    cancelOnlyBackendSubscription *const backend_subscription_ptr =
+        backend_subscription.get();
+    const auto handle = nixlTerminalEventSubscriptionTestPeer::makeTransfer(
+        std::move(backend_subscription), adapter);
+    nixlTerminalEventSubscriptionTestPeer::bind(handle, adapter);
+
+    EXPECT_EQ(nixlTerminalEventSubscriptionTestPeer::requestCancellation(handle),
+              NIXL_IN_PROG);
+    EXPECT_EQ(nixlTerminalEventSubscriptionTestPeer::drainCancellation(handle),
+              NIXL_ERR_NOT_SUPPORTED);
+    EXPECT_TRUE(nixlTerminalEventSubscriptionTestPeer::snapshot(handle).active);
+    EXPECT_EQ(backend_subscription_ptr->cancelCount.load(), 1);
+}
+
 TEST(TerminalEventApi, CapabilityCancellationMayTerminateImmediately) {
     nixl::terminalEventChannel channel(1);
     const auto channel_subscription = channel.subscribe({
@@ -474,6 +568,41 @@ TEST(TerminalEventApi, BackendLifecycleInventoryKeepsDistinctCounts) {
     EXPECT_EQ(inventory.backendProducers, 2U);
     EXPECT_EQ(inventory.activeCallbackSlots, 3U);
     EXPECT_EQ(inventory.queuedOwnerContinuations, 4U);
+}
+
+TEST(TerminalEventApi, PublicReleaseAuthorityIsTakeOnceAcrossConcurrentCallers) {
+    nixl::terminalEventChannel channel(1);
+    const auto channel_subscription = channel.subscribe({
+        .kind = nixl::terminal_event_kind_t::TRANSFER,
+        .ownerCookie = 9,
+        .identity = 30,
+        .generation = 5,
+    });
+    const auto adapter = std::make_shared<nixlTerminalTransferAdapter>(
+        nixlBackendTransferEventBinding{30, 5}, channel_subscription);
+    auto backend_subscription = std::make_unique<testBackendSubscription>();
+    const auto handle = nixlTerminalEventSubscriptionTestPeer::makeTransfer(
+        std::move(backend_subscription), adapter);
+    std::barrier start(3);
+    std::array<bool, 2> claims = {};
+
+    std::thread first([&]() {
+        start.arrive_and_wait();
+        claims[0] = nixlTerminalEventSubscriptionTestPeer::claimPublicRelease(handle);
+    });
+    std::thread second([&]() {
+        start.arrive_and_wait();
+        claims[1] = nixlTerminalEventSubscriptionTestPeer::claimPublicRelease(handle);
+    });
+    start.arrive_and_wait();
+    first.join();
+    second.join();
+
+    EXPECT_NE(claims[0], claims[1]);
+    EXPECT_EQ(static_cast<int>(claims[0]) + static_cast<int>(claims[1]), 1);
+    EXPECT_FALSE(nixlTerminalEventSubscriptionTestPeer::claimPublicRelease(handle));
+    nixlTerminalEventSubscriptionTestPeer::restorePublicRelease(handle);
+    EXPECT_TRUE(nixlTerminalEventSubscriptionTestPeer::claimPublicRelease(handle));
 }
 
 } // namespace
