@@ -2616,7 +2616,9 @@ nixlUcxEngine::sendXferRange(const nixl_xfer_op_t &operation,
             }
         }
         const nixl_status_t ret = ep->flushEp(req, terminal_slot.get());
-        const nixl_status_t evidence_status = int_handle->recordFlush(*ep, ret);
+        const nixl_status_t evidence_status = int_handle->recordFlush(
+            *ep,
+            terminal_slot != nullptr && ret == NIXL_SUCCESS ? NIXL_IN_PROG : ret);
         if (evidence_status != NIXL_SUCCESS) {
             if (terminal_slot != nullptr) {
                 static_cast<void>(terminal_slot->armPoster(

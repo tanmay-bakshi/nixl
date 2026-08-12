@@ -47,6 +47,8 @@ namespace {
 
 class terminalEventChannelState {
 public:
+    using authority_commit_t = terminalEventChannel::subscription::authority_commit_t;
+
     explicit terminalEventChannelState(std::size_t capacity)
         : capacity_(capacity),
           events_(capacity),
@@ -76,6 +78,41 @@ public:
     void
     releaseSubscription() noexcept {
         const std::lock_guard lock(mutex_);
+        releaseSubscriptionLocked();
+    }
+
+    [[nodiscard]] terminal_event_publish_result_t
+    publish(terminal_event_t event) noexcept {
+        return publishControlled(std::move(event), false, false, {});
+    }
+
+    [[nodiscard]] terminal_event_publish_result_t
+    publishAuthoritative(terminal_event_t event,
+                         bool terminal_on_success,
+                         authority_commit_t authority_commit) noexcept {
+        return publishControlled(
+            std::move(event), terminal_on_success, true, std::move(authority_commit));
+    }
+
+    void
+    failInvalidPublication() noexcept {
+        const std::lock_guard lock(mutex_);
+        setFatalLocked(terminal_channel_fatal_t::INVALID_PUBLICATION, 0);
+        static_cast<void>(signalLocked());
+    }
+
+    void
+    failInvalidPublicationAuthoritative(authority_commit_t authority_commit) noexcept {
+        const std::lock_guard lock(mutex_);
+        setFatalLocked(terminal_channel_fatal_t::INVALID_PUBLICATION, 0);
+        authority_commit();
+        releaseSubscriptionLocked();
+        static_cast<void>(signalLocked());
+    }
+
+private:
+    void
+    releaseSubscriptionLocked() noexcept {
         if (activeSubscriptions_ == 0) {
             return;
         }
@@ -87,35 +124,40 @@ public:
     }
 
     [[nodiscard]] terminal_event_publish_result_t
-    publish(terminal_event_t event) noexcept {
+    publishControlled(terminal_event_t event,
+                      bool terminal_on_success,
+                      bool terminal_on_failure,
+                      authority_commit_t authority_commit) noexcept {
         const std::lock_guard lock(mutex_);
+        terminal_event_publish_result_t result = terminal_event_publish_result_t::PUBLISHED;
         if (fatal_ != terminal_channel_fatal_t::NONE) {
-            return terminal_event_publish_result_t::CHANNEL_FATAL;
-        }
-        if (closeRequested_ || closed_) {
-            return terminal_event_publish_result_t::CHANNEL_CLOSED;
-        }
-        if (queuedEvents_ == capacity_) {
+            result = terminal_event_publish_result_t::CHANNEL_FATAL;
+        } else if (closeRequested_ || closed_) {
+            result = terminal_event_publish_result_t::CHANNEL_CLOSED;
+        } else if (queuedEvents_ == capacity_) {
             setFatalLocked(terminal_channel_fatal_t::QUEUE_OVERFLOW, 0);
-            static_cast<void>(signalLocked());
-            return terminal_event_publish_result_t::CHANNEL_FATAL;
+            result = terminal_event_publish_result_t::CHANNEL_FATAL;
+        } else {
+            const std::size_t tail = (head_ + queuedEvents_) % capacity_;
+            events_[tail] = std::move(event);
+            ++queuedEvents_;
         }
 
-        const std::size_t tail = (head_ + queuedEvents_) % capacity_;
-        events_[tail] = std::move(event);
-        ++queuedEvents_;
+        const bool retire = result == terminal_event_publish_result_t::PUBLISHED ?
+            terminal_on_success : terminal_on_failure;
+        if (retire) {
+            // Authority becomes queryable before the eventfd can wake a consumer. The callback
+            // is restricted to public lifecycle state and must not recurse into this channel.
+            authority_commit();
+            releaseSubscriptionLocked();
+        }
         if (!signalLocked()) {
             return terminal_event_publish_result_t::CHANNEL_FATAL;
         }
-        return terminal_event_publish_result_t::PUBLISHED;
+        return result;
     }
 
-    void
-    fail(terminal_channel_fatal_t fatal) noexcept {
-        const std::lock_guard lock(mutex_);
-        setFatalLocked(fatal, 0);
-        static_cast<void>(signalLocked());
-    }
+public:
 
     [[nodiscard]] int
     fileno() const noexcept {
@@ -302,6 +344,45 @@ terminalEventChannel::subscription::publishTransfer(nixl_status_t status,
 }
 
 terminal_event_publish_result_t
+terminalEventChannel::subscription::publishTransferAuthoritative(
+    nixl_status_t status,
+    std::uint64_t native_timestamp_ns,
+    authority_commit_t authority_commit) noexcept {
+    std::shared_ptr<terminalEventChannelState> state;
+    terminal_event_t event;
+    {
+        const std::lock_guard lock(mutex_);
+        if (released_) {
+            return terminal_event_publish_result_t::CHANNEL_CLOSED;
+        }
+        if (binding_.kind != terminal_event_kind_t::TRANSFER ||
+            !isTerminalTransferStatus(status) || !authority_commit) {
+            return terminal_event_publish_result_t::INVALID_EVENT;
+        }
+        if (transferPublished_) {
+            return terminal_event_publish_result_t::ALREADY_PUBLISHED;
+        }
+
+        transferPublished_ = true;
+        released_ = true;
+        state = std::move(state_);
+        const std::uint64_t timestamp = native_timestamp_ns == 0 ?
+            monotonicRawTimestampNs() : native_timestamp_ns;
+        event = {
+            .kind = binding_.kind,
+            .ownerCookie = binding_.ownerCookie,
+            .identity = binding_.identity,
+            .generation = binding_.generation,
+            .result = status,
+            .epoch = 0,
+            .nativeTimestampNs = timestamp,
+        };
+    }
+    return state->publishAuthoritative(
+        std::move(event), true, std::move(authority_commit));
+}
+
+terminal_event_publish_result_t
 terminalEventChannel::subscription::publishCapability(terminal_capability_state_t capability_state,
                                                       std::uint64_t epoch,
                                                       std::uint64_t native_timestamp_ns) noexcept {
@@ -326,6 +407,43 @@ terminalEventChannel::subscription::publishCapability(terminal_capability_state_
     });
 }
 
+terminal_event_publish_result_t
+terminalEventChannel::subscription::publishCapabilityAuthoritative(
+    terminal_capability_state_t capability_state,
+    std::uint64_t epoch,
+    std::uint64_t native_timestamp_ns,
+    bool terminal_on_success,
+    authority_commit_t authority_commit) noexcept {
+    const std::lock_guard lock(mutex_);
+    if (released_) {
+        return terminal_event_publish_result_t::CHANNEL_CLOSED;
+    }
+    if (binding_.kind != terminal_event_kind_t::CAPABILITY || epoch == 0 ||
+        !authority_commit) {
+        return terminal_event_publish_result_t::INVALID_EVENT;
+    }
+
+    const std::uint64_t timestamp = native_timestamp_ns == 0 ?
+        monotonicRawTimestampNs() : native_timestamp_ns;
+    const terminal_event_publish_result_t result = state_->publishAuthoritative(
+        {
+            .kind = binding_.kind,
+            .ownerCookie = binding_.ownerCookie,
+            .identity = binding_.identity,
+            .generation = binding_.generation,
+            .result = capability_state,
+            .epoch = epoch,
+            .nativeTimestampNs = timestamp,
+        },
+        terminal_on_success,
+        std::move(authority_commit));
+    if (terminal_on_success || result != terminal_event_publish_result_t::PUBLISHED) {
+        released_ = true;
+        state_.reset();
+    }
+    return result;
+}
+
 void
 terminalEventChannel::subscription::release() noexcept {
     std::shared_ptr<terminalEventChannelState> state;
@@ -347,7 +465,22 @@ terminalEventChannel::subscription::failInvalidPublication() noexcept {
     if (released_) {
         return;
     }
-    state_->fail(terminal_channel_fatal_t::INVALID_PUBLICATION);
+    state_->failInvalidPublication();
+}
+
+void
+terminalEventChannel::subscription::failInvalidPublicationAuthoritative(
+    authority_commit_t authority_commit) noexcept {
+    std::shared_ptr<terminalEventChannelState> state;
+    {
+        const std::lock_guard lock(mutex_);
+        if (released_ || !authority_commit) {
+            return;
+        }
+        released_ = true;
+        state = std::move(state_);
+    }
+    state->failInvalidPublicationAuthoritative(std::move(authority_commit));
 }
 
 terminalEventChannel::terminalEventChannel(std::size_t capacity)

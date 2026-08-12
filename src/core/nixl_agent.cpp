@@ -1798,6 +1798,8 @@ nixlAgent::subscribeXferTerminal(
             std::move(backend_subscription),
             adapter));
     subscription = handle.get();
+    data->ownedTerminalSubscriptions_.emplace(subscription, subscription_identity);
+    data->terminalSubscriptions_.emplace(subscription_identity, handle);
     adapter->bindTerminalCallback([weak_handle = std::weak_ptr(handle)]() noexcept {
         if (const std::shared_ptr<nixlTerminalEventSubscriptionH> retained =
                 weak_handle.lock();
@@ -1805,8 +1807,6 @@ nixlAgent::subscribeXferTerminal(
             retained->markTerminal();
         }
     });
-    data->ownedTerminalSubscriptions_.emplace(subscription, subscription_identity);
-    data->terminalSubscriptions_.emplace(subscription_identity, std::move(handle));
     return NIXL_SUCCESS;
 }
 
@@ -1893,6 +1893,8 @@ nixlAgent::subscribeRemoteNotificationState(
             std::move(backend_subscription),
             adapter));
     subscription = handle.get();
+    data->ownedTerminalSubscriptions_.emplace(subscription, subscription_identity);
+    data->terminalSubscriptions_.emplace(subscription_identity, handle);
     adapter->bindTerminalCallback([weak_handle = std::weak_ptr(handle)]() noexcept {
         if (const std::shared_ptr<nixlTerminalEventSubscriptionH> retained =
                 weak_handle.lock();
@@ -1900,8 +1902,6 @@ nixlAgent::subscribeRemoteNotificationState(
             retained->markTerminal();
         }
     });
-    data->ownedTerminalSubscriptions_.emplace(subscription, subscription_identity);
-    data->terminalSubscriptions_.emplace(subscription_identity, std::move(handle));
     return NIXL_SUCCESS;
 }
 
