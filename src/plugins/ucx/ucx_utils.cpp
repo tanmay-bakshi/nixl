@@ -22,6 +22,7 @@
 #include <cstring>
 #include <exception>
 #include <limits>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -978,25 +979,30 @@ nixlUcxWorker::makeTerminalCallbackSlot(
     if (failNextTerminalCallbackSlot_.exchange(false, std::memory_order_acq_rel)) {
         return NIXL_ERR_BACKEND;
     }
-    slot = nixl::ucx::ucx_callback_slot_t::create(
-        std::move(state),
-        kind,
-        continuations_,
-        [this](void *request) { reqRelease(request); },
-        std::move(owner_before_completion),
-        [this, owner_after_completion = std::move(owner_after_completion)]() {
-            const nixl_status_t retire_status = continuations_->retireProducer();
-            const std::size_t previous =
-                activeTerminalCallbacks_.fetch_sub(1, std::memory_order_acq_rel);
-            if (previous == 0 ||
-                (retire_status != NIXL_SUCCESS &&
-                 retire_status != continuations_->fatalStatus())) {
-                (void)continuations_->fail(NIXL_ERR_BACKEND);
-            }
-            if (owner_after_completion) {
-                owner_after_completion();
-            }
-        });
+    try {
+        slot = nixl::ucx::ucx_callback_slot_t::create(
+            std::move(state),
+            kind,
+            continuations_,
+            [this](void *request) { reqRelease(request); },
+            std::move(owner_before_completion),
+            [this, owner_after_completion = std::move(owner_after_completion)]() {
+                const nixl_status_t retire_status = continuations_->retireProducer();
+                const std::size_t previous =
+                    activeTerminalCallbacks_.fetch_sub(1, std::memory_order_acq_rel);
+                if (previous == 0 ||
+                    (retire_status != NIXL_SUCCESS &&
+                     retire_status != continuations_->fatalStatus())) {
+                    (void)continuations_->fail(NIXL_ERR_BACKEND);
+                }
+                if (owner_after_completion) {
+                    owner_after_completion();
+                }
+            });
+    }
+    catch (const std::bad_alloc &) {
+        return NIXL_ERR_BACKEND;
+    }
     const nixl_status_t producer_status = continuations_->registerProducer();
     if (producer_status != NIXL_SUCCESS) {
         slot.reset();

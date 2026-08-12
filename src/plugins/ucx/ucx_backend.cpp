@@ -25,6 +25,7 @@
 #include <limits>
 #include <future>
 #include <set>
+#include <new>
 #include <string.h>
 #include <unistd.h>
 #include "absl/strings/numbers.h"
@@ -259,15 +260,18 @@ public:
         nixl::ucx::ucx_callback_kind_t kind,
         nixl::ucx::ucx_callback_slot_t::owner_before_completion_t before,
         std::shared_ptr<nixl::ucx::ucx_callback_slot_t> &slot) {
-        std::shared_ptr<nixl::ucx::terminal_submission_state_t> state;
-        {
-            const std::lock_guard lock(mutex_);
-            if (terminal_ || publishing_ || state_ == nullptr || worker == nullptr ||
-                !worker->hasProgressOwner()) {
-                return NIXL_ERR_NOT_ALLOWED;
-            }
-            state = state_;
+        const std::lock_guard lock(mutex_);
+        if (terminal_ || publishing_ || state_ == nullptr || worker == nullptr ||
+            !worker->hasProgressOwner()) {
+            return NIXL_ERR_NOT_ALLOWED;
         }
+        try {
+            slots_.reserve(slots_.size() + 1);
+        }
+        catch (const std::bad_alloc &) {
+            return NIXL_ERR_BACKEND;
+        }
+        const std::shared_ptr<nixl::ucx::terminal_submission_state_t> state = state_;
         const nixl_status_t register_status =
             kind == nixl::ucx::ucx_callback_kind_t::DATA_CHUNK ?
             state->registerChunk() :
@@ -308,11 +312,8 @@ public:
                      state->unregisterFlush() : NIXL_SUCCESS);
             return unregister_status == NIXL_SUCCESS ? NIXL_ERR_BACKEND : unregister_status;
         }
-        {
-            const std::lock_guard lock(mutex_);
-            slots_.push_back({worker, slot});
-            ++activeSlots_;
-        }
+        slots_.push_back({worker, slot});
+        ++activeSlots_;
         return NIXL_SUCCESS;
     }
 
