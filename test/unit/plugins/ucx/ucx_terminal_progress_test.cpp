@@ -315,6 +315,8 @@ testCancellationAndFailure() {
 
 void
 testNotificationFailure() {
+    std::size_t wake_count = 0;
+    auto queue = makeQueue(8, wake_count);
     auto sink = std::make_shared<recording_sink_t>();
     auto state = std::make_shared<terminal_submission_state_t>(
         15, 105, 11, 1, 1, true, sink);
@@ -325,11 +327,21 @@ testNotificationFailure() {
     require(state->sealPosting(
                 []() { return NIXL_ERR_REMOTE_DISCONNECT; }, 71) == NIXL_SUCCESS,
             "posting seal failed");
-    require(state->completeFlush(NIXL_SUCCESS, 72) == NIXL_SUCCESS,
-            "notification failure transition failed");
+    require(queue->enqueue([state]() {
+                return state->completeFlush(NIXL_SUCCESS, 72);
+            }) == NIXL_SUCCESS,
+            "notification failure continuation was not admitted");
+    require(queue->drain() == 1,
+            "notification failure continuation was not drained");
     require(sink->results.size() == 1 &&
                 sink->results[0].status == NIXL_ERR_REMOTE_DISCONNECT,
             "notification failure did not become exact terminal failure");
+    require(queue->fatalStatus() == NIXL_SUCCESS,
+            "notification transfer failure poisoned its continuation queue");
+    require(queue->enqueue([]() { return NIXL_SUCCESS; }) == NIXL_SUCCESS &&
+                queue->drain() == 1 && queue->fatalStatus() == NIXL_SUCCESS &&
+                wake_count == 2,
+            "continuation queue was not reusable after notification transfer failure");
 }
 
 void
