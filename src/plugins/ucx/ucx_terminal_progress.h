@@ -126,7 +126,11 @@ public:
     [[nodiscard]] nixl_status_t
     registerChunk();
     [[nodiscard]] nixl_status_t
+    unregisterChunk();
+    [[nodiscard]] nixl_status_t
     registerFlush();
+    [[nodiscard]] nixl_status_t
+    unregisterFlush();
     [[nodiscard]] nixl_status_t
     completeFlush(nixl_status_t status, std::uint64_t timestamp_ns);
     [[nodiscard]] nixl_status_t
@@ -249,6 +253,8 @@ public:
     isScheduled() const noexcept;
     [[nodiscard]] void *
     requestForCancellation() const noexcept;
+    [[nodiscard]] nixl_status_t
+    abandonBeforePost() noexcept;
 
 private:
     ucx_callback_slot_t(std::shared_ptr<terminal_submission_state_t> state,

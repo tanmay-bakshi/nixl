@@ -975,6 +975,9 @@ nixlUcxWorker::makeTerminalCallbackSlot(
     if (state == nullptr || slot != nullptr) {
         return NIXL_ERR_INVALID_PARAM;
     }
+    if (failNextTerminalCallbackSlot_.exchange(false, std::memory_order_acq_rel)) {
+        return NIXL_ERR_BACKEND;
+    }
     const nixl_status_t producer_status = continuations_->registerProducer();
     if (producer_status != NIXL_SUCCESS) {
         return producer_status;

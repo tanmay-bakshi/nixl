@@ -219,6 +219,11 @@ nixlUcxNotificationQueue::poison() {
 class nixlUcxTerminalArm final :
     public nixl::ucx::terminal_submission_sink_t,
     public std::enable_shared_from_this<nixlUcxTerminalArm> {
+    struct slot_record_t {
+        nixlUcxWorker *worker = nullptr;
+        std::shared_ptr<nixl::ucx::ucx_callback_slot_t> slot;
+    };
+
 public:
     nixlUcxTerminalArm(
         nixlBackendTransferEventBinding binding,
@@ -285,12 +290,74 @@ public:
                 }
             });
         if (slot_status != NIXL_SUCCESS) {
+            const nixl_status_t unregister_status =
+                kind == nixl::ucx::ucx_callback_kind_t::DATA_CHUNK ?
+                state->unregisterChunk() :
+                (kind == nixl::ucx::ucx_callback_kind_t::ENDPOINT_FLUSH ?
+                     state->unregisterFlush() : NIXL_SUCCESS);
+            if (unregister_status != NIXL_SUCCESS) {
+                return NIXL_ERR_BACKEND;
+            }
             return slot_status;
+        }
+        if (slot == nullptr) {
+            const nixl_status_t unregister_status =
+                kind == nixl::ucx::ucx_callback_kind_t::DATA_CHUNK ?
+                state->unregisterChunk() :
+                (kind == nixl::ucx::ucx_callback_kind_t::ENDPOINT_FLUSH ?
+                     state->unregisterFlush() : NIXL_SUCCESS);
+            return unregister_status == NIXL_SUCCESS ? NIXL_ERR_BACKEND : unregister_status;
         }
         {
             const std::lock_guard lock(mutex_);
             slots_.push_back({worker, slot});
             ++activeSlots_;
+        }
+        return NIXL_SUCCESS;
+    }
+
+    [[nodiscard]] nixl_status_t
+    abandonSlotBeforePost(
+        const std::shared_ptr<nixl::ucx::ucx_callback_slot_t> &slot,
+        nixl::ucx::ucx_callback_kind_t kind) noexcept {
+        if (slot == nullptr) {
+            return NIXL_ERR_INVALID_PARAM;
+        }
+        std::shared_ptr<nixl::ucx::terminal_submission_state_t> state;
+        {
+            const std::lock_guard lock(mutex_);
+            const auto record = std::find_if(
+                slots_.begin(), slots_.end(), [&slot](const slot_record_t &candidate) {
+                    return candidate.slot == slot;
+                });
+            if (record == slots_.end() || state_ == nullptr) {
+                return NIXL_ERR_NOT_ALLOWED;
+            }
+            state = state_;
+        }
+        const nixl_status_t unregister_status =
+            kind == nixl::ucx::ucx_callback_kind_t::DATA_CHUNK ?
+            state->unregisterChunk() :
+            (kind == nixl::ucx::ucx_callback_kind_t::ENDPOINT_FLUSH ?
+                 state->unregisterFlush() : NIXL_SUCCESS);
+        if (unregister_status != NIXL_SUCCESS) {
+            return unregister_status;
+        }
+        const nixl_status_t abandon_status = slot->abandonBeforePost();
+        if (abandon_status != NIXL_SUCCESS) {
+            return abandon_status;
+        }
+        {
+            const std::lock_guard lock(mutex_);
+            const auto record = std::find_if(
+                slots_.begin(), slots_.end(), [&slot](const slot_record_t &candidate) {
+                    return candidate.slot == slot;
+                });
+            if (record == slots_.end() || activeSlots_ == 0) {
+                return NIXL_ERR_BACKEND;
+            }
+            slots_.erase(record);
+            --activeSlots_;
         }
         return NIXL_SUCCESS;
     }
@@ -444,11 +511,6 @@ public:
     }
 
 private:
-    struct slot_record_t {
-        nixlUcxWorker *worker = nullptr;
-        std::shared_ptr<nixl::ucx::ucx_callback_slot_t> slot;
-    };
-
     [[nodiscard]] nixl_status_t
     finalizeTerminal(nixl::ucx::terminal_submission_result_t completed) noexcept {
         completed.diagnostics.activeCallbackSlotsAtTerminal = 0;

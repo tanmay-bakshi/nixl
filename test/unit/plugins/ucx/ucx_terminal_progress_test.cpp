@@ -513,6 +513,31 @@ testNoProgressOwnerIsUnsupported() {
             "claimed progress owner could not allocate a stable callback slot");
 }
 
+void
+testCallbackSlotAllocationFailureDoesNotRegisterProducer() {
+    nixlUcxContext context({},
+                           false,
+                           1,
+                           nixl_thread_sync_t::NIXL_THREAD_SYNC_STRICT,
+                           0,
+                           "TLS=self");
+    nixlUcxWorker worker(context);
+    require(worker.claimProgressOwner() == NIXL_SUCCESS,
+            "progress owner claim failed for allocation fault test");
+    auto sink = std::make_shared<recording_sink_t>();
+    auto state = std::make_shared<terminal_submission_state_t>(
+        21, 111, 17, 1, 1, false, sink);
+    std::shared_ptr<ucx_callback_slot_t> slot;
+    worker.failNextTerminalCallbackSlotForTest();
+    require(worker.makeTerminalCallbackSlot(
+                state, ucx_callback_kind_t::DATA_CHUNK, slot) == NIXL_ERR_BACKEND,
+            "injected callback-slot allocation failure was not returned");
+    require(slot == nullptr && worker.activeTerminalCallbackCount() == 0 &&
+                worker.getContinuationQueue()->producerCount() == 0 &&
+                worker.terminalLifecycleDrained(),
+            "callback-slot allocation failure leaked native ownership");
+}
+
 } // namespace
 
 int
@@ -529,6 +554,7 @@ main() {
         testOwnerEnqueueDrainsToQuiescenceWithoutReentrantWake();
         testOverflowDrainsCallbackOwnership();
         testNoProgressOwnerIsUnsupported();
+        testCallbackSlotAllocationFailureDoesNotRegisterProducer();
     }
     catch (const std::exception &error) {
         std::cerr << "ucx terminal progress test failed: " << error.what() << '\n';
