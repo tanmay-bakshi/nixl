@@ -55,6 +55,8 @@ namespace {
         REMOTE_METADATA_LOADED = 3,
         SHUTDOWN = 4,
         ERROR = 5,
+        ARM_EXIT_AFTER_WRITE = 6,
+        EXIT_WATCH_ARMED = 7,
     };
 
     class peer_fixture_error final : public std::runtime_error {
@@ -203,6 +205,30 @@ namespace {
         };
     }
 
+    [[nodiscard]] std::string
+    encodeExitWatch(std::size_t offset, std::uint8_t expected) {
+        const std::array<std::uint64_t, 2> values = {
+            static_cast<std::uint64_t>(offset),
+            static_cast<std::uint64_t>(expected),
+        };
+        return std::string(reinterpret_cast<const char *>(values.data()), sizeof(values));
+    }
+
+    [[nodiscard]] std::pair<std::size_t, std::uint8_t>
+    decodeExitWatch(std::string_view payload) {
+        require(payload.size() == sizeof(std::uint64_t) * 2,
+                "peer exit-watch frame has an invalid length");
+        std::array<std::uint64_t, 2> values = {};
+        std::memcpy(values.data(), payload.data(), payload.size());
+        require(values[0] <= std::numeric_limits<std::size_t>::max() &&
+                    values[1] <= std::numeric_limits<std::uint8_t>::max(),
+                "peer exit-watch frame is invalid");
+        return {
+            static_cast<std::size_t>(values[0]),
+            static_cast<std::uint8_t>(values[1]),
+        };
+    }
+
     [[nodiscard]] nixlAgentConfig
     agentConfig() {
         nixlAgentConfig config;
@@ -269,6 +295,21 @@ namespace {
         [[nodiscard]] std::size_t
         capacity() const noexcept {
             return bytes_.size();
+        }
+
+        [[nodiscard]] std::uint8_t
+        byteAt(std::size_t offset) const {
+            require(offset < bytes_.size(), "peer DRAM byte offset is out of range");
+            return bytes_[offset];
+        }
+
+        void
+        waitForByte(std::size_t offset, std::uint8_t expected) const {
+            require(offset < bytes_.size(), "peer exit-watch offset is out of range");
+            const volatile std::uint8_t *const observed = bytes_.data() + offset;
+            while (*observed != expected) {
+                std::this_thread::yield();
+            }
         }
 
         [[nodiscard]] nixl_xfer_dlist_t
@@ -366,6 +407,29 @@ namespace {
         loadRemoteMetadata(std::string_view metadata) {
             sendFrame(socket_, frame_kind_t::LOAD_REMOTE_METADATA, metadata);
             static_cast<void>(expect(frame_kind_t::REMOTE_METADATA_LOADED));
+        }
+
+        void
+        armExitAfterWrite(std::size_t offset, std::uint8_t expected) {
+            sendFrame(
+                socket_, frame_kind_t::ARM_EXIT_AFTER_WRITE, encodeExitWatch(offset, expected));
+            static_cast<void>(expect(frame_kind_t::EXIT_WATCH_ARMED));
+        }
+
+        [[nodiscard]] bool
+        waitForExitSignal(int expected_signal) {
+            require(pid_ > 0 && !waited_, "peer worker is not live");
+            int status = 0;
+            while (::waitpid(pid_, &status, 0) < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                throw peer_fixture_error("failed to reap self-terminated TCP peer worker");
+            }
+            waited_ = true;
+            static_cast<void>(::close(socket_));
+            socket_ = -1;
+            return WIFSIGNALED(status) && WTERMSIG(status) == expected_signal;
         }
 
         void
@@ -700,6 +764,19 @@ namespace {
         sendFrame(fd, frame_kind_t::REMOTE_METADATA_LOADED);
 
         frame = receiveFrame(fd);
+        if (frame.kind == frame_kind_t::ARM_EXIT_AFTER_WRITE) {
+            const auto [offset, expected] = decodeExitWatch(frame.payload);
+            require(offset < memory.capacity(), "peer exit-watch exceeds registered DRAM");
+            sendFrame(fd, frame_kind_t::EXIT_WATCH_ARMED);
+            memory.waitForByte(offset, expected);
+            requireStatus(agent.invalidateRemoteMD(remote),
+                          NIXL_SUCCESS,
+                          "retire source route at data boundary");
+            if (::raise(SIGKILL) != 0) {
+                throw peer_fixture_error("peer worker failed to exit at the data boundary");
+            }
+            throw peer_fixture_error("peer exit-watch survived SIGKILL");
+        }
         require(frame.kind == frame_kind_t::SHUTDOWN, "peer worker received an invalid command");
         requireStatus(
             agent.invalidateRemoteMD(remote), NIXL_SUCCESS, "retire peer worker source handle");
