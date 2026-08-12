@@ -34,7 +34,6 @@ class nixlRemoteAgentH;
 class nixlTerminalEventChannelH;
 class nixlTerminalEventSubscriptionH;
 
-
 /*** NIXL memory type, operation and status enums ***/
 
 /**
@@ -42,13 +41,13 @@ class nixlTerminalEventSubscriptionH;
  * @brief  An enumeration of segment types for NIXL
  *         FILE_SEG must be last
  */
-enum nixl_mem_t {DRAM_SEG, VRAM_SEG, BLK_SEG, OBJ_SEG, FILE_SEG};
+enum nixl_mem_t { DRAM_SEG, VRAM_SEG, BLK_SEG, OBJ_SEG, FILE_SEG };
 
 /**
  * @enum   nixl_xfer_op_t
  * @brief  An enumeration of different transfer types for NIXL
  */
-enum nixl_xfer_op_t {NIXL_READ, NIXL_WRITE};
+enum nixl_xfer_op_t { NIXL_READ, NIXL_WRITE };
 
 /**
  * @enum   nixl_status_t
@@ -89,11 +88,13 @@ enum class nixl_thread_sync_t {
  *            of different enums
  */
 namespace nixlEnumStrings {
-    std::string memTypeStr(const nixl_mem_t &mem);
-    std::string xferOpStr (const nixl_xfer_op_t &op);
-    std::string statusStr (const nixl_status_t &status);
-}
-
+std::string
+memTypeStr(const nixl_mem_t &mem);
+std::string
+xferOpStr(const nixl_xfer_op_t &op);
+std::string
+statusStr(const nixl_status_t &status);
+} // namespace nixlEnumStrings
 
 /*** NIXL typedefs and defines used in the API ***/
 
@@ -134,8 +135,7 @@ using nixl_notifs_t = std::unordered_map<std::string, std::vector<nixl_blob_t>>;
 /**
  * @brief Notifications attributed to an agent-owned remote handle.
  */
-using nixl_remote_notifs_t =
-    std::unordered_map<const nixlRemoteAgentH *, std::vector<nixl_blob_t>>;
+using nixl_remote_notifs_t = std::unordered_map<const nixlRemoteAgentH *, std::vector<nixl_blob_t>>;
 
 
 /**
@@ -171,7 +171,6 @@ enum class nixl_cost_t {
  */
 using nixl_query_resp_t = std::optional<nixl_b_params_t>;
 
-
 /**
  * @struct nixlAgentOptionalArgs
  * @brief A structure for optional argument that can be provided to relevant agent methods.
@@ -182,7 +181,7 @@ struct nixlAgentOptionalArgs {
      *      of backends to be considered. Used in registerMem / deregisterMem
      *      makeConnection / prepXferDlist / makeXferReq / createXferReq / GetNotifs / GenNotif
      */
-    std::vector<nixlBackendH*> backends;
+    std::vector<nixlBackendH *> backends;
 
     /**
      * @var notif Optional notification message used in createXferReq / makeXferReq / postXferReq.
@@ -217,13 +216,15 @@ struct nixlAgentOptionalArgs {
 
     /**
      * @var ipAddr Used to specify the IP address of a remote peer for metadata transfer.
-     *                      used in sendLocalMD, fetchRemoteMD, invalidateLocalMD, sendLocalPartialMD.
+     *                      used in sendLocalMD, fetchRemoteMD, invalidateLocalMD,
+     * sendLocalPartialMD.
      */
     std::string ipAddr;
 
     /**
      * @var port Used to specify the port of a remote peer, ipAddr must also be set
-     *                      used in sendLocalMD, fetchRemoteMD, invalidateLocalMD, sendLocalPartialMD.
+     *                      used in sendLocalMD, fetchRemoteMD, invalidateLocalMD,
+     * sendLocalPartialMD.
      */
     int port = default_comm_port;
 
@@ -233,8 +234,8 @@ struct nixlAgentOptionalArgs {
      *                    agent's key prefix, and the full key will be used to store/fetch
      *                    the metadata key-value pair from the server.
      *                    Used in fetchRemoteMD, sendLocalPartialMD.
-     *                    Note that sendLocalMD always uses default_metadata_label and ignores this parameter.
-     *                    Note that invalidateLocalMD invalidates all labels and ignores this parameter.
+     *                    Note that sendLocalMD always uses default_metadata_label and ignores this
+     * parameter. Note that invalidateLocalMD invalidates all labels and ignores this parameter.
      */
     std::string metadataLabel;
 
@@ -243,6 +244,7 @@ struct nixlAgentOptionalArgs {
      */
     nixl_blob_t customParam;
 };
+
 /**
  * @brief A typedef for a nixlAgentOptionalArgs
  *        for providing extra optional arguments
@@ -468,6 +470,84 @@ enum class nixl_terminal_channel_fatal_t : uint32_t {
 };
 
 /**
+ * @enum nixl_terminal_destination_phase_t
+ * @brief Active destination lifecycle phase for an attached notification.
+ */
+enum class nixl_terminal_destination_phase_t {
+    PENDING,
+    ADMITTING,
+    COMMITTED,
+    REPLAYING,
+    QUARANTINED,
+};
+
+/**
+ * @struct nixlTerminalSourceDelivery
+ * @brief Exact active source-delivery identity and join state.
+ */
+struct nixlTerminalSourceDelivery {
+    nixl_backend_t backend;
+    uint64_t deliveryIdentity = 0;
+    uint64_t sourceHandleIdentity = 0;
+    uint64_t sourceGeneration = 0;
+    bool localPending = false;
+    bool receiptPending = false;
+    bool deadlineActive = false;
+};
+
+using nixl_terminal_source_delivery_t = nixlTerminalSourceDelivery;
+
+/**
+ * @struct nixlTerminalDeadline
+ * @brief Exact active native transfer deadline identity.
+ */
+struct nixlTerminalDeadline {
+    nixl_backend_t backend;
+    uint64_t handleIdentity = 0;
+    uint64_t generation = 0;
+};
+
+using nixl_terminal_deadline_t = nixlTerminalDeadline;
+
+/**
+ * @struct nixlTerminalDestinationDelivery
+ * @brief Exact active destination-delivery identity and lifecycle phase.
+ */
+struct nixlTerminalDestinationDelivery {
+    nixl_backend_t backend;
+    std::string sourceBackendIncarnation;
+    uint64_t sourceHandleIdentity = 0;
+    uint64_t sourceGeneration = 0;
+    uint64_t deliveryIdentity = 0;
+    nixl_terminal_destination_phase_t phase = nixl_terminal_destination_phase_t::PENDING;
+};
+
+using nixl_terminal_destination_delivery_t = nixlTerminalDestinationDelivery;
+
+/**
+ * @struct nixlTerminalBackendLifecycleInventory
+ * @brief Aggregate live terminal-delivery obligations across unique backend engines.
+ *
+ * Completed tombstones are bounded replay evidence and do not contribute to this inventory.
+ */
+struct nixlTerminalBackendLifecycleInventory {
+    size_t sourceDeliveriesOutstanding = 0;
+    size_t sourceLocalPending = 0;
+    size_t sourceReceiptPending = 0;
+    size_t destinationPending = 0;
+    size_t destinationAdmitting = 0;
+    size_t destinationCommitted = 0;
+    size_t destinationReplaying = 0;
+    size_t destinationQuarantined = 0;
+    size_t activeNativeDeadlines = 0;
+    std::vector<nixl_terminal_source_delivery_t> sourceDeliveries;
+    std::vector<nixl_terminal_destination_delivery_t> destinationDeliveries;
+    std::vector<nixl_terminal_deadline_t> nativeDeadlines;
+};
+
+using nixl_terminal_backend_lifecycle_inventory_t = nixlTerminalBackendLifecycleInventory;
+
+/**
  * @struct nixlTerminalEvent
  * @brief Immutable-by-convention autonomous event drained from an agent channel.
  */
@@ -477,8 +557,7 @@ struct nixlTerminalEvent {
     uint64_t identity = 0;
     uint64_t generation = 0;
     nixl_status_t transferStatus = NIXL_ERR_NOT_READY;
-    nixl_terminal_capability_state_t capabilityState =
-        nixl_terminal_capability_state_t::FAILED;
+    nixl_terminal_capability_state_t capabilityState = nixl_terminal_capability_state_t::FAILED;
     uint64_t capabilityEpoch = 0;
     uint64_t nativeTimestampNs = 0;
 };
@@ -497,6 +576,7 @@ struct nixlTerminalChannelInventory {
     size_t backendProducers = 0;
     size_t activeCallbackSlots = 0;
     size_t queuedOwnerContinuations = 0;
+    nixl_terminal_backend_lifecycle_inventory_t backendLifecycle;
     bool acceptingSubscriptions = false;
     bool closed = false;
     nixl_terminal_channel_fatal_t fatal = nixl_terminal_channel_fatal_t::NONE;
@@ -530,6 +610,7 @@ struct nixlTerminalSubscriptionInfo {
 };
 
 using nixl_terminal_subscription_info_t = nixlTerminalSubscriptionInfo;
+
 /**
  * @struct nixlRemoteAgentAuthority
  * @brief Immutable authority captured from one active remote-agent generation.

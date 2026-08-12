@@ -21,6 +21,7 @@
 #include <iostream>
 #include <limits>
 #include <numeric>
+#include <unordered_set>
 
 #include "nixl.h"
 #include "serdes/serdes.h"
@@ -95,7 +96,8 @@ toPublicCapabilityState(nixl::terminal_capability_state_t state) noexcept {
 toPublicInventory(
     const nixl::terminal_channel_inventory_t &inventory,
     size_t retained_public_subscriptions,
-    const nixlBackendEventSubscriptionInventory &backend_inventory) noexcept {
+    const nixlBackendEventSubscriptionInventory &backend_inventory,
+    nixl_terminal_backend_lifecycle_inventory_t backend_lifecycle) noexcept {
     return {
         .capacity = inventory.capacity,
         .queuedChannelEvents = inventory.queuedEvents,
@@ -104,11 +106,89 @@ toPublicInventory(
         .backendProducers = backend_inventory.backendProducers,
         .activeCallbackSlots = backend_inventory.activeCallbackSlots,
         .queuedOwnerContinuations = backend_inventory.queuedOwnerContinuations,
+        .backendLifecycle = std::move(backend_lifecycle),
         .acceptingSubscriptions = inventory.acceptingSubscriptions,
         .closed = inventory.closed,
         .fatal = static_cast<nixl_terminal_channel_fatal_t>(inventory.health.fatal),
         .eventfdError = inventory.health.eventfdError,
     };
+}
+
+[[nodiscard]] nixl_terminal_destination_phase_t
+toPublicDestinationPhase(nixl_backend_terminal_destination_phase_t phase) noexcept {
+    switch (phase) {
+    case nixl_backend_terminal_destination_phase_t::PENDING:
+        return nixl_terminal_destination_phase_t::PENDING;
+    case nixl_backend_terminal_destination_phase_t::ADMITTING:
+        return nixl_terminal_destination_phase_t::ADMITTING;
+    case nixl_backend_terminal_destination_phase_t::COMMITTED:
+        return nixl_terminal_destination_phase_t::COMMITTED;
+    case nixl_backend_terminal_destination_phase_t::REPLAYING:
+        return nixl_terminal_destination_phase_t::REPLAYING;
+    case nixl_backend_terminal_destination_phase_t::QUARANTINED:
+        return nixl_terminal_destination_phase_t::QUARANTINED;
+    }
+    return nixl_terminal_destination_phase_t::QUARANTINED;
+}
+
+void
+addBackendLifecycleInventory(nixl_terminal_backend_lifecycle_inventory_t &aggregate,
+                             const nixl_backend_t &backend,
+                             const nixlBackendTerminalLifecycleInventory &inventory) {
+    aggregate.sourceDeliveriesOutstanding += inventory.sourceDeliveriesOutstanding;
+    aggregate.sourceLocalPending += inventory.sourceLocalPending;
+    aggregate.sourceReceiptPending += inventory.sourceReceiptPending;
+    aggregate.destinationPending += inventory.destinationPending;
+    aggregate.destinationAdmitting += inventory.destinationAdmitting;
+    aggregate.destinationCommitted += inventory.destinationCommitted;
+    aggregate.destinationReplaying += inventory.destinationReplaying;
+    aggregate.destinationQuarantined += inventory.destinationQuarantined;
+    aggregate.activeNativeDeadlines += inventory.activeNativeDeadlines;
+
+    for (const nixlBackendTerminalSourceDelivery &delivery : inventory.sourceDeliveries) {
+        aggregate.sourceDeliveries.push_back({
+            .backend = backend,
+            .deliveryIdentity = delivery.deliveryIdentity,
+            .sourceHandleIdentity = delivery.sourceHandleIdentity,
+            .sourceGeneration = delivery.sourceGeneration,
+            .localPending = delivery.localPending,
+            .receiptPending = delivery.receiptPending,
+            .deadlineActive = delivery.deadlineActive,
+        });
+    }
+    for (const nixlBackendTerminalDestinationDelivery &delivery : inventory.destinationDeliveries) {
+        aggregate.destinationDeliveries.push_back({
+            .backend = backend,
+            .sourceBackendIncarnation = delivery.sourceBackendIncarnation,
+            .sourceHandleIdentity = delivery.sourceHandleIdentity,
+            .sourceGeneration = delivery.sourceGeneration,
+            .deliveryIdentity = delivery.deliveryIdentity,
+            .phase = toPublicDestinationPhase(delivery.phase),
+        });
+    }
+    for (const nixlBackendTerminalDeadline &deadline : inventory.nativeDeadlines) {
+        aggregate.nativeDeadlines.push_back({
+            .backend = backend,
+            .handleIdentity = deadline.handleIdentity,
+            .generation = deadline.generation,
+        });
+    }
+}
+
+[[nodiscard]] nixl_terminal_backend_lifecycle_inventory_t
+queryBackendLifecycleInventory(const backend_map_t &backend_engines) {
+    nixl_terminal_backend_lifecycle_inventory_t aggregate;
+    std::unordered_set<const nixlBackendEngine *> queried_engines;
+    for (const auto &[backend, engine] : backend_engines) {
+        static_cast<void>(backend);
+        if (!queried_engines.insert(engine.get()).second) {
+            continue;
+        }
+        nixlBackendTerminalLifecycleInventory inventory;
+        engine->queryTerminalLifecycleInventory(inventory);
+        addBackendLifecycleInventory(aggregate, engine->getType(), inventory);
+    }
+    return aggregate;
 }
 
 void
@@ -1654,8 +1734,10 @@ nixlAgent::drainTerminalEvents(nixlTerminalEventChannelH *channel,
         addBackendInventory(backend_inventory, subscription->backendInventory());
     }
     result.wakeCount = native_batch.wakeCount;
-    result.inventory = toPublicInventory(
-        native_batch.inventory, data->terminalSubscriptions_.size(), backend_inventory);
+    result.inventory = toPublicInventory(native_batch.inventory,
+                                         data->terminalSubscriptions_.size(),
+                                         backend_inventory,
+                                         queryBackendLifecycleInventory(data->backendEngines_));
     batch = std::move(result);
     return NIXL_SUCCESS;
 }
@@ -1674,8 +1756,10 @@ nixlAgent::queryTerminalEventChannel(
         static_cast<void>(identity);
         addBackendInventory(backend_inventory, subscription->backendInventory());
     }
-    inventory = toPublicInventory(
-        channel->channel_.inventory(), data->terminalSubscriptions_.size(), backend_inventory);
+    inventory = toPublicInventory(channel->channel_.inventory(),
+                                  data->terminalSubscriptions_.size(),
+                                  backend_inventory,
+                                  queryBackendLifecycleInventory(data->backendEngines_));
     return NIXL_SUCCESS;
 }
 
@@ -1691,6 +1775,21 @@ nixlAgent::getTerminalEventSubscriptionCount(
     }
     count = data->terminalSubscriptions_.size();
     return NIXL_SUCCESS;
+}
+
+nixl_status_t
+nixlAgent::installAdmissionReceiptBarrier(
+    const nixlBackendH *backend,
+    nixlBackendAdmissionReceiptBarrier *barrier) const {
+    NIXL_SHARED_LOCK_GUARD(data->lock);
+    if (backend == nullptr || backend->engine == nullptr) {
+        return NIXL_ERR_INVALID_PARAM;
+    }
+    const auto known = data->backendEngines_.find(backend->engine->getType());
+    if (known == data->backendEngines_.end() || known->second.get() != backend->engine) {
+        return NIXL_ERR_INVALID_PARAM;
+    }
+    return backend->engine->installAdmissionReceiptBarrier(barrier);
 }
 
 nixl_status_t

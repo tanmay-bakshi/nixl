@@ -131,7 +131,9 @@ struct tcp_fault_results_t {
     terminal_fault_result_t remoteFailure;
     terminal_fault_result_t notificationFailure;
     bool dataRemoteFlushedBeforeNotificationFailure = false;
-    bool notificationPendingAtRemoteFlush = false;
+    bool notificationFailureAfterRemoteFlush = false;
+    std::string faultPeerEngine;
+    bool faultPeerAdmissionReceiptHeld = false;
 };
 
 void
@@ -570,14 +572,8 @@ runThreadPoolRepost(nixlAgent &source_agent,
         .bytesPerDescriptor = descriptor_bytes,
         .seed = 211,
     };
-    nixlXferReqH *request = createRequest(source_agent,
-                                          source_backend,
-                                          source,
-                                          destination,
-                                          spec,
-                                          remote_name,
-                                          remote_handle,
-                                          {});
+    nixlXferReqH *request = createRequest(
+        source_agent, source_backend, source, destination, spec, remote_name, remote_handle, {});
     std::array<population_result_t, 2> results;
     std::uint64_t prior_generation = 0;
     for (std::size_t index = 0; index < results.size(); ++index) {
@@ -634,14 +630,12 @@ runThreadPoolRepost(nixlAgent &source_agent,
                 "thread-pool repost destination bytes differ from source");
         require(result.attestation.generation == info.generation,
                 "thread-pool repost attestation changed generation");
-        requireStatus(adapter.release(subscription),
-                      NIXL_SUCCESS,
-                      "release thread-pool repost subscription");
+        requireStatus(
+            adapter.release(subscription), NIXL_SUCCESS, "release thread-pool repost subscription");
         prior_generation = info.generation;
     }
-    requireStatus(source_agent.releaseXferReq(request),
-                  NIXL_SUCCESS,
-                  "release thread-pool repost request");
+    requireStatus(
+        source_agent.releaseXferReq(request), NIXL_SUCCESS, "release thread-pool repost request");
     return results;
 }
 
@@ -1368,8 +1362,13 @@ writeCoordinate(const options_t &options,
                << (tcp_faults.notificationFailure.ownerWoken ? "true" : "false")
                << ",\"data_remote_flushed_before_failure\":"
                << (tcp_faults.dataRemoteFlushedBeforeNotificationFailure ? "true" : "false")
-               << ",\"notification_pending_at_remote_flush\":"
-               << (tcp_faults.notificationPendingAtRemoteFlush ? "true" : "false") << '}';
+               << ",\"notification_failed_after_remote_flush\":"
+               << (tcp_faults.notificationFailureAfterRemoteFlush ? "true" : "false")
+               << ",\"source_progress_mode\":\"production\""
+                  ",\"fault_peer_engine\":";
+        writeString(output, tcp_faults.faultPeerEngine);
+        output << ",\"fault_peer_admission_receipt_held\":"
+               << (tcp_faults.faultPeerAdmissionReceiptHeld ? "true" : "false") << '}';
     }
     output << "},\"runtime_artifacts\":";
     writeRuntimeArtifacts(output, populations.front().attestation.runtimeArtifacts);
@@ -1451,15 +1450,14 @@ run(int argc, char **argv) {
         }
     }
     if (options.engine == "thread_pool") {
-        const std::array<population_result_t, 2> repost =
-            runThreadPoolRepost(*source.agent,
-                                source.backend,
-                                source_name,
-                                destination_handle,
-                                adapter,
-                                inbox,
-                                source_arena,
-                                destination_arena);
+        const std::array<population_result_t, 2> repost = runThreadPoolRepost(*source.agent,
+                                                                              source.backend,
+                                                                              source_name,
+                                                                              destination_handle,
+                                                                              adapter,
+                                                                              inbox,
+                                                                              source_arena,
+                                                                              destination_arena);
         populations.insert(populations.end(), repost.begin(), repost.end());
     }
 
@@ -1499,8 +1497,11 @@ run(int argc, char **argv) {
         };
         tcp_faults.dataRemoteFlushedBeforeNotificationFailure =
             fixtures.notificationFailure.dataRemoteFlushedBeforeFailure;
-        tcp_faults.notificationPendingAtRemoteFlush =
-            fixtures.notificationFailure.notificationPendingAtRemoteFlush;
+        tcp_faults.notificationFailureAfterRemoteFlush =
+            fixtures.notificationFailure.notificationFailureAfterRemoteFlush;
+        tcp_faults.faultPeerEngine = fixtures.notificationFailure.faultPeerEngine;
+        tcp_faults.faultPeerAdmissionReceiptHeld =
+            fixtures.notificationFailure.faultPeerAdmissionReceiptHeld;
         tcp_shutdown_cancellation = fixtures.shutdownCancellation;
     }
 

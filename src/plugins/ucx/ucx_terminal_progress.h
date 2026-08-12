@@ -164,6 +164,10 @@ public:
                               std::uint64_t timestamp_ns);
     void
     recordPeakContinuationDepth(std::size_t depth);
+    [[nodiscard]] nixl_status_t
+    recordNotificationReceipt(std::uint64_t timestamp_ns);
+    [[nodiscard]] nixl_status_t
+    recordNotificationFailure(nixl_status_t status, std::uint64_t timestamp_ns);
     void
     recordTerminalInventory(std::size_t active_callback_slots,
                             std::size_t continuation_depth);
@@ -212,6 +216,7 @@ enum class ucx_callback_kind_t {
     DATA_CHUNK,
     ENDPOINT_FLUSH,
     NOTIFICATION,
+    NOTIFICATION_SEND,
 };
 
 /**

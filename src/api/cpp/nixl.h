@@ -27,6 +27,12 @@
 #include <chrono>
 #include <memory>
 
+class nixlBackendAdmissionReceiptBarrier;
+
+namespace nixl::qualification {
+class terminal_ucx_api_adapter_t;
+}
+
 /**
  * @class nixlAgent
  * @brief nixlAgent forms the main transfer object class
@@ -37,6 +43,11 @@ class nixlAgent {
         const std::unique_ptr<nixlAgentData> data;
 
         friend class nixlAgentData;
+        friend class nixl::qualification::terminal_ucx_api_adapter_t;
+
+        [[nodiscard]] nixl_status_t
+        installAdmissionReceiptBarrier(const nixlBackendH *backend,
+                                       nixlBackendAdmissionReceiptBarrier *barrier) const;
 
         [[nodiscard]] nixl_status_t
         validateXferRemoteHandleLocked(const nixlXferReqH *req_hndl) const;

@@ -110,6 +110,10 @@ public:
                  const std::shared_ptr<nixlBackendTransferTransitionSink> &sink,
                  std::unique_ptr<nixlBackendEventSubscription> &subscription),
                 (override));
+    MOCK_METHOD(void,
+                queryTerminalLifecycleInventory,
+                (nixlBackendTerminalLifecycleInventory &inventory),
+                (const, noexcept, override));
     MOCK_METHOD(nixl_status_t, releaseReqH, (nixlBackendReqH * req), (const, override));
     MOCK_METHOD(nixl_status_t,
                 prepMemView,

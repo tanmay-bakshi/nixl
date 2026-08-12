@@ -32,7 +32,7 @@ namespace {
 
 using namespace nixl::ucx;
 
-static_assert(notif_wire_header_size == 128);
+static_assert(notif_wire_header_size == 144);
 static_assert(notif_wire_max_frame_size == 65536);
 
 void
@@ -64,6 +64,18 @@ makeEnvelope(notif_wire_type_t type) {
         .senderWorkerIncarnation = makeUuid(5),
         .capability = makeUuid(6),
         .capabilityEpoch = 0x0102030405060708ULL,
+        .deliveryIdentity =
+            type == notif_wire_type_t::ATTACHED_DATA ||
+                    type == notif_wire_type_t::DATA_RECEIPT ?
+            0x1112131415161718ULL : 0,
+        .sourceHandleIdentity =
+            type == notif_wire_type_t::ATTACHED_DATA ||
+                    type == notif_wire_type_t::DATA_RECEIPT ?
+            0x2122232425262728ULL : 0,
+        .sourceGeneration =
+            type == notif_wire_type_t::ATTACHED_DATA ||
+                    type == notif_wire_type_t::DATA_RECEIPT ?
+            0x3132333435363738ULL : 0,
     };
 }
 
@@ -109,9 +121,11 @@ void
 testRoundTrips() {
     for (notif_wire_type_t type : {notif_wire_type_t::OFFER,
                                    notif_wire_type_t::ACK,
-                                   notif_wire_type_t::DATA}) {
+                                   notif_wire_type_t::DATA,
+                                   notif_wire_type_t::DATA_RECEIPT,
+                                   notif_wire_type_t::ATTACHED_DATA}) {
         const std::vector<std::uint8_t> payload =
-            type == notif_wire_type_t::DATA ?
+            type == notif_wire_type_t::DATA || type == notif_wire_type_t::ATTACHED_DATA ?
             std::vector<std::uint8_t>{0, 1, 2, 127, 128, 254, 255} :
             std::vector<std::uint8_t>{};
         const notif_wire_envelope_t envelope = makeEnvelope(type);
@@ -139,10 +153,10 @@ testCanonicalNetworkOrderLayout() {
 
     const std::vector<std::uint8_t> expected_prefix = {
         'N', 'X', 'N', 'F',
-        1,
+        2,
         static_cast<std::uint8_t>(notif_wire_type_t::OFFER),
         0, 0,
-        0, 0, 0, 128,
+        0, 0, 0, 144,
         0, 0, 0, 0,
     };
     require(std::equal(expected_prefix.begin(), expected_prefix.end(), wire.begin()),
@@ -164,14 +178,25 @@ testCanonicalNetworkOrderLayout() {
                 "binary UUID identity moved on the wire");
     }
 
-    const std::array<std::uint8_t, 16> expected_epoch_and_reserved = {
+    const std::array<std::uint8_t, 16> expected_epoch_and_delivery = {
         1, 2, 3, 4, 5, 6, 7, 8,
         0, 0, 0, 0, 0, 0, 0, 0,
     };
-    require(std::equal(expected_epoch_and_reserved.begin(),
-                       expected_epoch_and_reserved.end(),
+    require(std::equal(expected_epoch_and_delivery.begin(),
+                       expected_epoch_and_delivery.end(),
                        wire.begin() + 112),
-            "capability epoch or reserved tail is not canonical");
+            "capability epoch or delivery identity is not canonical");
+
+    const notif_wire_envelope_t attached = makeEnvelope(notif_wire_type_t::ATTACHED_DATA);
+    const std::vector<std::uint8_t> attached_wire = encode(attached, {});
+    const std::array<std::uint8_t, 16> expected_source_transfer = {
+        0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28,
+        0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38,
+    };
+    require(std::equal(expected_source_transfer.begin(),
+                       expected_source_transfer.end(),
+                       attached_wire.begin() + 128),
+            "source transfer identity is not canonical");
 }
 
 void
@@ -267,8 +292,27 @@ testEncodeRejectsInvalidFramesWithoutMutation() {
             "zero capability epoch was encoded");
     require(output == sentinel, "zero-epoch encode mutated its output");
 
+    notif_wire_envelope_t missing_source =
+        makeEnvelope(notif_wire_type_t::ATTACHED_DATA);
+    missing_source.sourceHandleIdentity = 0;
+    output = sentinel;
+    require(encodeNotifWireFrame(missing_source, {}, output) ==
+                notif_wire_status_t::INVALID_SOURCE_TRANSFER,
+            "attached data without source handle identity was encoded");
+    require(output == sentinel, "invalid-source encode mutated its output");
+
+    notif_wire_envelope_t stray_source = makeEnvelope(notif_wire_type_t::DATA);
+    stray_source.sourceGeneration = 1;
+    output = sentinel;
+    require(encodeNotifWireFrame(stray_source, {}, output) ==
+                notif_wire_status_t::INVALID_SOURCE_TRANSFER,
+            "standalone data with source generation was encoded");
+    require(output == sentinel, "stray-source encode mutated its output");
+
     for (const notif_wire_type_t type : {
-             notif_wire_type_t::OFFER, notif_wire_type_t::ACK}) {
+             notif_wire_type_t::OFFER,
+             notif_wire_type_t::ACK,
+             notif_wire_type_t::DATA_RECEIPT}) {
         output = sentinel;
         require(encodeNotifWireFrame(makeEnvelope(type), {sentinel}, output) ==
                     notif_wire_status_t::INVALID_PAYLOAD,
@@ -288,14 +332,14 @@ testDecodeRejectsInvalidHeaderFields() {
                          notif_wire_status_t::MALFORMED_FRAME,
                          "invalid magic was decoded");
 
-    for (const std::uint8_t version : {0U, 2U, 255U}) {
+    for (const std::uint8_t version : {0U, 1U, 255U}) {
         malformed = valid;
         malformed[4] = version;
         requireDecodeFailure(malformed,
                              notif_wire_status_t::UNSUPPORTED_VERSION,
                              "unsupported version was decoded");
     }
-    for (const std::uint8_t type : {0U, 4U, 255U}) {
+    for (const std::uint8_t type : {0U, 6U, 255U}) {
         malformed = valid;
         malformed[5] = type;
         requireDecodeFailure(malformed,
@@ -303,7 +347,7 @@ testDecodeRejectsInvalidHeaderFields() {
                              "invalid frame type was decoded");
     }
     for (const std::size_t reserved_byte : {
-             6U, 7U, 120U, 121U, 122U, 123U, 124U, 125U, 126U, 127U}) {
+             6U, 7U}) {
         malformed = valid;
         malformed[reserved_byte] = 1;
         requireDecodeFailure(malformed,
@@ -335,6 +379,7 @@ testDecodeRejectsInvalidHeaderFields() {
 
     malformed = valid;
     malformed[5] = static_cast<std::uint8_t>(notif_wire_type_t::OFFER);
+    std::fill_n(malformed.begin() + 120, sizeof(std::uint64_t), 0);
     requireDecodeFailure(malformed,
                          notif_wire_status_t::INVALID_PAYLOAD,
                          "OFFER frame with payload was decoded");
@@ -342,6 +387,28 @@ testDecodeRejectsInvalidHeaderFields() {
     requireDecodeFailure(malformed,
                          notif_wire_status_t::INVALID_PAYLOAD,
                          "ACK frame with payload was decoded");
+    malformed = valid;
+    malformed[5] = static_cast<std::uint8_t>(notif_wire_type_t::DATA_RECEIPT);
+    requireDecodeFailure(malformed,
+                         notif_wire_status_t::INVALID_PAYLOAD,
+                         "DATA_RECEIPT frame with payload was decoded");
+
+    malformed = valid;
+    malformed[5] = static_cast<std::uint8_t>(notif_wire_type_t::DATA_RECEIPT);
+    std::fill_n(malformed.begin() + 120, sizeof(std::uint64_t), 0);
+    malformed.resize(notif_wire_header_size);
+    malformed[11] = static_cast<std::uint8_t>(notif_wire_header_size);
+    malformed[15] = 0;
+    requireDecodeFailure(malformed,
+                         notif_wire_status_t::INVALID_DELIVERY_IDENTITY,
+                         "DATA_RECEIPT without delivery identity was decoded");
+
+    malformed = valid;
+    malformed[5] = static_cast<std::uint8_t>(notif_wire_type_t::ATTACHED_DATA);
+    std::fill_n(malformed.begin() + 120, sizeof(std::uint64_t), 0);
+    requireDecodeFailure(malformed,
+                         notif_wire_status_t::INVALID_DELIVERY_IDENTITY,
+                         "ATTACHED_DATA without delivery identity was decoded");
 }
 
 void

@@ -435,6 +435,8 @@ terminal_submission_state_t::recordCallbackObservation(
         ++diagnostics_.notificationCallbacks;
         diagnostics_.notificationCallbackTimestampNs = timestamp_ns;
         break;
+    case ucx_callback_kind_t::NOTIFICATION_SEND:
+        break;
     }
     if (before_poster) {
         ++diagnostics_.callbacksBeforePosterReturn;
@@ -455,6 +457,40 @@ terminal_submission_state_t::recordPeakContinuationDepth(std::size_t depth) {
     const std::lock_guard lock(mutex_);
     diagnostics_.peakContinuationDepth =
         std::max(diagnostics_.peakContinuationDepth, depth);
+}
+
+nixl_status_t
+terminal_submission_state_t::recordNotificationReceipt(
+    std::uint64_t timestamp_ns) {
+    {
+        const std::lock_guard lock(mutex_);
+        if (phase_ != terminal_submission_phase_t::NOTIFICATION ||
+            !notificationStarted_ || notificationCompleted_) {
+            return NIXL_ERR_NOT_ALLOWED;
+        }
+        ++diagnostics_.notificationCallbacks;
+        diagnostics_.notificationCallbackTimestampNs = timestamp_ns;
+    }
+    return completeNotification(NIXL_SUCCESS, timestamp_ns);
+}
+
+nixl_status_t
+terminal_submission_state_t::recordNotificationFailure(
+    nixl_status_t status,
+    std::uint64_t timestamp_ns) {
+    transition_t transition;
+    {
+        const std::lock_guard lock(mutex_);
+        if (status >= NIXL_SUCCESS ||
+            phase_ != terminal_submission_phase_t::NOTIFICATION ||
+            !notificationStarted_ || notificationCompleted_) {
+            return NIXL_ERR_NOT_ALLOWED;
+        }
+        ++diagnostics_.notificationCallbacks;
+        diagnostics_.notificationCallbackTimestampNs = timestamp_ns;
+        transition = failLocked(status, timestamp_ns);
+    }
+    return finishTransition(std::move(transition));
 }
 
 terminal_submission_state_t::transition_t
@@ -706,6 +742,11 @@ ucx_callback_slot_t::deliverOnOwner() noexcept {
         break;
     case ucx_callback_kind_t::NOTIFICATION:
         completion_status = state_->completeNotification(status, timestamp_ns);
+        break;
+    case ucx_callback_kind_t::NOTIFICATION_SEND:
+        completion_status = status == NIXL_SUCCESS ?
+            NIXL_SUCCESS :
+            state_->completeNotification(status, timestamp_ns);
         break;
     }
     if (completion_status != NIXL_SUCCESS) {

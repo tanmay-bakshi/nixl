@@ -43,6 +43,17 @@ def test_terminal_channel_binding_exposes_borrowed_fd_and_inventory() -> None:
     assert inventory.backendProducers == 0
     assert inventory.activeCallbackSlots == 0
     assert inventory.queuedOwnerContinuations == 0
+    assert inventory.backendLifecycle.sourceDeliveriesOutstanding == 0
+    assert inventory.backendLifecycle.sourceLocalPending == 0
+    assert inventory.backendLifecycle.sourceReceiptPending == 0
+    assert inventory.backendLifecycle.destinationPending == 0
+    assert inventory.backendLifecycle.destinationAdmitting == 0
+    assert inventory.backendLifecycle.destinationCommitted == 0
+    assert inventory.backendLifecycle.destinationReplaying == 0
+    assert inventory.backendLifecycle.destinationQuarantined == 0
+    assert inventory.backendLifecycle.activeNativeDeadlines == 0
+    assert inventory.backendLifecycle.sourceDeliveries == ()
+    assert inventory.backendLifecycle.destinationDeliveries == ()
     assert inventory.acceptingSubscriptions
     assert not inventory.closed
     assert inventory.fatal == bindings.nixl_terminal_channel_fatal_t.NONE
@@ -82,11 +93,22 @@ def test_terminal_types_are_read_only_and_cover_both_terminal_route_states() -> 
     assert bindings.nixl_terminal_capability_state_t.RETIRED.name == "RETIRED"
     assert bindings.nixl_terminal_event_kind_t.TRANSFER.name == "TRANSFER"
     assert bindings.nixl_terminal_event_kind_t.CAPABILITY.name == "CAPABILITY"
+    assert bindings.nixl_terminal_destination_phase_t.PENDING.name == "PENDING"
+    assert bindings.nixl_terminal_destination_phase_t.ADMITTING.name == "ADMITTING"
+    assert bindings.nixl_terminal_destination_phase_t.COMMITTED.name == "COMMITTED"
+    assert bindings.nixl_terminal_destination_phase_t.REPLAYING.name == "REPLAYING"
+    assert bindings.nixl_terminal_destination_phase_t.QUARANTINED.name == "QUARANTINED"
 
     with pytest.raises(TypeError):
         bindings.nixlTerminalEvent()
     with pytest.raises(TypeError):
         bindings.nixlTerminalSubscriptionInfo()
+    with pytest.raises(TypeError):
+        bindings.nixlTerminalSourceDelivery()
+    with pytest.raises(TypeError):
+        bindings.nixlTerminalDeadline()
+    with pytest.raises(TypeError):
+        bindings.nixlTerminalDestinationDelivery()
 
 
 def test_high_level_channel_wraps_native_fd_drain_and_close() -> None:

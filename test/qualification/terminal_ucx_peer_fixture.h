@@ -54,7 +54,9 @@ struct tcp_notification_failure_observation_t {
     tcp_peer_terminal_observation_t transfer;
     tcp_peer_channel_observation_t channel;
     bool dataRemoteFlushedBeforeFailure = false;
-    bool notificationPendingAtRemoteFlush = false;
+    bool notificationFailureAfterRemoteFlush = false;
+    std::string faultPeerEngine;
+    bool faultPeerAdmissionReceiptHeld = false;
     bool peerExitedBySignal = false;
 };
 
@@ -65,6 +67,30 @@ struct tcp_shutdown_cancellation_observation_t {
     nixl_status_t cancelStatus = NIXL_ERR_BACKEND;
     bool postedInFlight = false;
     bool drained = false;
+    bool peerExitedBySignal = false;
+};
+
+struct tcp_unequal_worker_observation_t {
+    tcp_peer_channel_observation_t channel;
+    std::size_t sourceWorkerCount = 0;
+    std::size_t destinationWorkerCount = 0;
+    std::vector<std::size_t> exercisedSourceWorkers;
+    std::size_t completedTransferCount = 0;
+    std::size_t notificationCount = 0;
+    bool peerExitedCleanly = false;
+};
+
+struct tcp_admission_receipt_observation_t {
+    tcp_peer_terminal_observation_t transfer;
+    tcp_peer_channel_observation_t channel;
+    nixl_xfer_attestation_state_t stateWhileHeld = nixl_xfer_attestation_state_t::PREPARED;
+    std::uint64_t heldSourceHandleIdentity = 0;
+    std::uint64_t heldSourceGeneration = 0;
+    std::uint64_t heldDeliveryIdentity = 0;
+    std::size_t notificationCount = 0;
+    bool subscriptionActiveWhileHeld = false;
+    bool remoteFlushedWhileHeld = false;
+    bool peerExitedCleanly = false;
     bool peerExitedBySignal = false;
 };
 
@@ -82,6 +108,15 @@ runTcpNotificationFailureFixture(const std::string &engine);
 
 [[nodiscard]] tcp_shutdown_cancellation_observation_t
 runTcpShutdownCancellationFixture(const std::string &engine);
+
+[[nodiscard]] tcp_unequal_worker_observation_t
+runTcpUnequalWorkerFixture(std::size_t source_worker_count, std::size_t destination_worker_count);
+
+[[nodiscard]] tcp_admission_receipt_observation_t
+runTcpAdmissionReceiptReleaseFixture(const std::string &engine);
+
+[[nodiscard]] tcp_admission_receipt_observation_t
+runTcpAdmissionReceiptPeerDeathFixture(const std::string &engine);
 
 } // namespace nixl::qualification
 

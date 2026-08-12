@@ -10,6 +10,8 @@
 
 #include "nixl.h"
 
+class nixlBackendAdmissionReceiptBarrier;
+
 namespace nixl::qualification {
 
 struct terminal_channel_inventory_t {
@@ -63,6 +65,11 @@ public:
 
     [[nodiscard]] nixl_status_t
     queryInventory(terminal_channel_inventory_t &inventory);
+
+    [[nodiscard]] static nixl_status_t
+    installAdmissionReceiptBarrier(nixlAgent &agent,
+                                   const nixlBackendH *backend,
+                                   nixlBackendAdmissionReceiptBarrier *barrier) noexcept;
 
     [[nodiscard]] nixl_status_t
     close();

@@ -24,7 +24,7 @@ namespace nixl::ucx {
 namespace {
 
 constexpr std::array<std::uint8_t, 4> wire_magic = {'N', 'X', 'N', 'F'};
-constexpr std::uint8_t wire_version = 1;
+constexpr std::uint8_t wire_version = 2;
 
 constexpr std::size_t magic_offset = 0;
 constexpr std::size_t version_offset = 4;
@@ -39,9 +39,11 @@ constexpr std::size_t recipient_backend_offset = 64;
 constexpr std::size_t sender_worker_offset = 80;
 constexpr std::size_t capability_offset = 96;
 constexpr std::size_t capability_epoch_offset = 112;
-constexpr std::size_t reserved_tail_offset = 120;
+constexpr std::size_t delivery_identity_offset = 120;
+constexpr std::size_t source_handle_identity_offset = 128;
+constexpr std::size_t source_generation_offset = 136;
 
-static_assert(reserved_tail_offset + sizeof(std::uint64_t) ==
+static_assert(source_generation_offset + sizeof(std::uint64_t) ==
               notif_wire_header_size);
 
 [[nodiscard]] bool
@@ -50,6 +52,8 @@ isKnownType(notif_wire_type_t type) noexcept {
     case notif_wire_type_t::OFFER:
     case notif_wire_type_t::ACK:
     case notif_wire_type_t::DATA:
+    case notif_wire_type_t::DATA_RECEIPT:
+    case notif_wire_type_t::ATTACHED_DATA:
         return true;
     }
     return false;
@@ -60,11 +64,19 @@ payloadIsValid(notif_wire_type_t type, std::size_t payload_size) noexcept {
     switch (type) {
     case notif_wire_type_t::OFFER:
     case notif_wire_type_t::ACK:
+    case notif_wire_type_t::DATA_RECEIPT:
         return payload_size == 0;
     case notif_wire_type_t::DATA:
+    case notif_wire_type_t::ATTACHED_DATA:
         return true;
     }
     return false;
+}
+
+[[nodiscard]] bool
+hasAttachedDeliveryIdentity(notif_wire_type_t type) noexcept {
+    return type == notif_wire_type_t::DATA_RECEIPT ||
+        type == notif_wire_type_t::ATTACHED_DATA;
 }
 
 [[nodiscard]] bool
@@ -156,6 +168,12 @@ parseType(std::uint8_t encoded, notif_wire_type_t &type) noexcept {
     case static_cast<std::uint8_t>(notif_wire_type_t::DATA):
         type = notif_wire_type_t::DATA;
         return notif_wire_status_t::SUCCESS;
+    case static_cast<std::uint8_t>(notif_wire_type_t::DATA_RECEIPT):
+        type = notif_wire_type_t::DATA_RECEIPT;
+        return notif_wire_status_t::SUCCESS;
+    case static_cast<std::uint8_t>(notif_wire_type_t::ATTACHED_DATA):
+        type = notif_wire_type_t::ATTACHED_DATA;
+        return notif_wire_status_t::SUCCESS;
     default:
         return notif_wire_status_t::INVALID_TYPE;
     }
@@ -185,6 +203,21 @@ getNotifWireEncodedSize(const notif_wire_envelope_t &envelope,
     }
     if (envelope.capabilityEpoch == 0) {
         return notif_wire_status_t::INVALID_EPOCH;
+    }
+    const bool attached = hasAttachedDeliveryIdentity(envelope.type);
+    if (attached && envelope.deliveryIdentity == 0) {
+        return notif_wire_status_t::INVALID_DELIVERY_IDENTITY;
+    }
+    if (!attached && envelope.deliveryIdentity != 0) {
+        return notif_wire_status_t::INVALID_DELIVERY_IDENTITY;
+    }
+    if (attached &&
+        (envelope.sourceHandleIdentity == 0 || envelope.sourceGeneration == 0)) {
+        return notif_wire_status_t::INVALID_SOURCE_TRANSFER;
+    }
+    if (!attached &&
+        (envelope.sourceHandleIdentity != 0 || envelope.sourceGeneration != 0)) {
+        return notif_wire_status_t::INVALID_SOURCE_TRANSFER;
     }
     if (!payloadIsValid(envelope.type, payload_size)) {
         return notif_wire_status_t::INVALID_PAYLOAD;
@@ -219,6 +252,9 @@ encodeNotifWireFrame(const notif_wire_envelope_t &envelope,
     writeUuid(encoded, sender_worker_offset, envelope.senderWorkerIncarnation);
     writeUuid(encoded, capability_offset, envelope.capability);
     writeU64(encoded, capability_epoch_offset, envelope.capabilityEpoch);
+    writeU64(encoded, delivery_identity_offset, envelope.deliveryIdentity);
+    writeU64(encoded, source_handle_identity_offset, envelope.sourceHandleIdentity);
+    writeU64(encoded, source_generation_offset, envelope.sourceGeneration);
     std::copy(payload.begin(), payload.end(), encoded.begin() + notif_wire_header_size);
 
     output.swap(encoded);
@@ -250,10 +286,6 @@ decodeNotifWireFrame(std::span<const std::uint8_t> wire,
     if (readU16(wire, reserved_offset) != 0) {
         return notif_wire_status_t::NONZERO_RESERVED;
     }
-    if (readU64(wire, reserved_tail_offset) != 0) {
-        return notif_wire_status_t::NONZERO_RESERVED;
-    }
-
     const std::uint32_t declared_frame_size = readU32(wire, frame_size_offset);
     const std::uint32_t declared_payload_size = readU32(wire, payload_size_offset);
     const std::size_t actual_payload_size = wire.size() - notif_wire_header_size;
@@ -278,6 +310,26 @@ decodeNotifWireFrame(std::span<const std::uint8_t> wire,
     decoded.envelope.capabilityEpoch = readU64(wire, capability_epoch_offset);
     if (decoded.envelope.capabilityEpoch == 0) {
         return notif_wire_status_t::INVALID_EPOCH;
+    }
+    decoded.envelope.deliveryIdentity = readU64(wire, delivery_identity_offset);
+    decoded.envelope.sourceHandleIdentity = readU64(wire, source_handle_identity_offset);
+    decoded.envelope.sourceGeneration = readU64(wire, source_generation_offset);
+    const bool attached = hasAttachedDeliveryIdentity(decoded.envelope.type);
+    if (attached && decoded.envelope.deliveryIdentity == 0) {
+        return notif_wire_status_t::INVALID_DELIVERY_IDENTITY;
+    }
+    if (!attached && decoded.envelope.deliveryIdentity != 0) {
+        return notif_wire_status_t::INVALID_DELIVERY_IDENTITY;
+    }
+    if (attached &&
+        (decoded.envelope.sourceHandleIdentity == 0 ||
+         decoded.envelope.sourceGeneration == 0)) {
+        return notif_wire_status_t::INVALID_SOURCE_TRANSFER;
+    }
+    if (!attached &&
+        (decoded.envelope.sourceHandleIdentity != 0 ||
+         decoded.envelope.sourceGeneration != 0)) {
+        return notif_wire_status_t::INVALID_SOURCE_TRANSFER;
     }
     decoded.payload = wire.subspan(notif_wire_header_size);
 

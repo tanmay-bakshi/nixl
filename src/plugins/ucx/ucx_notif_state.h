@@ -138,6 +138,7 @@ struct notif_offer_acceptance_t {
     notif_wire_envelope_t acknowledgement;
     notif_wire_envelope_t localOffer;
     bool reemitLocalOffer = false;
+    bool remoteCapabilityChanged = false;
 };
 
 enum class notif_data_disposition_t {
@@ -151,6 +152,11 @@ struct notif_data_authority_t {
     std::uint64_t connectionIdentity = 0;
     notif_wire_uuid_t senderWorkerIncarnation;
     std::uint64_t endpointIdentity = 0;
+    notif_wire_uuid_t capability;
+    std::uint64_t capabilityEpoch = 0;
+    std::uint64_t deliveryIdentity = 0;
+    std::uint64_t sourceHandleIdentity = 0;
+    std::uint64_t sourceGeneration = 0;
     bool tombstoned = false;
 };
 
@@ -215,10 +221,34 @@ public:
     [[nodiscard]] notif_state_status_t
     prepareData(const notif_route_key_t &route,
                 const notif_wire_uuid_t &local_sender_worker,
+                std::uint64_t delivery_identity,
+                std::uint64_t source_handle_identity,
+                std::uint64_t source_generation,
                 notif_wire_envelope_t &data) const;
 
     [[nodiscard]] notif_data_resolution_t
     resolveData(const notif_wire_envelope_t &data) const;
+
+    [[nodiscard]] notif_state_status_t
+    makeDataReceipt(const notif_data_authority_t &authority,
+                    const notif_wire_uuid_t &local_sender_worker,
+                    const notif_wire_uuid_t &data_capability,
+                    std::uint64_t data_capability_epoch,
+                    std::uint64_t delivery_identity,
+                    std::uint64_t source_handle_identity,
+                    std::uint64_t source_generation,
+                    notif_wire_envelope_t &receipt) const;
+
+    [[nodiscard]] notif_data_resolution_t
+    resolveDataReceipt(const notif_wire_envelope_t &receipt) const;
+
+    [[nodiscard]] notif_state_status_t
+    validateOutboundDeliveryAuthority(const notif_route_key_t &route,
+                                      const notif_wire_uuid_t &capability,
+                                      std::uint64_t capability_epoch,
+                                      std::uint64_t connection_identity,
+                                      const notif_wire_uuid_t &receipt_worker,
+                                      std::uint64_t endpoint_identity) const;
 
 private:
     class route_delivery_state_t;
@@ -286,7 +316,10 @@ private:
                        const binding_state_t &binding,
                        const notif_wire_uuid_t &local_sender_worker,
                        const notif_wire_uuid_t &capability,
-                       std::uint64_t capability_epoch) const;
+                       std::uint64_t capability_epoch,
+                       std::uint64_t delivery_identity = 0,
+                       std::uint64_t source_handle_identity = 0,
+                       std::uint64_t source_generation = 0) const;
 
     [[nodiscard]] notif_route_snapshot_t
     makeSnapshotLocked(const binding_state_t &binding) const;

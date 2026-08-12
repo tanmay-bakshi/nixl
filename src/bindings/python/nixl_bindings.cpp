@@ -385,6 +385,78 @@ PYBIND11_MODULE(_bindings, m) {
                nixl_terminal_channel_fatal_t::ACTIVE_SUBSCRIPTIONS_ON_CLOSE)
         .value("INVALID_PUBLICATION", nixl_terminal_channel_fatal_t::INVALID_PUBLICATION);
 
+    py::enum_<nixl_terminal_destination_phase_t>(m, "nixl_terminal_destination_phase_t")
+        .value("PENDING", nixl_terminal_destination_phase_t::PENDING)
+        .value("ADMITTING", nixl_terminal_destination_phase_t::ADMITTING)
+        .value("COMMITTED", nixl_terminal_destination_phase_t::COMMITTED)
+        .value("REPLAYING", nixl_terminal_destination_phase_t::REPLAYING)
+        .value("QUARANTINED", nixl_terminal_destination_phase_t::QUARANTINED);
+
+    py::class_<nixl_terminal_source_delivery_t>(m, "nixlTerminalSourceDelivery")
+        .def_readonly("backend", &nixl_terminal_source_delivery_t::backend)
+        .def_readonly("deliveryIdentity",
+                      &nixl_terminal_source_delivery_t::deliveryIdentity)
+        .def_readonly("sourceHandleIdentity",
+                      &nixl_terminal_source_delivery_t::sourceHandleIdentity)
+        .def_readonly("sourceGeneration",
+                      &nixl_terminal_source_delivery_t::sourceGeneration)
+        .def_readonly("localPending", &nixl_terminal_source_delivery_t::localPending)
+        .def_readonly("receiptPending", &nixl_terminal_source_delivery_t::receiptPending)
+        .def_readonly("deadlineActive", &nixl_terminal_source_delivery_t::deadlineActive);
+
+    py::class_<nixl_terminal_destination_delivery_t>(m, "nixlTerminalDestinationDelivery")
+        .def_readonly("backend", &nixl_terminal_destination_delivery_t::backend)
+        .def_readonly("sourceBackendIncarnation",
+                      &nixl_terminal_destination_delivery_t::sourceBackendIncarnation)
+        .def_readonly("sourceHandleIdentity",
+                      &nixl_terminal_destination_delivery_t::sourceHandleIdentity)
+        .def_readonly("sourceGeneration",
+                      &nixl_terminal_destination_delivery_t::sourceGeneration)
+        .def_readonly("deliveryIdentity",
+                      &nixl_terminal_destination_delivery_t::deliveryIdentity)
+        .def_readonly("phase", &nixl_terminal_destination_delivery_t::phase);
+
+    py::class_<nixl_terminal_deadline_t>(m, "nixlTerminalDeadline")
+        .def_readonly("backend", &nixl_terminal_deadline_t::backend)
+        .def_readonly("handleIdentity", &nixl_terminal_deadline_t::handleIdentity)
+        .def_readonly("generation", &nixl_terminal_deadline_t::generation);
+
+    py::class_<nixl_terminal_backend_lifecycle_inventory_t>(
+        m, "nixlTerminalBackendLifecycleInventory")
+        .def_readonly("sourceDeliveriesOutstanding",
+                      &nixl_terminal_backend_lifecycle_inventory_t::sourceDeliveriesOutstanding)
+        .def_readonly("sourceLocalPending",
+                      &nixl_terminal_backend_lifecycle_inventory_t::sourceLocalPending)
+        .def_readonly("sourceReceiptPending",
+                      &nixl_terminal_backend_lifecycle_inventory_t::sourceReceiptPending)
+        .def_readonly("destinationPending",
+                      &nixl_terminal_backend_lifecycle_inventory_t::destinationPending)
+        .def_readonly("destinationAdmitting",
+                      &nixl_terminal_backend_lifecycle_inventory_t::destinationAdmitting)
+        .def_readonly("destinationCommitted",
+                      &nixl_terminal_backend_lifecycle_inventory_t::destinationCommitted)
+        .def_readonly("destinationReplaying",
+                      &nixl_terminal_backend_lifecycle_inventory_t::destinationReplaying)
+        .def_readonly("destinationQuarantined",
+                      &nixl_terminal_backend_lifecycle_inventory_t::destinationQuarantined)
+        .def_readonly("activeNativeDeadlines",
+                      &nixl_terminal_backend_lifecycle_inventory_t::activeNativeDeadlines)
+        .def_property_readonly(
+            "sourceDeliveries",
+            [](const nixl_terminal_backend_lifecycle_inventory_t &value) {
+                return immutableTuple(value.sourceDeliveries);
+            })
+        .def_property_readonly(
+            "destinationDeliveries",
+            [](const nixl_terminal_backend_lifecycle_inventory_t &value) {
+                return immutableTuple(value.destinationDeliveries);
+            })
+        .def_property_readonly(
+            "nativeDeadlines",
+            [](const nixl_terminal_backend_lifecycle_inventory_t &value) {
+                return immutableTuple(value.nativeDeadlines);
+            });
+
     py::class_<nixlTerminalEventSnapshot>(m, "nixlTerminalEvent")
         .def_property_readonly(
             "kind", [](const nixlTerminalEventSnapshot &value) { return value.get().kind; })
@@ -460,6 +532,11 @@ PYBIND11_MODULE(_bindings, m) {
             "queuedOwnerContinuations",
             [](const nixlTerminalChannelInventorySnapshot &value) {
                 return value.get().queuedOwnerContinuations;
+            })
+        .def_property_readonly(
+            "backendLifecycle",
+            [](const nixlTerminalChannelInventorySnapshot &value) {
+                return value.get().backendLifecycle;
             })
         .def_property_readonly(
             "acceptingSubscriptions",

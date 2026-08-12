@@ -67,6 +67,27 @@ ucx_notif_state_test = executable('ucx_notif_state_test',
 
 test('ucx_notif_state', ucx_notif_state_test)
 
+ucx_notif_delivery_test = executable('ucx_notif_delivery_test',
+        'ucx_notif_delivery_test.cpp',
+        dependencies: ucx_backend_test_dep,
+        include_directories: ucx_test_include_directories)
+
+test('ucx_notif_delivery', ucx_notif_delivery_test)
+
+ucx_notif_ingress_test = executable('ucx_notif_ingress_test',
+        'ucx_notif_ingress_test.cpp',
+        dependencies: ucx_backend_test_dep,
+        include_directories: ucx_test_include_directories)
+
+test('ucx_notif_ingress', ucx_notif_ingress_test)
+
+ucx_terminal_deadline_test = executable('ucx_terminal_deadline_test',
+        'ucx_terminal_deadline_test.cpp',
+        dependencies: ucx_backend_test_dep,
+        include_directories: ucx_test_include_directories)
+
+test('ucx_terminal_deadline', ucx_terminal_deadline_test)
+
 if get_option('buildtype') != 'release'
 
     ucx_worker_bin = executable('ucx_worker_test',

@@ -78,6 +78,14 @@ terminal_ucx_api_adapter_t::queryInventory(terminal_channel_inventory_t &invento
 }
 
 nixl_status_t
+terminal_ucx_api_adapter_t::installAdmissionReceiptBarrier(
+    nixlAgent &agent,
+    const nixlBackendH *backend,
+    nixlBackendAdmissionReceiptBarrier *barrier) noexcept {
+    return agent.installAdmissionReceiptBarrier(backend, barrier);
+}
+
+nixl_status_t
 terminal_ucx_api_adapter_t::close() {
     return agent_.closeTerminalEventChannel(channel_);
 }

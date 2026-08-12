@@ -34,10 +34,17 @@ nixl_xfer_completion_receipt = nixlBind.nixlXferCompletionReceipt
 nixl_terminal_event = nixlBind.nixlTerminalEvent
 nixl_terminal_event_batch = nixlBind.nixlTerminalEventBatch
 nixl_terminal_channel_inventory = nixlBind.nixlTerminalChannelInventory
+nixl_terminal_backend_lifecycle_inventory = (
+    nixlBind.nixlTerminalBackendLifecycleInventory
+)
+nixl_terminal_source_delivery = nixlBind.nixlTerminalSourceDelivery
+nixl_terminal_deadline = nixlBind.nixlTerminalDeadline
+nixl_terminal_destination_delivery = nixlBind.nixlTerminalDestinationDelivery
 nixl_terminal_subscription_info = nixlBind.nixlTerminalSubscriptionInfo
 nixl_terminal_event_kind_t = nixlBind.nixl_terminal_event_kind_t
 nixl_terminal_capability_state_t = nixlBind.nixl_terminal_capability_state_t
 nixl_terminal_channel_fatal_t = nixlBind.nixl_terminal_channel_fatal_t
+nixl_terminal_destination_phase_t = nixlBind.nixl_terminal_destination_phase_t
 
 _REMOTE_HANDLE_CONSTRUCTION_TOKEN = object()
 _TERMINAL_CHANNEL_CONSTRUCTION_TOKEN = object()

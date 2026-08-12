@@ -49,7 +49,8 @@ run(int argc, char **argv) {
     if (observation.transfer.terminalStatus != NIXL_ERR_REMOTE_DISCONNECT ||
         observation.transfer.terminalEventCount != 1 || !observation.transfer.ownerWoken ||
         !observation.dataRemoteFlushedBeforeFailure ||
-        !observation.notificationPendingAtRemoteFlush || !observation.peerExitedBySignal) {
+        !observation.notificationFailureAfterRemoteFlush || observation.faultPeerEngine != engine ||
+        !observation.faultPeerAdmissionReceiptHeld || !observation.peerExitedBySignal) {
         throw std::runtime_error("notification fixture did not prove its terminal boundary");
     }
     requireCleanChannel(observation.channel);

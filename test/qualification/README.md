@@ -37,13 +37,15 @@ TCP over `lo` uses two distinct agents and endpoints. Every attested endpoint
 flush must complete through a callback, and the coordinate must prove callback
 delivery after poster return. TCP additionally proves attached
 authenticated-notification success and failure. Its notification-failure fixture
-stops the independent peer only after the transfer attestation records
-all-endpoint remote-flush authority, verifies that notification terminality is
-still pending at that boundary, and then kills the peer. TCP also proves remote failure and capability
-epoch advancement, endpoint failure, and retirement on three distinct route
-generations. FAILED and RETIRED are exercised by separate terminal
-subscriptions. `terminal_ucx_receipt.py` rejects hard-coded pass fields and the
-physically over-constrained predecessor schema.
+retains production progress on both agents and holds the destination's exact
+admission receipt after queue commit. Every endpoint must record remote-flush
+authority while the source remains nonterminal. Killing that peer must then
+produce notification failure after the last flush callback without discarding
+the established authority. TCP also
+proves remote failure and capability epoch advancement, endpoint failure, and
+retirement on three distinct route generations. FAILED and RETIRED are
+exercised by separate terminal subscriptions. `terminal_ucx_receipt.py` rejects
+hard-coded pass fields and the physically over-constrained predecessor schema.
 
 `terminal_ucx_api_adapter.*` is the only API seam. It exists so this checkpoint
 can compile while the terminal-agent and UCX callback branches converge; the

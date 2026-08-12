@@ -41,7 +41,10 @@
 #include "ucx_connection_metadata.h"
 #include "ucx_enums.h"
 #include "ucx_notif_state.h"
+#include "ucx_notif_ingress.h"
+#include "ucx_notif_delivery.h"
 #include "ucx_notif_wire.h"
+#include "ucx_terminal_deadline.h"
 #include "ucx_utils.h"
 
 class nixlUcxNotificationQueue {
@@ -50,10 +53,10 @@ public:
     static constexpr size_t maxPendingBytes = 64 * 1024 * 1024;
     static constexpr size_t maxWireBytes = nixl::ucx::notif_wire_max_frame_size;
 
-    explicit nixlUcxNotificationQueue(
-        size_t max_notifications = maxPendingNotifications,
-        size_t max_bytes = maxPendingBytes)
-        : maxNotifications_(max_notifications), maxBytes_(max_bytes) {}
+    explicit nixlUcxNotificationQueue(size_t max_notifications = maxPendingNotifications,
+                                      size_t max_bytes = maxPendingBytes)
+        : maxNotifications_(max_notifications),
+          maxBytes_(max_bytes) {}
 
     [[nodiscard]] nixl_status_t
     push(nixlAuthenticatedNotification &&notification);
@@ -73,41 +76,43 @@ private:
 };
 
 class nixlUcxConnection : public nixlBackendConnMD {
-    private:
-        const uint64_t identity_;
-        const nixl::ucx::connection_metadata_t metadata_;
-        std::vector<std::unique_ptr<nixlUcxEp>> eps;
-        std::atomic<bool> endpointFailureObserved_{false};
+private:
+    const uint64_t identity_;
+    const nixl::ucx::connection_metadata_t metadata_;
+    std::vector<std::unique_ptr<nixlUcxEp>> eps;
+    std::atomic<bool> endpointFailureObserved_{false};
 
-    public:
-        nixlUcxConnection(uint64_t identity, nixl::ucx::connection_metadata_t metadata)
-            : identity_(identity), metadata_(std::move(metadata)) {}
+public:
+    nixlUcxConnection(uint64_t identity, nixl::ucx::connection_metadata_t metadata)
+        : identity_(identity),
+          metadata_(std::move(metadata)) {}
 
-        [[nodiscard]] const std::unique_ptr<nixlUcxEp>& getEp(size_t ep_id) const noexcept {
-            return eps[ep_id];
-        }
+    [[nodiscard]] const std::unique_ptr<nixlUcxEp> &
+    getEp(size_t ep_id) const noexcept {
+        return eps[ep_id];
+    }
 
-        [[nodiscard]] uint64_t
-        getIdentity() const noexcept {
-            return identity_;
-        }
+    [[nodiscard]] uint64_t
+    getIdentity() const noexcept {
+        return identity_;
+    }
 
-        [[nodiscard]] const nixl::ucx::connection_metadata_t &
-        getMetadata() const noexcept {
-            return metadata_;
-        }
+    [[nodiscard]] const nixl::ucx::connection_metadata_t &
+    getMetadata() const noexcept {
+        return metadata_;
+    }
 
-        [[nodiscard]] bool
-        claimEndpointFailure() noexcept {
-            bool expected = false;
-            return endpointFailureObserved_.compare_exchange_strong(
-                expected, true, std::memory_order_acq_rel);
-        }
+    [[nodiscard]] bool
+    claimEndpointFailure() noexcept {
+        bool expected = false;
+        return endpointFailureObserved_.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel);
+    }
 
-        [[nodiscard]] bool
-        endpointFailureObserved() const noexcept {
-            return endpointFailureObserved_.load(std::memory_order_acquire);
-        }
+    [[nodiscard]] bool
+    endpointFailureObserved() const noexcept {
+        return endpointFailureObserved_.load(std::memory_order_acquire);
+    }
 
     friend class nixlUcxEngine;
 };
@@ -116,22 +121,22 @@ using ucx_connection_ptr_t = std::shared_ptr<nixlUcxConnection>;
 
 // A private metadata has to implement get, and has all the metadata
 class nixlUcxPrivateMetadata : public nixlBackendMD {
-    private:
-        nixlUcxMem mem;
-        nixl_blob_t rkeyStr;
+private:
+    nixlUcxMem mem;
+    nixl_blob_t rkeyStr;
 
-    public:
-        nixlUcxPrivateMetadata() : nixlBackendMD(true) {
-        }
+public:
+    nixlUcxPrivateMetadata() : nixlBackendMD(true) {}
 
-        [[nodiscard]] const std::string& get() const noexcept {
-            return rkeyStr;
-        }
+    [[nodiscard]] const std::string &
+    get() const noexcept {
+        return rkeyStr;
+    }
 
-        [[nodiscard]] const nixlUcxMem &
-        getMem() const noexcept {
-            return mem;
-        }
+    [[nodiscard]] const nixlUcxMem &
+    getMem() const noexcept {
+        return mem;
+    }
 
     friend class nixlUcxEngine;
 };
@@ -209,11 +214,10 @@ public:
     queryRemoteNotificationState(const nixlRemoteAgentBinding &binding) const override;
 
     nixl_status_t
-    subscribeXferTerminal(
-        nixlBackendReqH *handle,
-        const nixlBackendTransferEventBinding &binding,
-        const std::shared_ptr<nixlBackendTransferTransitionSink> &sink,
-        std::unique_ptr<nixlBackendEventSubscription> &subscription) override;
+    subscribeXferTerminal(nixlBackendReqH *handle,
+                          const nixlBackendTransferEventBinding &binding,
+                          const std::shared_ptr<nixlBackendTransferTransitionSink> &sink,
+                          std::unique_ptr<nixlBackendEventSubscription> &subscription) override;
 
     nixl_status_t
     subscribeRemoteNotificationState(
@@ -275,9 +279,17 @@ public:
                                   nixl_xfer_attestation_t &attestation) const override;
     nixl_status_t
     releaseReqH(nixlBackendReqH *handle) const override;
+    void
+    queryTerminalLifecycleInventory(
+        nixlBackendTerminalLifecycleInventory &inventory) const noexcept override;
+    [[nodiscard]] bool
+    terminalDeadlinesDrained() const noexcept;
 
     unsigned
     progress();
+
+    [[nodiscard]] nixl_status_t
+    installAdmissionReceiptBarrier(nixlBackendAdmissionReceiptBarrier *barrier) noexcept override;
 
     void
     progressLoop();
@@ -289,8 +301,7 @@ public:
     nixl_status_t
     genNotif(const std::string &remote_agent, const std::string &msg) const override;
     nixl_status_t
-    genNotif(const nixlRemoteAgentBinding &binding,
-             const std::string &msg) const override;
+    genNotif(const nixlRemoteAgentBinding &binding, const std::string &msg) const override;
 
     // public function for UCX worker to mark connections as connected
     nixl_status_t
@@ -322,6 +333,11 @@ protected:
     [[nodiscard]] size_t
     getWorkerId(const nixl_opt_b_args_t *opt_args = nullptr) const noexcept;
 
+    [[nodiscard]] nixl::ucx::terminal_deadline_owner_t *
+    getTerminalDeadlineOwner() const noexcept {
+        return terminalDeadlineOwner_.get();
+    }
+
     virtual size_t
     getSharedWorkersSize() const {
         return uws.size();
@@ -329,8 +345,28 @@ protected:
 
     virtual void
     appendNotif(nixlAuthenticatedNotification &&notification) const;
+    [[nodiscard]] virtual nixl_status_t
+    admitNotif(nixlAuthenticatedNotification &&notification) const;
     virtual void
     poisonNotifs() const;
+
+    void
+    drainNotificationDeliveries() const;
+    void
+    closeNotificationIngress() const;
+    [[nodiscard]] bool
+    notificationDeliveriesDrained() const noexcept;
+    [[nodiscard]] bool
+    notificationIngressDrained() const noexcept;
+    [[nodiscard]] nixl_status_t
+    scheduleAdmissionReceipt(const nixl::ucx::notif_ingress_key_t &key,
+                             const nixl::ucx::notif_wire_envelope_t &receipt,
+                             size_t worker_id,
+                             uint64_t connection_identity) const;
+    void
+    drainTerminalDeadlines() noexcept;
+    void
+    closeTerminalDeadlines() noexcept;
 
     virtual nixl_status_t
     sendXferRange(const nixl_xfer_op_t &operation,
@@ -352,6 +388,9 @@ protected:
     nixlUcxEngine(const nixlBackendInitParams &init_params);
 
     mutable nixlUcxNotificationQueue notifQueue_;
+    std::shared_ptr<nixl::ucx::notif_delivery_registry_t> deliveryRegistry_;
+    std::shared_ptr<nixl::ucx::notif_ingress_registry_t> ingressRegistry_;
+    std::atomic<nixlBackendAdmissionReceiptBarrier *> admissionReceiptBarrier_{nullptr};
 
 private:
     struct notifCallbackContext {
@@ -383,7 +422,9 @@ private:
     nixl_status_t
     sendControlFrame(const nixl::ucx::notif_wire_envelope_t &envelope,
                      uint64_t connection_identity,
-                     size_t worker_id) const;
+                     size_t worker_id,
+                     nixlUcxReq *req = nullptr,
+                     nixl::ucx::ucx_callback_slot_t *terminal_slot = nullptr) const;
 
     [[nodiscard]] nixl_status_t
     makeRoute(const nixlRemoteAgentBinding &binding,
@@ -394,8 +435,10 @@ private:
     prepareDataFrame(const nixl_remote_agent_authority_t &authority,
                      size_t worker_id,
                      const std::string &msg,
+                     uint64_t delivery_identity,
                      std::vector<std::uint8_t> &frame,
-                     ucx_connection_ptr_t &connection) const;
+                     ucx_connection_ptr_t &connection,
+                     nixl::ucx::notif_delivery_key_t *delivery_key = nullptr) const;
 
     [[nodiscard]] std::optional<exactRouteRecord>
     getExactRoute(uint64_t handle_identity, uint64_t generation) const;
@@ -429,6 +472,9 @@ private:
     [[nodiscard]] std::optional<size_t>
     getWorkerIdFromOptArgs(const nixl_opt_b_args_t &opt_args) const noexcept;
 
+    void
+    failTerminalLifecycle(nixl_status_t status) noexcept;
+
     /* UCX data */
     std::unique_ptr<nixlUcxContext> uc;
     std::vector<std::unique_ptr<nixlUcxWorker>> uws;
@@ -437,6 +483,9 @@ private:
     nixl::ucx::notif_wire_uuid_t localAgentIncarnationUuid_;
     std::shared_ptr<nixl::ucx::notif_capability_state_t> notifState_;
     std::shared_ptr<nixl::ucx::notif_endpoint_failure_state_t> endpointFailureState_;
+    std::unique_ptr<nixl::ucx::terminal_deadline_owner_t> terminalDeadlineOwner_;
+    std::atomic<nixl_status_t> terminalLifecycleFatal_{NIXL_SUCCESS};
+    mutable std::atomic<uint64_t> nextDeliveryIdentity_{1};
     mutable std::atomic<size_t> sharedWorkerIndex_;
 
     // Map of agent name to saved nixlUcxConnection info
@@ -445,6 +494,7 @@ private:
 };
 
 class nixlUcxThread;
+class nixlUcxConstructorFailureQualification;
 
 /**
  * Represents an engine with a single progress thread for all shared workers
@@ -462,6 +512,8 @@ public:
 protected:
     void
     appendNotif(nixlAuthenticatedNotification &&notification) const override;
+    [[nodiscard]] nixl_status_t
+    admitNotif(nixlAuthenticatedNotification &&notification) const override;
     void
     poisonNotifs() const override;
 
@@ -469,10 +521,6 @@ private:
     std::unique_ptr<nixlUcxThread> thread_;
     mutable std::mutex notifMutex_;
 };
-
-namespace asio {
-class io_context;
-}
 
 class nixlUcxThreadPoolEngine : public nixlUcxEngine {
 public:
@@ -500,6 +548,8 @@ public:
 protected:
     void
     appendNotif(nixlAuthenticatedNotification &&notification) const override;
+    [[nodiscard]] nixl_status_t
+    admitNotif(nixlAuthenticatedNotification &&notification) const override;
     void
     poisonNotifs() const override;
 
@@ -513,7 +563,16 @@ protected:
                   size_t end_idx) const override;
 
 private:
-    std::unique_ptr<asio::io_context> io_;
+    enum class qualification_constructor_failure_point_t {
+        AFTER_SHARED_PROGRESS_OWNER_STARTED,
+        AFTER_FIRST_DEDICATED_PROGRESS_OWNER_STARTED,
+    };
+
+    nixlUcxThreadPoolEngine(const nixlBackendInitParams &init_params,
+                            std::optional<qualification_constructor_failure_point_t> failure_point);
+
+    friend class nixlUcxConstructorFailureQualification;
+
     std::unique_ptr<nixlUcxThread> sharedThread_;
     std::vector<std::unique_ptr<nixlUcxThread>> dedicatedThreads_;
     size_t numSharedWorkers_;

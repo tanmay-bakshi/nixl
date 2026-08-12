@@ -80,6 +80,9 @@ public:
       const nixlBackendTransferEventBinding &binding,
       const std::shared_ptr<nixlBackendTransferTransitionSink> &sink,
       std::unique_ptr<nixlBackendEventSubscription> &subscription) override;
+  void
+  queryTerminalLifecycleInventory(
+      nixlBackendTerminalLifecycleInventory &inventory) const noexcept override;
   nixl_status_t
   releaseReqH(nixlBackendReqH *handle) const override;
 

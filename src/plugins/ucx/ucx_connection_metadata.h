@@ -49,6 +49,7 @@ enum class connection_metadata_status_t {
 struct connection_metadata_worker_t {
     notif_wire_uuid_t incarnation;
     std::string endpointAddress;
+    bool supportsAttachedReceipt = false;
 
     bool
     operator==(const connection_metadata_worker_t &) const = default;

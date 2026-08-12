@@ -61,6 +61,7 @@ makeMetadata() {
                 {
                     .incarnation = makeUuid(2),
                     .endpointAddress = std::string("\0\x01\xff", 3),
+                    .supportsAttachedReceipt = true,
                 },
                 {
                     .incarnation = makeUuid(3),
@@ -151,7 +152,7 @@ testCanonicalNetworkOrderLayout() {
     const std::string wire = encode(metadata);
 
     std::string expected = "NXCM";
-    expected.push_back(1);
+    expected.push_back(2);
     expected.append(3, '\0');
     appendU32(expected, 86);
     appendU32(expected, 2);
@@ -159,7 +160,8 @@ testCanonicalNetworkOrderLayout() {
     for (const connection_metadata_worker_t &worker : metadata.workers) {
         appendUuid(expected, worker.incarnation);
         appendU32(expected, static_cast<std::uint32_t>(worker.endpointAddress.size()));
-        expected.append(4, '\0');
+        expected.push_back(worker.supportsAttachedReceipt ? 1 : 0);
+        expected.append(3, '\0');
         expected.append(worker.endpointAddress);
     }
 
@@ -304,7 +306,7 @@ testDecodeHeaderValidation() {
                          connection_metadata_status_t::MALFORMED_METADATA,
                          "invalid metadata magic was decoded");
 
-    for (const std::uint8_t version : {0U, 2U, 255U}) {
+    for (const std::uint8_t version : {0U, 3U, 255U}) {
         malformed = valid;
         malformed[4] = static_cast<char>(version);
         requireDecodeFailure(malformed,
@@ -373,7 +375,13 @@ testDecodeWorkerValidation() {
                          connection_metadata_status_t::MALFORMED_METADATA,
                          "worker address extending past the frame was decoded");
 
-    for (const std::size_t reserved_offset : {52U, 53U, 54U, 55U}) {
+    malformed = valid;
+    malformed[52] = 2;
+    requireDecodeFailure(malformed,
+                         connection_metadata_status_t::NONZERO_RESERVED,
+                         "unknown worker feature was decoded");
+
+    for (const std::size_t reserved_offset : {53U, 54U, 55U}) {
         malformed = valid;
         malformed[reserved_offset] = 1;
         requireDecodeFailure(malformed,
@@ -395,6 +403,31 @@ testDecodeWorkerValidation() {
                          "trailing metadata bytes were decoded");
 }
 
+void
+testLegacyMetadataDisablesAttachedReceipts() {
+    connection_metadata_t legacy = makeMetadata();
+    for (connection_metadata_worker_t &worker : legacy.workers) {
+        worker.supportsAttachedReceipt = false;
+    }
+    std::string wire = encode(legacy);
+    wire[4] = 1;
+
+    connection_metadata_t decoded;
+    require(decodeConnectionMetadata(wire, decoded) == connection_metadata_status_t::SUCCESS,
+            "legacy connection metadata was not decoded");
+    require(std::none_of(decoded.workers.begin(),
+                         decoded.workers.end(),
+                         [](const connection_metadata_worker_t &worker) {
+                             return worker.supportsAttachedReceipt;
+                         }),
+            "legacy metadata inferred attached-receipt support");
+
+    wire[52] = 1;
+    requireDecodeFailure(wire,
+                         connection_metadata_status_t::NONZERO_RESERVED,
+                         "legacy metadata advertised an undefined receipt feature");
+}
+
 } // namespace
 
 int
@@ -407,6 +440,7 @@ main() {
         testEncodeValidation();
         testDecodeHeaderValidation();
         testDecodeWorkerValidation();
+        testLegacyMetadataDisablesAttachedReceipts();
     }
     catch (const std::exception &error) {
         std::cerr << "ucx_connection_metadata_test failed: " << error.what() << '\n';

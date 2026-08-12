@@ -203,7 +203,7 @@ testConvergenceAndEarlyData() {
 
     notif_wire_envelope_t data_sentinel;
     data_sentinel.type = notif_wire_type_t::ACK;
-    require(state_b.prepareData(route_ba, worker_b1, data_sentinel) ==
+    require(state_b.prepareData(route_ba, worker_b1, 1, 47, 53, data_sentinel) ==
                 notif_state_status_t::NOT_READY,
             "outbound route became ready before an OFFER");
     require(data_sentinel.type == notif_wire_type_t::ACK,
@@ -226,7 +226,8 @@ testConvergenceAndEarlyData() {
             "OFFER did not make the outbound route ready before ACK");
 
     notif_wire_envelope_t early_data;
-    require(state_b.prepareData(route_ba, worker_b2, early_data) == notif_state_status_t::SUCCESS,
+    require(state_b.prepareData(route_ba, worker_b2, 2, 47, 53, early_data) ==
+                notif_state_status_t::SUCCESS,
             "DATA could not race ahead of ACK");
     const notif_data_resolution_t early_resolution = state_a.resolveData(early_data);
     require(early_resolution.disposition == notif_data_disposition_t::DELIVER &&
@@ -236,6 +237,35 @@ testConvergenceAndEarlyData() {
                 early_resolution.authority.endpointIdentity == 5001 &&
                 !early_resolution.authority.tombstoned,
             "early DATA did not resolve to exact receiver-local authority");
+
+    notif_wire_envelope_t delivery_receipt;
+    require(state_a.makeDataReceipt(early_resolution.authority,
+                                    worker_a1,
+                                    early_data.capability,
+                                    early_data.capabilityEpoch,
+                                    early_data.deliveryIdentity,
+                                    early_data.sourceHandleIdentity,
+                                    early_data.sourceGeneration,
+                                    delivery_receipt) == notif_state_status_t::SUCCESS,
+            "receiver could not bind a DATA_RECEIPT to the accepted delivery");
+    require(delivery_receipt.type == notif_wire_type_t::DATA_RECEIPT &&
+                delivery_receipt.deliveryIdentity == early_data.deliveryIdentity &&
+                delivery_receipt.capability == early_data.capability &&
+                delivery_receipt.capabilityEpoch == early_data.capabilityEpoch,
+            "DATA_RECEIPT changed exact delivery authority");
+    const notif_data_resolution_t receipt_resolution =
+        state_b.resolveDataReceipt(delivery_receipt);
+    require(receipt_resolution.disposition == notif_data_disposition_t::DELIVER &&
+                receipt_resolution.authority.route == route_ba &&
+                receipt_resolution.authority.deliveryIdentity == early_data.deliveryIdentity &&
+                receipt_resolution.authority.connectionIdentity == 2001,
+            "DATA_RECEIPT did not resolve to the exact sender-local route");
+
+    notif_wire_envelope_t stale_receipt = delivery_receipt;
+    ++stale_receipt.capabilityEpoch;
+    require(state_b.resolveDataReceipt(stale_receipt).disposition ==
+                notif_data_disposition_t::DROP_ROUTE,
+            "stale DATA_RECEIPT changed current delivery state");
 
     notif_route_key_t acknowledged_route;
     require(state_a.acceptAcknowledgement(accepted_by_b.acknowledgement, acknowledged_route) ==
@@ -288,11 +318,11 @@ testOfferReplayAndEpochConflict() {
     notif_offer_acceptance_t acceptance;
     require(state_a.acceptOffer(remote_offer, worker_a, acceptance) ==
                     notif_state_status_t::SUCCESS &&
-                acceptance.reemitLocalOffer,
+                acceptance.reemitLocalOffer && acceptance.remoteCapabilityChanged,
             "new high-epoch OFFER was not accepted");
     require(state_a.acceptOffer(remote_offer, worker_a, acceptance) ==
                     notif_state_status_t::SUCCESS &&
-                !acceptance.reemitLocalOffer,
+                !acceptance.reemitLocalOffer && !acceptance.remoteCapabilityChanged,
             "exact OFFER replay was not idempotent");
 
     notif_wire_envelope_t stale = remote_offer;
@@ -312,7 +342,8 @@ testOfferReplayAndEpochConflict() {
                 notif_state_status_t::EPOCH_CONFLICT,
             "equal-epoch capability conflict did not fail closed");
     notif_wire_envelope_t data;
-    require(state_a.prepareData(route_ab, worker_a, data) == notif_state_status_t::ROUTE_FAILED,
+    require(state_a.prepareData(route_ab, worker_a, 3, 47, 53, data) ==
+                notif_state_status_t::ROUTE_FAILED,
             "failed route remained eligible for new DATA sends");
 }
 
@@ -343,7 +374,7 @@ testRetirementPreservesExactAttribution() {
     notif_wire_envelope_t output;
     require(state_a.makeOffer(generation_one, worker_a, output) ==
                     notif_state_status_t::ROUTE_RETIRED &&
-                state_a.prepareData(generation_one, worker_a, output) ==
+                state_a.prepareData(generation_one, worker_a, 4, 47, 53, output) ==
                     notif_state_status_t::ROUTE_RETIRED,
             "retired route remained eligible for new sends");
 
@@ -494,8 +525,9 @@ testCapabilitySubscriptionTransitions() {
                 makeInbound(
                     local_offer, notif_wire_type_t::OFFER, remote_worker, second_capability, 21),
                 local_worker,
-                acceptance) == notif_state_status_t::SUCCESS,
-            "capability epoch advance failed");
+                acceptance) == notif_state_status_t::SUCCESS &&
+            acceptance.remoteCapabilityChanged,
+        "capability epoch advance failed");
     require(sink->transitions().size() == 2 &&
                 sink->transitions()[1].state == notif_route_transition_state_t::READY &&
                 sink->transitions()[1].capabilityEpoch == 21 &&

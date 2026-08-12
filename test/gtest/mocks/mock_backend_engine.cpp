@@ -105,6 +105,13 @@ MockBackendEngine::subscribeXferTerminal(
     return gmock_backend_engine->subscribeXferTerminal(handle, binding, sink, subscription);
 }
 
+void
+MockBackendEngine::queryTerminalLifecycleInventory(
+    nixlBackendTerminalLifecycleInventory &inventory) const noexcept {
+    assert(sharedState > 0);
+    gmock_backend_engine->queryTerminalLifecycleInventory(inventory);
+}
+
 nixl_status_t
 MockBackendEngine::releaseReqH(nixlBackendReqH *handle) const {
     assert(sharedState > 0);

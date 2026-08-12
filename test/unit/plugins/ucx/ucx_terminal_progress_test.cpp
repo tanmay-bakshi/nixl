@@ -346,6 +346,36 @@ testNotificationFailure() {
 }
 
 void
+testAuthenticatedNotificationFailureRecordsItsBoundary() {
+    auto sink = std::make_shared<recording_sink_t>();
+    auto state = std::make_shared<terminal_submission_state_t>(
+        23, 113, 19, 1, 1, true, sink);
+    require(state->registerChunk() == NIXL_SUCCESS &&
+                state->registerFlush() == NIXL_SUCCESS &&
+                state->completeChunk(NIXL_SUCCESS, 130) == NIXL_SUCCESS,
+            "authenticated-failure data setup failed");
+    require(state->sealPosting([]() { return NIXL_IN_PROG; }, 131) ==
+                NIXL_SUCCESS,
+            "authenticated-failure posting seal failed");
+    state->recordCallbackObservation(
+        ucx_callback_kind_t::ENDPOINT_FLUSH, false, 132);
+    require(state->completeFlush(NIXL_SUCCESS, 132) == NIXL_SUCCESS,
+            "authenticated-failure notification setup failed");
+    require(state->recordNotificationFailure(
+                NIXL_ERR_REMOTE_DISCONNECT, 133) == NIXL_SUCCESS,
+            "authenticated notification failure did not publish terminality");
+    require(sink->results.size() == 1 &&
+                sink->results[0].status == NIXL_ERR_REMOTE_DISCONNECT &&
+                sink->results[0].diagnostics.lastFlushCallbackTimestampNs == 132 &&
+                sink->results[0].diagnostics.notificationCallbacks == 1 &&
+                sink->results[0].diagnostics.notificationCallbackTimestampNs == 133,
+            "authenticated notification failure lost its exact timing boundary");
+    require(state->recordNotificationFailure(
+                NIXL_ERR_REMOTE_DISCONNECT, 134) == NIXL_ERR_NOT_ALLOWED,
+            "terminal authenticated notification accepted a duplicate failure");
+}
+
+void
 testCompositeFolding() {
     auto sink = std::make_shared<recording_sink_t>();
     auto state = std::make_shared<terminal_submission_state_t>(
@@ -692,6 +722,7 @@ main() {
         testCallbacksBeforePostingSeal();
         testCancellationAndFailure();
         testNotificationFailure();
+        testAuthenticatedNotificationFailureRecordsItsBoundary();
         testCompositeFolding();
         testFailedSlotAllocationCanUndoOnlyUnpostedRegistration();
         testContinuationOverflowAndShutdown();

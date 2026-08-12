@@ -187,6 +187,18 @@ class nixlBackendEngine {
             return NIXL_ERR_NOT_SUPPORTED;
         }
 
+        virtual void
+        queryTerminalLifecycleInventory(
+            nixlBackendTerminalLifecycleInventory &inventory) const noexcept {
+            inventory = {};
+        }
+
+        virtual nixl_status_t
+        installAdmissionReceiptBarrier(nixlBackendAdmissionReceiptBarrier *barrier) noexcept {
+            static_cast<void>(barrier);
+            return NIXL_ERR_NOT_SUPPORTED;
+        }
+
         //Backend aborts the transfer if necessary, and destructs the relevant objects
         virtual nixl_status_t releaseReqH(nixlBackendReqH* handle) const = 0;
 

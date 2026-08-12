@@ -518,7 +518,10 @@ notif_capability_state_t::makeEnvelopeLocked(notif_wire_type_t type,
                                              const binding_state_t &binding,
                                              const notif_wire_uuid_t &local_sender_worker,
                                              const notif_wire_uuid_t &capability,
-                                             std::uint64_t capability_epoch) const {
+                                             std::uint64_t capability_epoch,
+                                             std::uint64_t delivery_identity,
+                                             std::uint64_t source_handle_identity,
+                                             std::uint64_t source_generation) const {
     return {
         .type = type,
         .senderAgentIncarnation = localAgentIncarnation_,
@@ -528,6 +531,9 @@ notif_capability_state_t::makeEnvelopeLocked(notif_wire_type_t type,
         .senderWorkerIncarnation = local_sender_worker,
         .capability = capability,
         .capabilityEpoch = capability_epoch,
+        .deliveryIdentity = delivery_identity,
+        .sourceHandleIdentity = source_handle_identity,
+        .sourceGeneration = source_generation,
     };
 }
 
@@ -608,6 +614,7 @@ notif_capability_state_t::acceptOffer(const notif_wire_envelope_t &offer,
     }
 
     binding_state_t &binding = known->second;
+    acceptance.route = binding.binding.route;
     std::uint64_t endpoint_identity = 0;
     const notif_state_status_t validation =
         validateInboundLocked(offer, binding, endpoint_identity);
@@ -664,6 +671,7 @@ notif_capability_state_t::acceptOffer(const notif_wire_envelope_t &offer,
                                          binding.localCapability,
                                          binding.localCapabilityEpoch),
         .reemitLocalOffer = reemit_local_offer,
+        .remoteCapabilityChanged = capability_changed,
     };
     if (capability_changed) {
         pending = enqueueRouteTransitionLocked(binding.binding.route,
@@ -715,7 +723,18 @@ notif_capability_state_t::acceptAcknowledgement(const notif_wire_envelope_t &ack
 notif_state_status_t
 notif_capability_state_t::prepareData(const notif_route_key_t &route,
                                       const notif_wire_uuid_t &local_sender_worker,
+                                      std::uint64_t delivery_identity,
+                                      std::uint64_t source_handle_identity,
+                                      std::uint64_t source_generation,
                                       notif_wire_envelope_t &data) const {
+    if ((delivery_identity == 0) !=
+        (source_handle_identity == 0 && source_generation == 0)) {
+        return notif_state_status_t::INVALID_ARGUMENT;
+    }
+    if (delivery_identity != 0 &&
+        (source_handle_identity == 0 || source_generation == 0)) {
+        return notif_state_status_t::INVALID_ARGUMENT;
+    }
     std::lock_guard<std::mutex> lock(mutex_);
     const auto known = bindings_.find(route);
     if (known == bindings_.end()) {
@@ -735,11 +754,15 @@ notif_capability_state_t::prepareData(const notif_route_key_t &route,
         return notif_state_status_t::NOT_READY;
     }
 
-    data = makeEnvelopeLocked(notif_wire_type_t::DATA,
+    data = makeEnvelopeLocked(delivery_identity == 0 ? notif_wire_type_t::DATA :
+                                                       notif_wire_type_t::ATTACHED_DATA,
                               binding,
                               local_sender_worker,
                               binding.remoteCapability,
-                              binding.remoteCapabilityEpoch);
+                              binding.remoteCapabilityEpoch,
+                              delivery_identity,
+                              source_handle_identity,
+                              source_generation);
     return notif_state_status_t::SUCCESS;
 }
 
@@ -768,10 +791,22 @@ notif_capability_state_t::resolveData(const notif_wire_envelope_t &data) const {
     const binding_state_t &binding = known->second;
     resolution.authority.connectionIdentity = binding.binding.connectionIdentity;
     resolution.authority.tombstoned = binding.retired;
+    resolution.authority.capability = data.capability;
+    resolution.authority.capabilityEpoch = data.capabilityEpoch;
+    resolution.authority.deliveryIdentity = data.deliveryIdentity;
+    resolution.authority.sourceHandleIdentity = data.sourceHandleIdentity;
+    resolution.authority.sourceGeneration = data.sourceGeneration;
 
     std::uint64_t endpoint_identity = 0;
     const notif_state_status_t validation = validateInboundLocked(data, binding, endpoint_identity);
-    if (data.type != notif_wire_type_t::DATA ||
+    if ((data.type != notif_wire_type_t::DATA &&
+         data.type != notif_wire_type_t::ATTACHED_DATA) ||
+        (data.type == notif_wire_type_t::DATA &&
+         (data.deliveryIdentity != 0 || data.sourceHandleIdentity != 0 ||
+          data.sourceGeneration != 0)) ||
+        (data.type == notif_wire_type_t::ATTACHED_DATA &&
+         (data.deliveryIdentity == 0 || data.sourceHandleIdentity == 0 ||
+          data.sourceGeneration == 0)) ||
         data.capabilityEpoch != binding.localCapabilityEpoch ||
         validation != notif_state_status_t::SUCCESS) {
         resolution.status = notif_state_status_t::INVALID_ARGUMENT;
@@ -786,6 +821,138 @@ notif_capability_state_t::resolveData(const notif_wire_envelope_t &data) const {
     resolution.disposition = notif_data_disposition_t::DELIVER;
     resolution.status = notif_state_status_t::SUCCESS;
     return resolution;
+}
+
+notif_state_status_t
+notif_capability_state_t::makeDataReceipt(const notif_data_authority_t &authority,
+                                          const notif_wire_uuid_t &local_sender_worker,
+                                          const notif_wire_uuid_t &data_capability,
+                                          std::uint64_t data_capability_epoch,
+                                          std::uint64_t delivery_identity,
+                                          std::uint64_t source_handle_identity,
+                                          std::uint64_t source_generation,
+                                          notif_wire_envelope_t &receipt) const {
+    if (delivery_identity == 0 || source_handle_identity == 0 || source_generation == 0 ||
+        !isCanonicalNotifWireUuid(data_capability) || data_capability_epoch == 0 ||
+        authority.deliveryIdentity != delivery_identity ||
+        authority.sourceHandleIdentity != source_handle_identity ||
+        authority.sourceGeneration != source_generation) {
+        return notif_state_status_t::INVALID_ARGUMENT;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto known = bindings_.find(authority.route);
+    if (known == bindings_.end()) {
+        return notif_state_status_t::UNKNOWN_ROUTE;
+    }
+    const binding_state_t &binding = known->second;
+    if (binding.retired) {
+        return notif_state_status_t::ROUTE_RETIRED;
+    }
+    if (binding.failed) {
+        return notif_state_status_t::ROUTE_FAILED;
+    }
+    if (binding.binding.connectionIdentity != authority.connectionIdentity ||
+        data_capability != binding.localCapability ||
+        data_capability_epoch != binding.localCapabilityEpoch) {
+        return notif_state_status_t::INVALID_ARGUMENT;
+    }
+    if (!isLocalWorker(local_sender_worker)) {
+        return notif_state_status_t::INVALID_ARGUMENT;
+    }
+    receipt = makeEnvelopeLocked(notif_wire_type_t::DATA_RECEIPT,
+                                 binding,
+                                 local_sender_worker,
+                                 data_capability,
+                                 data_capability_epoch,
+                                 delivery_identity,
+                                 source_handle_identity,
+                                 source_generation);
+    return notif_state_status_t::SUCCESS;
+}
+
+notif_data_resolution_t
+notif_capability_state_t::resolveDataReceipt(const notif_wire_envelope_t &receipt) const {
+    if (receipt.type != notif_wire_type_t::DATA_RECEIPT || receipt.deliveryIdentity == 0 ||
+        receipt.sourceHandleIdentity == 0 || receipt.sourceGeneration == 0 ||
+        receipt.recipientAgentIncarnation != localAgentIncarnation_ ||
+        receipt.recipientBackendIncarnation != localBackendIncarnation_) {
+        return {};
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    bool peer_known = false;
+    for (const auto &[route, binding] : bindings_) {
+        if (route.remoteAgentIncarnation != receipt.senderAgentIncarnation ||
+            route.remoteBackendIncarnation != receipt.senderBackendIncarnation) {
+            continue;
+        }
+        peer_known = true;
+        std::uint64_t endpoint_identity = 0;
+        const notif_state_status_t validation =
+            validateInboundLocked(receipt, binding, endpoint_identity);
+        if (validation != notif_state_status_t::SUCCESS ||
+            !binding.hasRemoteCapability || receipt.capability != binding.remoteCapability ||
+            receipt.capabilityEpoch != binding.remoteCapabilityEpoch) {
+            continue;
+        }
+        return {
+            .disposition = notif_data_disposition_t::DELIVER,
+            .status = notif_state_status_t::SUCCESS,
+            .authority =
+                {
+                    .route = route,
+                    .connectionIdentity = binding.binding.connectionIdentity,
+                    .senderWorkerIncarnation = receipt.senderWorkerIncarnation,
+                    .endpointIdentity = endpoint_identity,
+                    .capability = receipt.capability,
+                    .capabilityEpoch = receipt.capabilityEpoch,
+                    .deliveryIdentity = receipt.deliveryIdentity,
+                    .sourceHandleIdentity = receipt.sourceHandleIdentity,
+                    .sourceGeneration = receipt.sourceGeneration,
+                    .tombstoned = binding.retired || binding.failed,
+                },
+        };
+    }
+    return {
+        .disposition = peer_known ? notif_data_disposition_t::DROP_ROUTE :
+                                    notif_data_disposition_t::POISON_GLOBAL,
+        .status = peer_known ? notif_state_status_t::INVALID_ARGUMENT :
+                               notif_state_status_t::UNKNOWN_ROUTE,
+    };
+}
+
+notif_state_status_t
+notif_capability_state_t::validateOutboundDeliveryAuthority(
+    const notif_route_key_t &route,
+    const notif_wire_uuid_t &capability,
+    std::uint64_t capability_epoch,
+    std::uint64_t connection_identity,
+    const notif_wire_uuid_t &receipt_worker,
+    std::uint64_t endpoint_identity) const {
+    if (!isCanonicalNotifWireUuid(capability) || capability_epoch == 0 ||
+        connection_identity == 0 || !isCanonicalNotifWireUuid(receipt_worker) ||
+        endpoint_identity == 0) {
+        return notif_state_status_t::INVALID_ARGUMENT;
+    }
+    const std::lock_guard lock(mutex_);
+    const auto known = bindings_.find(route);
+    if (known == bindings_.end()) {
+        return notif_state_status_t::UNKNOWN_ROUTE;
+    }
+    const binding_state_t &binding = known->second;
+    if (binding.failed) {
+        return notif_state_status_t::ROUTE_FAILED;
+    }
+    if (binding.retired) {
+        return notif_state_status_t::ROUTE_RETIRED;
+    }
+    const auto worker = binding.remoteWorkers.find(receipt_worker);
+    if (binding.binding.connectionIdentity != connection_identity ||
+        !binding.hasRemoteCapability || binding.remoteCapability != capability ||
+        binding.remoteCapabilityEpoch != capability_epoch ||
+        worker == binding.remoteWorkers.end() || worker->second != endpoint_identity) {
+        return notif_state_status_t::INVALID_ARGUMENT;
+    }
+    return notif_state_status_t::SUCCESS;
 }
 
 notif_endpoint_failure_state_t::notif_endpoint_failure_state_t(

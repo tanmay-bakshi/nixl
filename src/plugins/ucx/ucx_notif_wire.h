@@ -26,13 +26,15 @@
 namespace nixl::ucx {
 
 inline constexpr std::size_t notif_wire_uuid_size = 16;
-inline constexpr std::size_t notif_wire_header_size = 128;
+inline constexpr std::size_t notif_wire_header_size = 144;
 inline constexpr std::size_t notif_wire_max_frame_size = 64 * 1024;
 
 enum class notif_wire_type_t : std::uint8_t {
     OFFER = 1,
     ACK = 2,
     DATA = 3,
+    DATA_RECEIPT = 4,
+    ATTACHED_DATA = 5,
 };
 
 enum class notif_wire_status_t {
@@ -44,6 +46,8 @@ enum class notif_wire_status_t {
     INVALID_TYPE,
     NONZERO_RESERVED,
     INVALID_IDENTITY,
+    INVALID_DELIVERY_IDENTITY,
+    INVALID_SOURCE_TRANSFER,
     INVALID_PAYLOAD,
 };
 
@@ -63,6 +67,9 @@ struct notif_wire_envelope_t {
     notif_wire_uuid_t senderWorkerIncarnation;
     notif_wire_uuid_t capability;
     std::uint64_t capabilityEpoch = 0;
+    std::uint64_t deliveryIdentity = 0;
+    std::uint64_t sourceHandleIdentity = 0;
+    std::uint64_t sourceGeneration = 0;
 
     bool
     operator==(const notif_wire_envelope_t &) const = default;

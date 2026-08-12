@@ -447,6 +447,139 @@ namespace agent {
         EXPECT_EQ(local_agent_->closeTerminalEventChannel(channel), NIXL_SUCCESS);
     }
 
+    TEST_F(singleAgentSessionFixture,
+           TerminalChannelAggregatesEngineLifecycleWithoutSubscriptionsTest) {
+        auto &backend = agent_helper_->getGMockEngine();
+        EXPECT_CALL(backend, queryTerminalLifecycleInventory(testing::_))
+            .Times(2)
+            .WillRepeatedly([](nixlBackendTerminalLifecycleInventory &inventory) {
+                inventory = {
+                    .sourceDeliveriesOutstanding = 2,
+                    .sourceLocalPending = 1,
+                    .sourceReceiptPending = 2,
+                    .destinationPending = 1,
+                    .destinationAdmitting = 1,
+                    .destinationCommitted = 1,
+                    .destinationReplaying = 1,
+                    .destinationQuarantined = 1,
+                    .activeNativeDeadlines = 2,
+                    .sourceDeliveries = {
+                        {
+                            .deliveryIdentity = 101,
+                            .sourceHandleIdentity = 201,
+                            .sourceGeneration = 301,
+                            .localPending = true,
+                            .receiptPending = true,
+                            .deadlineActive = true,
+                        },
+                        {
+                            .deliveryIdentity = 102,
+                            .sourceHandleIdentity = 202,
+                            .sourceGeneration = 302,
+                            .receiptPending = true,
+                            .deadlineActive = true,
+                        },
+                    },
+                    .destinationDeliveries = {
+                        {
+                            .sourceBackendIncarnation = "source-a",
+                            .sourceHandleIdentity = 401,
+                            .sourceGeneration = 501,
+                            .deliveryIdentity = 601,
+                            .phase = nixl_backend_terminal_destination_phase_t::PENDING,
+                        },
+                        {
+                            .sourceBackendIncarnation = "source-b",
+                            .sourceHandleIdentity = 402,
+                            .sourceGeneration = 502,
+                            .deliveryIdentity = 602,
+                            .phase = nixl_backend_terminal_destination_phase_t::ADMITTING,
+                        },
+                        {
+                            .sourceBackendIncarnation = "source-c",
+                            .sourceHandleIdentity = 403,
+                            .sourceGeneration = 503,
+                            .deliveryIdentity = 603,
+                            .phase = nixl_backend_terminal_destination_phase_t::COMMITTED,
+                        },
+                        {
+                            .sourceBackendIncarnation = "source-d",
+                            .sourceHandleIdentity = 404,
+                            .sourceGeneration = 504,
+                            .deliveryIdentity = 604,
+                            .phase = nixl_backend_terminal_destination_phase_t::REPLAYING,
+                        },
+                        {
+                            .sourceBackendIncarnation = "source-e",
+                            .sourceHandleIdentity = 405,
+                            .sourceGeneration = 505,
+                            .deliveryIdentity = 605,
+                            .phase = nixl_backend_terminal_destination_phase_t::QUARANTINED,
+                        },
+                    },
+                    .nativeDeadlines = {
+                        {.handleIdentity = 201, .generation = 301},
+                        {.handleIdentity = 202, .generation = 302},
+                    },
+                };
+            });
+
+        nixl_b_params_t params;
+        nixlBackendH *backend_handle = nullptr;
+        ASSERT_EQ(agent_helper_->createBackendWithGMock(params, backend_handle), NIXL_SUCCESS);
+        nixlTerminalEventChannelH *channel = nullptr;
+        ASSERT_EQ(agent_->createTerminalEventChannel(4, channel), NIXL_SUCCESS);
+
+        const auto verify_inventory = [](const nixl_terminal_channel_inventory_t &inventory) {
+            EXPECT_EQ(inventory.retainedPublicSubscriptions, 0U);
+            const nixl_terminal_backend_lifecycle_inventory_t &lifecycle =
+                inventory.backendLifecycle;
+            EXPECT_EQ(lifecycle.sourceDeliveriesOutstanding, 2U);
+            EXPECT_EQ(lifecycle.sourceLocalPending, 1U);
+            EXPECT_EQ(lifecycle.sourceReceiptPending, 2U);
+            EXPECT_EQ(lifecycle.destinationPending, 1U);
+            EXPECT_EQ(lifecycle.destinationAdmitting, 1U);
+            EXPECT_EQ(lifecycle.destinationCommitted, 1U);
+            EXPECT_EQ(lifecycle.destinationReplaying, 1U);
+            EXPECT_EQ(lifecycle.destinationQuarantined, 1U);
+            EXPECT_EQ(lifecycle.activeNativeDeadlines, 2U);
+            ASSERT_EQ(lifecycle.nativeDeadlines.size(), 2U);
+            EXPECT_EQ(lifecycle.nativeDeadlines[0].backend, GetMockBackendName());
+            EXPECT_EQ(lifecycle.nativeDeadlines[0].handleIdentity, 201U);
+            EXPECT_EQ(lifecycle.nativeDeadlines[0].generation, 301U);
+            ASSERT_EQ(lifecycle.sourceDeliveries.size(), 2U);
+            EXPECT_EQ(lifecycle.sourceDeliveries[0].backend, GetMockBackendName());
+            EXPECT_EQ(lifecycle.sourceDeliveries[0].deliveryIdentity, 101U);
+            EXPECT_TRUE(lifecycle.sourceDeliveries[0].localPending);
+            EXPECT_TRUE(lifecycle.sourceDeliveries[0].receiptPending);
+            EXPECT_TRUE(lifecycle.sourceDeliveries[0].deadlineActive);
+            ASSERT_EQ(lifecycle.destinationDeliveries.size(), 5U);
+            EXPECT_EQ(lifecycle.destinationDeliveries[0].backend, GetMockBackendName());
+            EXPECT_EQ(lifecycle.destinationDeliveries[0].sourceBackendIncarnation,
+                      "source-a");
+            const std::array<nixl_terminal_destination_phase_t, 5> expected_phases = {
+                nixl_terminal_destination_phase_t::PENDING,
+                nixl_terminal_destination_phase_t::ADMITTING,
+                nixl_terminal_destination_phase_t::COMMITTED,
+                nixl_terminal_destination_phase_t::REPLAYING,
+                nixl_terminal_destination_phase_t::QUARANTINED,
+            };
+            for (size_t index = 0; index < expected_phases.size(); ++index) {
+                EXPECT_EQ(lifecycle.destinationDeliveries[index].phase,
+                          expected_phases[index]);
+            }
+        };
+
+        nixl_terminal_channel_inventory_t inventory;
+        ASSERT_EQ(agent_->queryTerminalEventChannel(channel, inventory), NIXL_SUCCESS);
+        verify_inventory(inventory);
+
+        nixl_terminal_event_batch_t batch;
+        ASSERT_EQ(agent_->drainTerminalEvents(channel, batch), NIXL_SUCCESS);
+        EXPECT_TRUE(batch.events.empty());
+        verify_inventory(batch.inventory);
+    }
+
     TEST_F(singleAgentSessionFixture, GetNonExistingPluginTest) {
         nixl_mem_list_t mem;
         nixl_b_params_t params;

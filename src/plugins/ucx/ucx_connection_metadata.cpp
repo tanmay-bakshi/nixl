@@ -27,7 +27,8 @@ namespace nixl::ucx {
 namespace {
 
     constexpr std::array<std::uint8_t, 4> metadata_magic = {'N', 'X', 'C', 'M'};
-    constexpr std::uint8_t metadata_version = 1;
+    constexpr std::uint8_t legacy_metadata_version = 1;
+    constexpr std::uint8_t metadata_version = 2;
 
     constexpr std::size_t magic_offset = 0;
     constexpr std::size_t version_offset = 4;
@@ -39,8 +40,11 @@ namespace {
 
     constexpr std::size_t worker_incarnation_offset = 0;
     constexpr std::size_t worker_address_size_offset = 16;
-    constexpr std::size_t worker_reserved_offset = 20;
-    constexpr std::size_t worker_reserved_size = 4;
+    constexpr std::size_t worker_features_offset = 20;
+    constexpr std::uint8_t attached_receipt_feature = 1U << 0U;
+    constexpr std::uint8_t known_worker_features = attached_receipt_feature;
+    constexpr std::size_t worker_reserved_offset = 21;
+    constexpr std::size_t worker_reserved_size = 3;
 
     static_assert(backend_incarnation_offset + notif_wire_uuid_size ==
                   connection_metadata_header_size);
@@ -188,6 +192,8 @@ encodeConnectionMetadata(const connection_metadata_t &metadata, std::string &out
         writeU32(encoded,
                  offset + worker_address_size_offset,
                  static_cast<std::uint32_t>(worker.endpointAddress.size()));
+        encoded[offset + worker_features_offset] =
+            static_cast<char>(worker.supportsAttachedReceipt ? attached_receipt_feature : 0);
         offset += connection_metadata_worker_header_size;
         std::copy(
             worker.endpointAddress.begin(), worker.endpointAddress.end(), encoded.begin() + offset);
@@ -211,7 +217,8 @@ decodeConnectionMetadata(std::string_view wire, connection_metadata_t &output) {
             return connection_metadata_status_t::MALFORMED_METADATA;
         }
     }
-    if (static_cast<std::uint8_t>(wire[version_offset]) != metadata_version) {
+    const std::uint8_t version = static_cast<std::uint8_t>(wire[version_offset]);
+    if (version != legacy_metadata_version && version != metadata_version) {
         return connection_metadata_status_t::UNSUPPORTED_VERSION;
     }
     if (hasNonzeroBytes(wire, header_reserved_offset, header_reserved_size)) {
@@ -252,9 +259,15 @@ decodeConnectionMetadata(std::string_view wire, connection_metadata_t &output) {
         if (address_size == 0 || address_size > connection_metadata_max_worker_address_size) {
             return connection_metadata_status_t::INVALID_WORKER_ADDRESS;
         }
-        if (hasNonzeroBytes(wire, offset + worker_reserved_offset, worker_reserved_size)) {
+        const std::uint8_t worker_features =
+            static_cast<std::uint8_t>(wire[offset + worker_features_offset]);
+        if ((version == legacy_metadata_version && worker_features != 0) ||
+            (worker_features & ~known_worker_features) != 0 ||
+            hasNonzeroBytes(wire, offset + worker_reserved_offset, worker_reserved_size)) {
             return connection_metadata_status_t::NONZERO_RESERVED;
         }
+        worker.supportsAttachedReceipt =
+            version == metadata_version && (worker_features & attached_receipt_feature) != 0;
 
         offset += connection_metadata_worker_header_size;
         if (address_size > wire.size() - offset) {
