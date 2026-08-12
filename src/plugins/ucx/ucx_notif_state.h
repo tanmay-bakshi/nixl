@@ -169,6 +169,9 @@ public:
     retireRemoteAgent(const notif_route_key_t &route);
 
     [[nodiscard]] notif_state_status_t
+    failRemoteAgent(const notif_route_key_t &route);
+
+    [[nodiscard]] notif_state_status_t
     queryRemoteNotificationState(const notif_route_key_t &route,
                                  notif_route_snapshot_t &snapshot) const;
 
