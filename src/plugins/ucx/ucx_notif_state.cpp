@@ -305,6 +305,38 @@ notif_capability_state_t::retireRemoteAgent(const notif_route_key_t &route) {
     return notif_state_status_t::SUCCESS;
 }
 
+notif_state_status_t
+notif_capability_state_t::failRemoteAgent(const notif_route_key_t &route) {
+    pending_route_delivery_t pending;
+    {
+        const std::lock_guard lock(mutex_);
+        const auto known = bindings_.find(route);
+        if (known == bindings_.end()) {
+            return notif_state_status_t::UNKNOWN_ROUTE;
+        }
+        if (known->second.retired || known->second.failed) {
+            return notif_state_status_t::SUCCESS;
+        }
+
+        known->second.failed = true;
+        const peer_key_t peer = {
+            .agentIncarnation = route.remoteAgentIncarnation,
+            .backendIncarnation = route.remoteBackendIncarnation,
+        };
+        const auto active = activePeers_.find(peer);
+        if (active != activePeers_.end() && active->second == route) {
+            activePeers_.erase(active);
+        }
+        const std::uint64_t epoch = known->second.remoteCapabilityEpoch != 0 ?
+            known->second.remoteCapabilityEpoch :
+            known->second.localCapabilityEpoch;
+        pending =
+            enqueueRouteTransitionLocked(route, notif_route_transition_state_t::FAILED, epoch);
+    }
+    dispatchRouteTransition(std::move(pending));
+    return notif_state_status_t::SUCCESS;
+}
+
 notif_route_snapshot_t
 notif_capability_state_t::makeSnapshotLocked(const binding_state_t &binding) const {
     notif_route_state_t route_state = notif_route_state_t::NOT_READY;
