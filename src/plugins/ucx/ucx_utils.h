@@ -298,6 +298,11 @@ public:
         return hasProgressOwner_;
     }
 
+    [[nodiscard]] bool
+    isProgressOwnerThread() const noexcept {
+        return hasProgressOwner_ && progressOwnerThread_ == std::this_thread::get_id();
+    }
+
     [[nodiscard]] const std::shared_ptr<nixl::ucx::ucx_worker_continuation_queue_t> &
     getContinuationQueue() const noexcept {
         return continuations_;

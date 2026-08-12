@@ -216,6 +216,21 @@ nixlUcxNotificationQueue::poison() {
     queuedBytes_ = 0;
 }
 
+class nixlUcxTerminalArm;
+
+class nixlUcxTerminalOwnership final {
+public:
+    void
+    detach(const nixlUcxTerminalArm *arm) noexcept;
+
+private:
+    friend class nixlUcxBackendReqH;
+
+    mutable std::mutex mutex_;
+    std::shared_ptr<nixlUcxTerminalArm> armed_;
+    std::shared_ptr<nixlUcxTerminalArm> active_;
+};
+
 class nixlUcxTerminalArm final :
     public nixl::ucx::terminal_submission_sink_t,
     public std::enable_shared_from_this<nixlUcxTerminalArm> {
@@ -224,11 +239,13 @@ public:
         nixlBackendTransferEventBinding binding,
         std::shared_ptr<nixlBackendTransferTransitionSink> sink,
         std::shared_ptr<nixlUcxAttestationState> attestation,
-        std::vector<nixlUcxWorker *> workers)
+        std::vector<nixlUcxWorker *> workers,
+        std::weak_ptr<nixlUcxTerminalOwnership> ownership)
         : binding_(binding),
           sink_(std::move(sink)),
           attestation_(std::move(attestation)),
-          workers_(std::move(workers)) {}
+          workers_(std::move(workers)),
+          ownership_(std::move(ownership)) {}
 
     [[nodiscard]] nixl_status_t
     begin(bool has_notification) {
@@ -310,19 +327,24 @@ public:
     }
 
     [[nodiscard]] nixl_status_t
-    cancel() noexcept {
+    requestCancellation() noexcept {
         const nixl_status_t status = fail(NIXL_ERR_CANCELED);
-        if (status == NIXL_IN_PROG) {
-            std::unique_lock lock(mutex_);
-            delivered_.wait(lock, [this]() { return terminal_; });
-            return terminalStatus_ == NIXL_ERR_CANCELED ? NIXL_SUCCESS : terminalStatus_;
-        }
-        if (status != NIXL_ERR_CANCELED && status != NIXL_SUCCESS) {
+        if (status != NIXL_IN_PROG && status != NIXL_ERR_CANCELED &&
+            status != NIXL_SUCCESS) {
             return status;
         }
+        const std::lock_guard lock(mutex_);
+        return terminal_ ? cancellationStatusLocked() : NIXL_IN_PROG;
+    }
+
+    [[nodiscard]] nixl_status_t
+    drainCancellation() noexcept {
         std::unique_lock lock(mutex_);
+        if (!terminal_ && isProgressOwnerThread()) {
+            return NIXL_IN_PROG;
+        }
         delivered_.wait(lock, [this]() { return terminal_; });
-        return terminalStatus_ == NIXL_ERR_CANCELED ? NIXL_SUCCESS : terminalStatus_;
+        return cancellationStatusLocked();
     }
 
     [[nodiscard]] nixl_status_t
@@ -451,6 +473,7 @@ private:
 
     [[nodiscard]] nixl_status_t
     finalizeTerminal(nixl::ucx::terminal_submission_result_t completed) noexcept {
+        const std::shared_ptr<nixlUcxTerminalArm> self = shared_from_this();
         completed.diagnostics.activeCallbackSlotsAtTerminal = 0;
         completed.diagnostics.continuationDepthAtTerminal = 0;
         completed.diagnostics.terminalPublishTimestampNs =
@@ -472,11 +495,6 @@ private:
                                    "terminal progress evidence failed");
             }
         }
-        sink_->publish({
-            .binding = binding_,
-            .status = status,
-            .nativeTimestampNs = completed.nativeTimestampNs,
-        });
         {
             const std::lock_guard lock(mutex_);
             terminal_ = true;
@@ -485,8 +503,31 @@ private:
             state_.reset();
             slots_.clear();
         }
+        // Terminal visibility permits immediate request release, so detach first while `self`
+        // keeps the arm alive across a sink that releases both public lifetimes.
+        if (const std::shared_ptr<nixlUcxTerminalOwnership> ownership = ownership_.lock();
+            ownership != nullptr) {
+            ownership->detach(self.get());
+        }
+        sink_->publish({
+            .binding = binding_,
+            .status = status,
+            .nativeTimestampNs = completed.nativeTimestampNs,
+        });
         delivered_.notify_all();
         return status == NIXL_SUCCESS ? NIXL_SUCCESS : status;
+    }
+
+    [[nodiscard]] nixl_status_t
+    cancellationStatusLocked() const noexcept {
+        return terminalStatus_ == NIXL_ERR_CANCELED ? NIXL_SUCCESS : terminalStatus_;
+    }
+
+    [[nodiscard]] bool
+    isProgressOwnerThread() const noexcept {
+        return std::any_of(workers_.begin(), workers_.end(), [](const nixlUcxWorker *worker) {
+            return worker->isProgressOwnerThread();
+        });
     }
 
     void
@@ -513,6 +554,7 @@ private:
     const std::shared_ptr<nixlBackendTransferTransitionSink> sink_;
     const std::shared_ptr<nixlUcxAttestationState> attestation_;
     const std::vector<nixlUcxWorker *> workers_;
+    const std::weak_ptr<nixlUcxTerminalOwnership> ownership_;
     mutable std::mutex mutex_;
     std::condition_variable delivered_;
     std::shared_ptr<nixl::ucx::terminal_submission_state_t> state_;
@@ -524,6 +566,17 @@ private:
     bool terminal_ = false;
 };
 
+void
+nixlUcxTerminalOwnership::detach(const nixlUcxTerminalArm *arm) noexcept {
+    const std::lock_guard lock(mutex_);
+    if (armed_.get() == arm) {
+        armed_.reset();
+    }
+    if (active_.get() == arm) {
+        active_.reset();
+    }
+}
+
 class nixlUcxTerminalSubscription final : public nixlBackendEventSubscription {
 public:
     explicit nixlUcxTerminalSubscription(std::shared_ptr<nixlUcxTerminalArm> arm)
@@ -531,7 +584,7 @@ public:
 
     nixl_status_t
     cancel() noexcept override {
-        return arm_->cancel();
+        return arm_->requestCancellation();
     }
 
     void
@@ -541,7 +594,7 @@ public:
 
     nixl_status_t
     drainCancellation() noexcept override {
-        return arm_->cancel();
+        return arm_->drainCancellation();
     }
 
 private:
@@ -660,9 +713,7 @@ private:
     nixlUcxWorker *worker_;
     size_t workerId_;
     std::shared_ptr<nixlUcxAttestationState> attestation_;
-    mutable std::mutex terminalMutex_;
-    std::shared_ptr<nixlUcxTerminalArm> armedTerminal_;
-    std::shared_ptr<nixlUcxTerminalArm> activeTerminal_;
+    const std::shared_ptr<nixlUcxTerminalOwnership> terminalOwnership_;
 
     [[nodiscard]] nixl_status_t
     checkConnection(const nixl_status_t status = NIXL_SUCCESS) const {
@@ -712,7 +763,8 @@ public:
           attestation_(attestation != nullptr ?
                            std::move(attestation) :
                            std::make_shared<nixlUcxAttestationState>(
-                               allocateIdentity(next_handle_identity, "handle"))) {}
+                               allocateIdentity(next_handle_identity, "handle"))),
+          terminalOwnership_(std::make_shared<nixlUcxTerminalOwnership>()) {}
 
     [[nodiscard]] nixl_status_t
     prepareAttestation(nixl_xfer_op_t operation,
@@ -732,17 +784,22 @@ public:
         }
         std::shared_ptr<nixlUcxTerminalArm> armed;
         {
-            const std::lock_guard lock(terminalMutex_);
-            if (activeTerminal_ != nullptr && !activeTerminal_->isTerminal()) {
+            const std::lock_guard lock(terminalOwnership_->mutex_);
+            if (terminalOwnership_->active_ != nullptr &&
+                !terminalOwnership_->active_->isTerminal()) {
                 return NIXL_ERR_REPOST_ACTIVE;
             }
-            activeTerminal_.reset();
-            if (armedTerminal_ != nullptr &&
-                armedTerminal_->binding().generation != attestation_->getGeneration() + 1) {
+            terminalOwnership_->active_.reset();
+            if (terminalOwnership_->armed_ != nullptr &&
+                terminalOwnership_->armed_->binding().generation !=
+                    attestation_->getGeneration() + 1) {
                 return NIXL_ERR_NOT_ALLOWED;
             }
-            armed = armedTerminal_;
+            armed = terminalOwnership_->armed_;
         }
+        // Terminality and an empty request vector leave only the preceding generation's
+        // endpoint set, which must not become the next generation's flush set.
+        connections_.clear();
 
         const nixl_status_t begin_status = attestation_->beginSubmission();
         if (begin_status != NIXL_SUCCESS) {
@@ -759,15 +816,15 @@ public:
             return arm_status;
         }
         {
-            const std::lock_guard lock(terminalMutex_);
-            if (armedTerminal_ != armed) {
+            const std::lock_guard lock(terminalOwnership_->mutex_);
+            if (terminalOwnership_->armed_ != armed) {
                 attestation_->fail(attestation_->getGeneration(),
                                    NIXL_ERR_BACKEND,
                                    "terminal subscription ownership changed during activation");
                 return NIXL_ERR_BACKEND;
             }
-            armedTerminal_.reset();
-            activeTerminal_ = std::move(armed);
+            terminalOwnership_->armed_.reset();
+            terminalOwnership_->active_ = std::move(armed);
         }
         return NIXL_SUCCESS;
     }
@@ -789,15 +846,16 @@ public:
             }
         }
         const auto arm = std::make_shared<nixlUcxTerminalArm>(
-            binding, sink, attestation_, workers);
+            binding, sink, attestation_, workers, terminalOwnership_);
         {
-            const std::lock_guard lock(terminalMutex_);
-            if (armedTerminal_ != nullptr ||
-                (activeTerminal_ != nullptr && !activeTerminal_->isTerminal())) {
+            const std::lock_guard lock(terminalOwnership_->mutex_);
+            if (terminalOwnership_->armed_ != nullptr ||
+                (terminalOwnership_->active_ != nullptr &&
+                 !terminalOwnership_->active_->isTerminal())) {
                 return NIXL_ERR_NOT_ALLOWED;
             }
-            activeTerminal_ = nullptr;
-            armedTerminal_ = arm;
+            terminalOwnership_->active_ = nullptr;
+            terminalOwnership_->armed_ = arm;
         }
         subscription = std::make_unique<nixlUcxTerminalSubscription>(arm);
         return NIXL_SUCCESS;
@@ -805,14 +863,14 @@ public:
 
     [[nodiscard]] std::shared_ptr<nixlUcxTerminalArm>
     getActiveTerminal() const noexcept {
-        const std::lock_guard lock(terminalMutex_);
-        return activeTerminal_;
+        const std::lock_guard lock(terminalOwnership_->mutex_);
+        return terminalOwnership_->active_;
     }
 
     void
     setActiveTerminal(const std::shared_ptr<nixlUcxTerminalArm> &terminal) noexcept {
-        const std::lock_guard lock(terminalMutex_);
-        activeTerminal_ = terminal;
+        const std::lock_guard lock(terminalOwnership_->mutex_);
+        terminalOwnership_->active_ = terminal;
     }
 
     [[nodiscard]] bool
@@ -822,9 +880,10 @@ public:
 
     [[nodiscard]] bool
     terminalLifecycleDrained() const noexcept {
-        const std::lock_guard lock(terminalMutex_);
-        return armedTerminal_ == nullptr &&
-            (activeTerminal_ == nullptr || activeTerminal_->isTerminal());
+        const std::lock_guard lock(terminalOwnership_->mutex_);
+        return terminalOwnership_->armed_ == nullptr &&
+            (terminalOwnership_->active_ == nullptr ||
+             terminalOwnership_->active_->isTerminal());
     }
 
     [[nodiscard]] nixl_status_t

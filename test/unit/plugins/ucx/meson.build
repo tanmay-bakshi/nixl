@@ -92,3 +92,10 @@ ucx_terminal_progress_test = executable('ucx_terminal_progress_test',
         include_directories: ucx_test_include_directories)
 
 test('ucx_terminal_progress', ucx_terminal_progress_test)
+
+ucx_terminal_cancellation_test = executable('ucx_terminal_cancellation_test',
+        'ucx_terminal_cancellation_test.cpp',
+        dependencies: ucx_backend_test_dep,
+        include_directories: ucx_test_include_directories)
+
+test('ucx_terminal_cancellation', ucx_terminal_cancellation_test, timeout: 60)
