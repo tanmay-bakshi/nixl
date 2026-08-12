@@ -130,6 +130,19 @@ public:
     queryInventory(nixlBackendEventSubscriptionInventory &inventory) const noexcept {
         inventory = {};
     }
+
+    /**
+     * Drive backend-owned cancellation progress during fail-closed agent shutdown.
+     *
+     * Autonomous backends may block on their native completion primitive. This call must not
+     * return success until callbacks, producers, and continuations owned by this subscription are
+     * fully drained. Backends with asynchronous cancellation must override this method; the
+     * default fails closed instead of issuing a second cancellation request.
+     */
+    virtual nixl_status_t
+    drainCancellation() noexcept {
+        return NIXL_ERR_NOT_SUPPORTED;
+    }
 };
 
 
