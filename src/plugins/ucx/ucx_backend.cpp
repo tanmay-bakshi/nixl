@@ -532,7 +532,8 @@ private:
             .nativeTimestampNs = completed.nativeTimestampNs,
         });
         delivered_.notify_all();
-        return status == NIXL_SUCCESS ? NIXL_SUCCESS : status;
+        // A failed transfer is terminal data; publishing it completes the owner continuation.
+        return NIXL_SUCCESS;
     }
 
     [[nodiscard]] nixl_status_t
