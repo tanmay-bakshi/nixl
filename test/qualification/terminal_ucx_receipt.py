@@ -601,7 +601,11 @@ def _validate_faults(faults: object, transport: str) -> None:
     _require(
         isinstance(notification_failure, dict)
         and notification_failure.get("data_remote_flushed_before_failure") is True,
-        "notification failure did not isolate post-flush ordering",
+        "notification failure lacked all-endpoint remote-flush authority",
+    )
+    _require(
+        notification_failure.get("notification_pending_at_remote_flush") is True,
+        "notification was terminal before the remote-flush failure boundary",
     )
 
 

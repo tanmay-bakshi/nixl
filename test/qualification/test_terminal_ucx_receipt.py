@@ -235,6 +235,7 @@ def _faults(transport: str) -> dict[str, object]:
     faults["remote_failure"] = _terminal_fault("NIXL_ERR_REMOTE_DISCONNECT")
     notification_failure = _terminal_fault("NIXL_ERR_REMOTE_DISCONNECT")
     notification_failure["data_remote_flushed_before_failure"] = True
+    notification_failure["notification_pending_at_remote_flush"] = True
     faults["notification_failure"] = notification_failure
     return faults
 
@@ -519,6 +520,16 @@ def test_validate_receipt_accepts_transport_aware_matrix() -> None:
         (("cases", 2, "remote_route_capability", "routes", 1, "states"), ["READY"]),
         (("cases", 2, "remote_route_capability", "routes", 2, "handle_identity"), 502),
         (("cases", 2, "faults", "remote_failure", "owner_woken"), False),
+        (
+            (
+                "cases",
+                2,
+                "faults",
+                "notification_failure",
+                "notification_pending_at_remote_flush",
+            ),
+            False,
+        ),
         (
             ("cases", 2, "faults", "shutdown_cancellation_drain", "posted_in_flight"),
             False,

@@ -131,6 +131,7 @@ struct tcp_fault_results_t {
     terminal_fault_result_t remoteFailure;
     terminal_fault_result_t notificationFailure;
     bool dataRemoteFlushedBeforeNotificationFailure = false;
+    bool notificationPendingAtRemoteFlush = false;
 };
 
 void
@@ -1366,7 +1367,9 @@ writeCoordinate(const options_t &options,
                << ",\"owner_woken\":"
                << (tcp_faults.notificationFailure.ownerWoken ? "true" : "false")
                << ",\"data_remote_flushed_before_failure\":"
-               << (tcp_faults.dataRemoteFlushedBeforeNotificationFailure ? "true" : "false") << '}';
+               << (tcp_faults.dataRemoteFlushedBeforeNotificationFailure ? "true" : "false")
+               << ",\"notification_pending_at_remote_flush\":"
+               << (tcp_faults.notificationPendingAtRemoteFlush ? "true" : "false") << '}';
     }
     output << "},\"runtime_artifacts\":";
     writeRuntimeArtifacts(output, populations.front().attestation.runtimeArtifacts);
@@ -1496,6 +1499,8 @@ run(int argc, char **argv) {
         };
         tcp_faults.dataRemoteFlushedBeforeNotificationFailure =
             fixtures.notificationFailure.dataRemoteFlushedBeforeFailure;
+        tcp_faults.notificationPendingAtRemoteFlush =
+            fixtures.notificationFailure.notificationPendingAtRemoteFlush;
         tcp_shutdown_cancellation = fixtures.shutdownCancellation;
     }
 

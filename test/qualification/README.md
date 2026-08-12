@@ -36,7 +36,10 @@ anchors. It may not load its own metadata or manufacture a remote handle.
 TCP over `lo` uses two distinct agents and endpoints. Every attested endpoint
 flush must complete through a callback, and the coordinate must prove callback
 delivery after poster return. TCP additionally proves attached
-authenticated-notification success and failure, remote failure, and capability
+authenticated-notification success and failure. Its notification-failure fixture
+stops the independent peer only after the transfer attestation records
+all-endpoint remote-flush authority, verifies that notification terminality is
+still pending at that boundary, and then kills the peer. TCP also proves remote failure and capability
 epoch advancement, endpoint failure, and retirement on three distinct route
 generations. FAILED and RETIRED are exercised by separate terminal
 subscriptions. `terminal_ucx_receipt.py` rejects hard-coded pass fields and the

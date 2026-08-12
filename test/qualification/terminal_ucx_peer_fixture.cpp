@@ -875,7 +875,8 @@ runTcpNotificationFailureFixture(const std::string &engine) {
     requireStatus(adapter.querySubscription(transfer_subscription, pre_failure_info),
                   NIXL_SUCCESS,
                   "query notification subscription at remote-flush boundary");
-    require(pre_failure_info.active,
+    const bool notification_pending_at_remote_flush = pre_failure_info.active;
+    require(notification_pending_at_remote_flush,
             "notification completed before the remote-flush failure boundary");
     terminal_channel_inventory_t pre_failure_inventory;
     requireStatus(adapter.queryInventory(pre_failure_inventory),
@@ -933,6 +934,7 @@ runTcpNotificationFailureFixture(const std::string &engine) {
             },
         .channel = channel,
         .dataRemoteFlushedBeforeFailure = data_remote_flushed,
+        .notificationPendingAtRemoteFlush = notification_pending_at_remote_flush,
         .peerExitedBySignal = peer_exited_by_signal,
     };
 }
