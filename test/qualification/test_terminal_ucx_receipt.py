@@ -10,37 +10,169 @@ import pytest
 from terminal_ucx_receipt import seal_receipt, validate_receipt
 
 
-def _case(transport: str, engine: str, completion_mode: str) -> dict[str, object]:
-    """Build one valid case fixture.
+def _inventory() -> dict[str, object]:
+    """Build one clean native lifecycle inventory.
+
+    :returns: Valid zero-inventory receipt.
+    """
+    return {
+        "active_subscriptions": 0,
+        "active_backend_producers": 0,
+        "active_callback_slots": 0,
+        "queued_continuations": 0,
+        "queued_events": 0,
+        "channel_closed": True,
+        "fatal": "NONE",
+    }
+
+
+def _population(
+    transport: str,
+    engine: str,
+    completion_mode: str,
+) -> dict[str, object]:
+    """Build one valid completion-population fixture.
 
     :param transport: Observed UCX transport.
-    :param engine: UCX progress engine path.
-    :param completion_mode: Immediate or asynchronous completion population.
-    :returns: Valid case receipt.
+    :param engine: UCX progress-engine path.
+    :param completion_mode: Immediate or asynchronous population.
+    :returns: Valid completion-population receipt.
     """
-    digest = hashlib.sha256(f"{transport}:{engine}".encode()).hexdigest()
+    digest = hashlib.sha256(
+        f"{transport}:{engine}:{completion_mode}".encode()
+    ).hexdigest()
+    immediate = completion_mode == "immediate"
     return {
-        "transport": transport,
-        "engine": engine,
         "completion_mode": completion_mode,
-        "memory_type": "DRAM",
         "byte_count": 4096,
+        "destination_byte_count": 4096,
         "source_sha256": digest,
         "destination_sha256": digest,
         "bytes_verified": True,
         "terminal_status": "NIXL_SUCCESS",
+        "terminal_event_count": 1,
         "attestation_state": "REMOTE_FLUSHED",
         "attestation_status": "NIXL_SUCCESS",
+        "attestation_sha256": hashlib.sha256(
+            f"attestation:{digest}".encode()
+        ).hexdigest(),
         "completion_claimed": True,
         "take_once_second_status": "NIXL_ERR_NOT_ALLOWED",
         "selected_transports": [transport],
-        "terminal_native_timestamp_ns": 10,
-        "drain_timestamp_ns": 11,
         "subscription_before_post": True,
-        "terminal_after_notification_completion": True,
-        "callback_before_return_observed": transport == "self" and engine == "shared",
-        "capability_snapshot_ready": True,
-        "capability_retired": True,
+        "notification_completion_timestamp_ns": 10,
+        "terminal_native_timestamp_ns": 11,
+        "drain_timestamp_ns": 12,
+        "callbacks_before_return": 3 if immediate else 0,
+        "callbacks_after_return": 0 if immediate else 3,
+        "callback_count": 3,
+    }
+
+
+def _capability() -> dict[str, object]:
+    """Build complete capability-transition evidence.
+
+    :returns: Valid capability receipt.
+    """
+    return {
+        "subscribe_before_ready": True,
+        "snapshot_after_ready": True,
+        "ready_state": "READY",
+        "ready_epoch": 7,
+        "epoch_transition_observed": True,
+        "next_epoch": 8,
+        "failed_state": "FAILED",
+        "failed_subscription_terminal": True,
+        "retired_state": "RETIRED",
+        "retired_subscription_terminal": True,
+    }
+
+
+def _faults() -> dict[str, object]:
+    """Build complete isolated failure-path evidence.
+
+    :returns: Valid failure-path receipt.
+    """
+    return {
+        "transfer_cancellation": {
+            "terminal_status": "NIXL_ERR_CANCELED",
+            "terminal_event_count": 1,
+            "owner_woken": True,
+        },
+        "remote_failure": {
+            "terminal_status": "NIXL_ERR_REMOTE_DISCONNECT",
+            "terminal_event_count": 1,
+            "owner_woken": True,
+        },
+        "notification_failure": {
+            "terminal_status": "NIXL_ERR_REMOTE_DISCONNECT",
+            "terminal_event_count": 1,
+            "owner_woken": True,
+            "data_remote_flushed_before_failure": True,
+        },
+        "queue_overflow": {
+            "fatal": "QUEUE_OVERFLOW",
+            "owner_woken": True,
+            "admitted_event_preserved": True,
+        },
+        "shutdown_cancellation_drain": {
+            "cancel_status": "NIXL_SUCCESS",
+            "terminal_status": "NIXL_ERR_CANCELED",
+            "terminal_event_count": 1,
+            "owner_woken": True,
+            "drained": True,
+        },
+    }
+
+
+def _case(transport: str, engine: str, identity_seed: int) -> dict[str, object]:
+    """Build one valid transport and engine coordinate.
+
+    :param transport: Observed UCX transport.
+    :param engine: UCX progress-engine path.
+    :param identity_seed: Positive base for distinct native identities.
+    :returns: Valid matrix-case receipt.
+    """
+    return {
+        "transport": transport,
+        "engine": engine,
+        "memory_type": "DRAM",
+        "endpoint_identities": [identity_seed, identity_seed + 1],
+        "source_registration_identity": identity_seed + 2,
+        "destination_registration_identity": identity_seed + 3,
+        "completion_populations": [
+            _population(transport, engine, "immediate"),
+            _population(transport, engine, "asynchronous"),
+        ],
+        "capability": _capability(),
+        "faults": _faults(),
+        "shutdown": _inventory(),
+    }
+
+
+def _invocation(transport: str, engine: str) -> dict[str, object]:
+    """Build one exact qualification invocation.
+
+    :param transport: Requested UCX transport.
+    :param engine: Requested progress engine.
+    :returns: Valid invocation receipt.
+    """
+    return {
+        "transport": transport,
+        "engine": engine,
+        "argv": [
+            "/workspace/build/terminal_ucx_qualification",
+            "--transport",
+            transport,
+            "--engine",
+            engine,
+        ],
+        "environment": {
+            "CUDA_VISIBLE_DEVICES": "",
+            "NVIDIA_VISIBLE_DEVICES": "void",
+            "UCX_TLS": transport,
+            "UCX_NET_DEVICES": "lo" if transport == "tcp" else None,
+        },
     }
 
 
@@ -49,34 +181,21 @@ def _receipt() -> dict[str, object]:
 
     :returns: Valid receipt object.
     """
+    coordinates = [
+        ("self", "shared"),
+        ("self", "thread_pool"),
+        ("tcp", "shared"),
+        ("tcp", "thread_pool"),
+    ]
     return {
-        "schema": "nixl-terminal-ucx-qualification/v1",
+        "schema": "nixl-terminal-ucx-qualification/v2",
         "status": "pass",
         "nixl_revision": "1" * 40,
         "ucx_revision": "2" * 40,
         "executable_sha256": "3" * 64,
-        "commands": [
-            ["terminal_ucx_qualification", "--transport", "self", "--engine", "shared"],
-            [
-                "terminal_ucx_qualification",
-                "--transport",
-                "self",
-                "--engine",
-                "thread_pool",
-            ],
-            ["terminal_ucx_qualification", "--transport", "tcp", "--engine", "shared"],
-            [
-                "terminal_ucx_qualification",
-                "--transport",
-                "tcp",
-                "--engine",
-                "thread_pool",
-            ],
+        "invocations": [
+            _invocation(transport, engine) for transport, engine in coordinates
         ],
-        "environment": {
-            "CUDA_VISIBLE_DEVICES": "",
-            "NVIDIA_VISIBLE_DEVICES": "void",
-        },
         "runtime_artifacts": [
             {"component": "libnixl", "path": "/tmp/libnixl.so", "build_id": "aa"},
             {"component": "libucp", "path": "/tmp/libucp.so", "build_id": "bb"},
@@ -94,19 +213,28 @@ def _receipt() -> dict[str, object]:
             "gpu_api_used": False,
         },
         "cases": [
-            _case("self", "shared", "immediate"),
-            _case("self", "thread_pool", "asynchronous"),
-            _case("tcp", "shared", "asynchronous"),
-            _case("tcp", "thread_pool", "asynchronous"),
+            _case(transport, engine, 100 + index * 10)
+            for index, (transport, engine) in enumerate(coordinates)
         ],
-        "shutdown": {
-            "active_subscriptions": 0,
-            "active_producers": 0,
-            "queued_events": 0,
-            "channel_closed": True,
-            "fatal": "NONE",
-        },
+        "shutdown": _inventory(),
     }
+
+
+def _replace_path(
+    receipt: dict[str, object],
+    path: tuple[str | int, ...],
+    value: object,
+) -> None:
+    """Replace one nested fixture value.
+
+    :param receipt: Mutable receipt fixture.
+    :param path: Nested dictionary and list path.
+    :param value: Replacement value.
+    """
+    target: object = receipt
+    for component in path[:-1]:
+        target = target[component]  # type: ignore[index]
+    target[path[-1]] = value  # type: ignore[index]
 
 
 def test_validate_receipt_accepts_complete_matrix() -> None:
@@ -118,12 +246,36 @@ def test_validate_receipt_accepts_complete_matrix() -> None:
     ("path", "value"),
     [
         (("zero_gpu", "nvidia_device_open_count"), 1),
-        (("shutdown", "active_subscriptions"), 1),
-        (("shutdown", "active_producers"), 1),
-        (("cases", 0, "destination_sha256"), "0" * 64),
-        (("cases", 0, "selected_transports"), ["tcp"]),
-        (("cases", 0, "take_once_second_status"), "NIXL_SUCCESS"),
-        (("cases", 0, "terminal_after_notification_completion"), False),
+        (("shutdown", "active_callback_slots"), 1),
+        (("cases", 0, "shutdown", "queued_continuations"), 1),
+        (("cases", 0, "endpoint_identities"), [100, 100]),
+        (("cases", 0, "destination_registration_identity"), 102),
+        (("cases", 0, "completion_populations", 0, "destination_sha256"), "0" * 64),
+        (("cases", 0, "completion_populations", 0, "selected_transports"), ["tcp"]),
+        (
+            ("cases", 0, "completion_populations", 0, "take_once_second_status"),
+            "NIXL_SUCCESS",
+        ),
+        (
+            (
+                "cases",
+                0,
+                "completion_populations",
+                0,
+                "notification_completion_timestamp_ns",
+            ),
+            12,
+        ),
+        (("cases", 0, "completion_populations", 0, "callbacks_before_return"), 0),
+        (("cases", 0, "completion_populations", 1, "callbacks_after_return"), 0),
+        (("cases", 0, "capability", "failed_subscription_terminal"), False),
+        (("cases", 0, "capability", "next_epoch"), 7),
+        (("cases", 0, "faults", "remote_failure", "owner_woken"), False),
+        (
+            ("cases", 0, "faults", "notification_failure", "terminal_status"),
+            "NIXL_SUCCESS",
+        ),
+        (("cases", 0, "faults", "queue_overflow", "fatal"), "NONE"),
         (("runtime_artifacts", 0, "build_id"), "not-hex"),
     ],
 )
@@ -136,11 +288,34 @@ def test_validate_receipt_rejects_false_authority(
     :param value: Contradictory value.
     """
     receipt = copy.deepcopy(_receipt())
-    target: object = receipt
-    for component in path[:-1]:
-        target = target[component]  # type: ignore[index]
-    target[path[-1]] = value  # type: ignore[index]
+    _replace_path(receipt, path, value)
     with pytest.raises(ValueError):
+        validate_receipt(receipt)
+
+
+def test_validate_receipt_rejects_old_schema() -> None:
+    """Forbid the permissive predecessor schema from sealing Stage 1."""
+    receipt = _receipt()
+    receipt["schema"] = "nixl-terminal-ucx-qualification/v1"
+    with pytest.raises(ValueError, match="schema"):
+        validate_receipt(receipt)
+
+
+def test_validate_receipt_rejects_non_object_runtime_artifact() -> None:
+    """Report malformed runtime evidence as validation failure."""
+    receipt = _receipt()
+    receipt["runtime_artifacts"] = [None]
+    with pytest.raises(ValueError, match="runtime artifact"):
+        validate_receipt(receipt)
+
+
+def test_validate_receipt_rejects_duplicate_coordinate() -> None:
+    """Require every transport and engine coordinate exactly once."""
+    receipt = _receipt()
+    cases = receipt["cases"]
+    assert isinstance(cases, list)
+    cases[-1] = copy.deepcopy(cases[0])
+    with pytest.raises(ValueError, match="coordinates"):
         validate_receipt(receipt)
 
 
