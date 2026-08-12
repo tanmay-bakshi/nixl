@@ -122,9 +122,9 @@ struct capability_result_t {
 };
 
 struct tcp_fixture_result_t {
-    tcp_endpoint_failure_observation_t endpointFailure;
-    tcp_notification_failure_observation_t notificationFailure;
-    tcp_shutdown_cancellation_observation_t shutdownCancellation;
+    nixl::qualification::tcp_endpoint_failure_observation_t endpointFailure;
+    nixl::qualification::tcp_notification_failure_observation_t notificationFailure;
+    nixl::qualification::tcp_shutdown_cancellation_observation_t shutdownCancellation;
 };
 
 struct tcp_fault_results_t {
@@ -742,7 +742,7 @@ runCapabilities(const options_t &options,
                 nixl::qualification::terminal_ucx_api_adapter_t &adapter,
                 terminal_event_inbox_t &inbox,
                 std::uint64_t suffix,
-                const tcp_peer_capability_observation_t &endpoint_failure) {
+                const nixl::qualification::tcp_peer_capability_observation_t &endpoint_failure) {
     capability_result_t result;
     nixl_blob_t source_metadata;
     requireStatus(source.getLocalMD(source_metadata), NIXL_SUCCESS, "get source metadata");
@@ -1290,7 +1290,8 @@ run(int argc, char **argv) {
     terminal_event_inbox_t inbox(adapter);
     capability_result_t capability;
     tcp_fault_results_t tcp_faults;
-    std::optional<tcp_shutdown_cancellation_observation_t> tcp_shutdown_cancellation;
+    std::optional<nixl::qualification::tcp_shutdown_cancellation_observation_t>
+        tcp_shutdown_cancellation;
     if (options.transport == "tcp") {
         ready_route_t route =
             makeReadyRoute(*source.agent, source.backend, destination_agent, adapter, inbox, 9001);
