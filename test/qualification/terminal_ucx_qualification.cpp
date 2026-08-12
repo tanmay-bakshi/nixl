@@ -1123,6 +1123,23 @@ writeSelectedTransports(std::ostream &output, const nixl_xfer_attestation_t &att
 }
 
 void
+writeEndpointFlushes(std::ostream &output, const nixl_xfer_attestation_t &attestation) {
+    output << '[';
+    for (std::size_t index = 0; index < attestation.endpoints.size(); ++index) {
+        if (index != 0) {
+            output << ',';
+        }
+        const nixl_xfer_attestation_endpoint_t &endpoint = attestation.endpoints[index];
+        output << "{\"worker_id\":" << endpoint.workerId
+               << ",\"worker_identity\":" << endpoint.workerIdentity
+               << ",\"endpoint_identity\":" << endpoint.endpointIdentity
+               << ",\"flush_posted\":" << (endpoint.flushPosted ? "true" : "false")
+               << ",\"remote_flushed\":" << (endpoint.remoteFlushed ? "true" : "false") << '}';
+    }
+    output << ']';
+}
+
+void
 writeTerminalProgress(std::ostream &output, const nixl_xfer_terminal_progress_t &progress) {
     output << "{\"autonomous\":" << (progress.autonomous ? "true" : "false")
            << ",\"data_callbacks\":" << progress.dataCallbacks
@@ -1165,12 +1182,16 @@ writePopulation(std::ostream &output, const population_result_t &result) {
     writeString(output, nixlEnumStrings::statusStr(result.attestationStatus));
     output << ",\"attestation_sha256\":";
     writeString(output, result.attestation.evidenceDigest);
-    output << ",\"completion_claimed\":"
+    output << ",\"attestation_handle_identity\":" << result.attestation.handleIdentity
+           << ",\"attestation_generation\":" << result.attestation.generation
+           << ",\"completion_claimed\":"
            << (result.attestation.completionClaimed ? "true" : "false")
            << ",\"take_once_second_status\":";
     writeString(output, nixlEnumStrings::statusStr(result.secondTakeStatus));
     output << ",\"selected_transports\":";
     writeSelectedTransports(output, result.attestation);
+    output << ",\"endpoint_flushes\":";
+    writeEndpointFlushes(output, result.attestation);
     output << ",\"subscription_before_post\":" << (result.subscriptionBeforePost ? "true" : "false")
            << ",\"event_native_timestamp_ns\":" << result.eventNativeTimestampNs
            << ",\"drain_timestamp_ns\":" << result.drainTimestampNs << ",\"terminal_progress\":";

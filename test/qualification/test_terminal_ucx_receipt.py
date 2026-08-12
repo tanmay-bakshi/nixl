@@ -51,49 +51,73 @@ def _inventory() -> dict[str, object]:
     }
 
 
-def _terminal_progress(transport: str, population: str) -> dict[str, object]:
+def _terminal_progress(
+    transport: str, population: str, endpoint_count: int
+) -> dict[str, object]:
     """Build native terminal-progress evidence.
 
     :param transport: Self or TCP coordinate.
     :param population: Small or large population.
+    :param endpoint_count: Number of endpoint flushes in the attestation.
     :returns: Conserved callback and ordering observations.
     """
     self_transport = transport == "self"
     small = population == "small"
     data_callbacks = 1 if small else 4
-    flush_callbacks = 1
+    flush_callbacks = 0 if self_transport else endpoint_count
     notification_callbacks = 0 if self_transport else 1
     callback_count = data_callbacks + flush_callbacks + notification_callbacks
-    before_return = 1 if self_transport and small else 0
+    before_return = data_callbacks if self_transport else 0
     return {
         "autonomous": True,
         "data_callbacks": data_callbacks,
         "endpoint_flush_callbacks": flush_callbacks,
         "notification_callbacks": notification_callbacks,
-        "asynchronous_requests": callback_count - before_return,
-        "immediate_completions": before_return,
+        "asynchronous_requests": 0 if self_transport else callback_count,
+        "immediate_completions": (
+            data_callbacks + endpoint_count if self_transport else 0
+        ),
         "callbacks_before_poster_return": before_return,
         "peak_continuation_depth": 2,
         "active_callback_slots_at_terminal": 0,
         "continuation_depth_at_terminal": 0,
         "last_data_callback_timestamp_ns": 10,
-        "last_flush_callback_timestamp_ns": 11,
+        "last_flush_callback_timestamp_ns": 0 if self_transport else 11,
         "notification_callback_timestamp_ns": 0 if self_transport else 12,
         "terminal_publish_timestamp_ns": 13,
         "terminal_status": "NIXL_SUCCESS",
     }
 
 
-def _population(transport: str, engine: str, population: str) -> dict[str, object]:
+def _population(
+    transport: str,
+    engine: str,
+    population: str,
+    handle_identity: int,
+    generation: int,
+) -> dict[str, object]:
     """Build one valid completion population.
 
     :param transport: Observed UCX transport.
     :param engine: Progress-engine path.
     :param population: Small or large population.
+    :param handle_identity: Transfer-request identity in the attestation.
+    :param generation: Transfer generation in the attestation.
     :returns: Valid population receipt.
     """
     digest = hashlib.sha256(f"{transport}:{engine}:{population}".encode()).hexdigest()
     byte_count = 4096 if population == "small" else 16 * 1024 * 1024
+    endpoint_count = 2 if engine == "thread_pool" and population != "small" else 1
+    endpoint_flushes = [
+        {
+            "worker_id": index,
+            "worker_identity": handle_identity * 10 + index,
+            "endpoint_identity": handle_identity * 100 + index,
+            "flush_posted": True,
+            "remote_flushed": True,
+        }
+        for index in range(endpoint_count)
+    ]
     return {
         "population": population,
         "descriptor_count": 1 if population == "small" else 4,
@@ -109,13 +133,16 @@ def _population(transport: str, engine: str, population: str) -> dict[str, objec
         "attestation_sha256": hashlib.sha256(
             f"attestation:{digest}".encode()
         ).hexdigest(),
+        "attestation_handle_identity": handle_identity,
+        "attestation_generation": generation,
         "completion_claimed": True,
         "take_once_second_status": "NIXL_ERR_NOT_ALLOWED",
         "selected_transports": [transport],
+        "endpoint_flushes": endpoint_flushes,
         "subscription_before_post": True,
         "event_native_timestamp_ns": 13,
         "drain_timestamp_ns": 14,
-        "terminal_progress": _terminal_progress(transport, population),
+        "terminal_progress": _terminal_progress(transport, population, endpoint_count),
     }
 
 
@@ -221,12 +248,36 @@ def _case(transport: str, engine: str, address_seed: int) -> dict[str, object]:
     :returns: Valid matrix case.
     """
     self_transport = transport == "self"
+    populations = [
+        _population(transport, engine, "small", address_seed + 1, 1),
+        _population(transport, engine, "large", address_seed + 2, 1),
+    ]
+    if engine == "thread_pool":
+        repost_identity = address_seed + 3
+        populations.extend(
+            [
+                _population(
+                    transport,
+                    engine,
+                    "thread_pool_repost_generation_1",
+                    repost_identity,
+                    7,
+                ),
+                _population(
+                    transport,
+                    engine,
+                    "thread_pool_repost_generation_2",
+                    repost_identity,
+                    8,
+                ),
+            ]
+        )
     return {
         "transport": transport,
         "engine": engine,
-        "agent_shape": "one_agent_local_route"
-        if self_transport
-        else "two_distinct_agents",
+        "agent_shape": (
+            "one_agent_local_route" if self_transport else "two_distinct_agents"
+        ),
         "agent_count": 1 if self_transport else 2,
         "remote_agent_handle_present": not self_transport,
         "registrations": {
@@ -243,13 +294,10 @@ def _case(transport: str, engine: str, address_seed: int) -> dict[str, object]:
                 "byte_capacity": 16 * 1024 * 1024,
             },
         },
-        "completion_populations": [
-            _population(transport, engine, "small"),
-            _population(transport, engine, "large"),
-        ],
-        "remote_route_capability": _not_applicable()
-        if self_transport
-        else _capability(),
+        "completion_populations": populations,
+        "remote_route_capability": (
+            _not_applicable() if self_transport else _capability()
+        ),
         "attached_authenticated_notification": (
             _not_applicable()
             if self_transport
@@ -300,7 +348,7 @@ def _invocation(transport: str, engine: str) -> dict[str, object]:
 
 
 def _receipt() -> dict[str, object]:
-    """Build a complete schema-v3 receipt.
+    """Build a complete schema-v4 receipt.
 
     :returns: Valid qualification receipt.
     """
@@ -315,7 +363,7 @@ def _receipt() -> dict[str, object]:
         for index, (transport, engine) in enumerate(coordinates)
     ]
     return {
-        "schema": "nixl-terminal-ucx-qualification/v3",
+        "schema": "nixl-terminal-ucx-qualification/v4",
         "status": "pass",
         "nixl_revision": "1" * 40,
         "ucx_revision": "2" * 40,
@@ -380,7 +428,7 @@ def test_validate_receipt_accepts_transport_aware_matrix() -> None:
                 "terminal_progress",
                 "endpoint_flush_callbacks",
             ),
-            0,
+            1,
         ),
         (
             (
@@ -390,6 +438,70 @@ def test_validate_receipt_accepts_transport_aware_matrix() -> None:
                 0,
                 "terminal_progress",
                 "callbacks_before_poster_return",
+            ),
+            99,
+        ),
+        (
+            (
+                "cases",
+                0,
+                "completion_populations",
+                0,
+                "terminal_progress",
+                "immediate_completions",
+            ),
+            1,
+        ),
+        (
+            (
+                "cases",
+                0,
+                "completion_populations",
+                0,
+                "endpoint_flushes",
+                0,
+                "remote_flushed",
+            ),
+            False,
+        ),
+        (
+            (
+                "cases",
+                1,
+                "completion_populations",
+                2,
+                "population",
+            ),
+            "thread_pool_repost_generation_2",
+        ),
+        (
+            (
+                "cases",
+                1,
+                "completion_populations",
+                3,
+                "attestation_handle_identity",
+            ),
+            999_999,
+        ),
+        (
+            (
+                "cases",
+                1,
+                "completion_populations",
+                3,
+                "attestation_generation",
+            ),
+            7,
+        ),
+        (
+            (
+                "cases",
+                2,
+                "completion_populations",
+                0,
+                "terminal_progress",
+                "endpoint_flush_callbacks",
             ),
             0,
         ),
@@ -432,7 +544,7 @@ def test_validate_receipt_rejects_false_authority(
 def test_validate_receipt_rejects_old_schema() -> None:
     """Forbid sealing the physically over-constrained predecessor schema."""
     receipt = _receipt()
-    receipt["schema"] = "nixl-terminal-ucx-qualification/v2"
+    receipt["schema"] = "nixl-terminal-ucx-qualification/v3"
     with pytest.raises(ValueError, match="schema"):
         validate_receipt(receipt)
 
