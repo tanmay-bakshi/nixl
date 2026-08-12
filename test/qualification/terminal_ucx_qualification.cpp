@@ -253,7 +253,10 @@ agentConfig() {
 [[nodiscard]] nixl_b_params_t
 backendParameters(const std::string &transport, const std::string &engine) {
     nixl_b_params_t parameters;
-    parameters["ucx_error_handling_mode"] = transport == "self" ? "none" : "peer";
+    parameters["ucx_error_handling_mode"] = "peer";
+    if (transport == "self") {
+        parameters["engine_config"] = "UNIFIED_MODE=y";
+    }
     if (engine == "shared") {
         parameters["num_workers"] = "2";
         parameters["num_threads"] = "0";
