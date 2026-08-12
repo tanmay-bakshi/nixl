@@ -554,6 +554,96 @@ runPopulation(nixlAgent &source_agent,
     return result;
 }
 
+[[nodiscard]] std::array<population_result_t, 2>
+runThreadPoolRepost(nixlAgent &source_agent,
+                    nixlBackendH *source_backend,
+                    const std::string &remote_name,
+                    const nixlRemoteAgentH *remote_handle,
+                    nixl::qualification::terminal_ucx_api_adapter_t &adapter,
+                    terminal_event_inbox_t &inbox,
+                    registered_arena_t &source,
+                    registered_arena_t &destination) {
+    const population_spec_t spec{
+        .name = "thread_pool_repost",
+        .descriptorCount = large_descriptor_count,
+        .bytesPerDescriptor = descriptor_bytes,
+        .seed = 211,
+    };
+    nixlXferReqH *request = createRequest(source_agent,
+                                          source_backend,
+                                          source,
+                                          destination,
+                                          spec,
+                                          remote_name,
+                                          remote_handle,
+                                          {});
+    std::array<population_result_t, 2> results;
+    std::uint64_t prior_generation = 0;
+    for (std::size_t index = 0; index < results.size(); ++index) {
+        population_spec_t generation_spec = spec;
+        generation_spec.name += "_generation_" + std::to_string(index + 1);
+        generation_spec.seed = static_cast<std::uint8_t>(spec.seed + index * 17U);
+        source.fill(generation_spec);
+        destination.clear(generation_spec);
+
+        const std::uint64_t owner_cookie = 5001 + index;
+        nixlTerminalEventSubscriptionH *subscription = nullptr;
+        requireStatus(adapter.subscribeTransfer(request, owner_cookie, subscription),
+                      NIXL_SUCCESS,
+                      "subscribe thread-pool repost generation");
+        require(subscription != nullptr, "thread-pool repost subscription is null");
+        nixl_terminal_subscription_info_t info;
+        requireStatus(adapter.querySubscription(subscription, info),
+                      NIXL_SUCCESS,
+                      "query thread-pool repost subscription");
+        require(info.active && info.generation > prior_generation,
+                "thread-pool repost did not bind a fresh transfer generation");
+
+        const nixl_status_t post_status = source_agent.postXferReq(request);
+        require(post_status == NIXL_SUCCESS || post_status == NIXL_IN_PROG,
+                "post thread-pool repost generation failed");
+        const nixl_terminal_event_t event =
+            inbox.take(nixl_terminal_event_kind_t::TRANSFER, owner_cookie);
+        require(event.transferStatus == NIXL_SUCCESS && event.identity == info.identity &&
+                    event.generation == info.generation,
+                "thread-pool repost terminal event changed generation");
+
+        population_result_t &result = results[index];
+        result.spec = generation_spec;
+        result.byteCount = generation_spec.descriptorCount * generation_spec.bytesPerDescriptor;
+        result.destinationByteCount = result.byteCount;
+        result.sourceSha256 = source.sha256(generation_spec);
+        result.destinationSha256 = destination.sha256(generation_spec);
+        result.terminalStatus = event.transferStatus;
+        result.eventNativeTimestampNs = event.nativeTimestampNs;
+        result.drainTimestampNs = monotonicRawNs();
+        result.terminalEventCount = 1;
+        result.subscriptionBeforePost = true;
+        result.attestationStatus =
+            source_agent.takeXferCompletionAttestation(request, result.attestation);
+        nixl_xfer_attestation_t duplicate;
+        result.secondTakeStatus = source_agent.takeXferCompletionAttestation(request, duplicate);
+        requireStatus(result.attestationStatus,
+                      NIXL_SUCCESS,
+                      "take thread-pool repost completion attestation");
+        requireStatus(result.secondTakeStatus,
+                      NIXL_ERR_NOT_ALLOWED,
+                      "take thread-pool repost completion twice");
+        require(result.sourceSha256 == result.destinationSha256,
+                "thread-pool repost destination bytes differ from source");
+        require(result.attestation.generation == info.generation,
+                "thread-pool repost attestation changed generation");
+        requireStatus(adapter.release(subscription),
+                      NIXL_SUCCESS,
+                      "release thread-pool repost subscription");
+        prior_generation = info.generation;
+    }
+    requireStatus(source_agent.releaseXferReq(request),
+                  NIXL_SUCCESS,
+                  "release thread-pool repost request");
+    return results;
+}
+
 [[nodiscard]] terminal_fault_result_t
 runCancellation(const options_t &options, std::uint64_t suffix) {
     endpoint_t endpoint = makeEndpoint("qualification-cancel-" + std::to_string(suffix), options);
@@ -1335,6 +1425,18 @@ run(int argc, char **argv) {
             notification_success_count +=
                 takeAttachedNotification(destination_agent, source_handle, notification);
         }
+    }
+    if (options.engine == "thread_pool") {
+        const std::array<population_result_t, 2> repost =
+            runThreadPoolRepost(*source.agent,
+                                source.backend,
+                                source_name,
+                                destination_handle,
+                                adapter,
+                                inbox,
+                                source_arena,
+                                destination_arena);
+        populations.insert(populations.end(), repost.begin(), repost.end());
     }
 
     if (options.transport == "tcp") {
