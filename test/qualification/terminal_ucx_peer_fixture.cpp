@@ -761,16 +761,14 @@ runTcpEndpointFailureFixture(const std::string &engine) {
     requireStatus(adapter.querySubscription(transfer_subscription, terminal_transfer_info),
                   NIXL_SUCCESS,
                   "query terminal endpoint-failure transfer");
-    require(!terminal_transfer_info.active,
-            "endpoint-failure transfer subscription stayed active");
+    require(!terminal_transfer_info.active, "endpoint-failure transfer subscription stayed active");
     requireStatus(adapter.release(transfer_subscription),
                   NIXL_SUCCESS,
                   "release endpoint-failure transfer subscription");
     requireStatus(
         source.agent.releaseXferReq(request), NIXL_SUCCESS, "release endpoint-failure request");
-    requireStatus(source.agent.invalidateRemoteMD(remote),
-                  NIXL_SUCCESS,
-                  "invalidate failed TCP peer route");
+    requireStatus(
+        source.agent.invalidateRemoteMD(remote), NIXL_SUCCESS, "invalidate failed TCP peer route");
     require(inbox.empty(), "endpoint-failure fixture retained a drained event");
     const tcp_peer_channel_observation_t channel = closeAndObserveChannel(adapter);
 
