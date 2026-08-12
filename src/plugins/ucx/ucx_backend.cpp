@@ -940,6 +940,16 @@ public:
         return false;
     }
 
+    [[nodiscard]] nixl_status_t
+    clearAutonomousPostingState() {
+        if (!requests_.empty() || notif.has_value()) {
+            return NIXL_ERR_REPOST_ACTIVE;
+        }
+        connections_.clear();
+        setActiveTerminal(nullptr);
+        return NIXL_SUCCESS;
+    }
+
     virtual void
     release() {
         const bool has_transport_request =
@@ -1343,12 +1353,17 @@ struct nixlUcxBackendSharedState {
 void
 nixlUcxChunkBackendReqH::complete(const nixl_status_t status) {
     NIXL_ASSERT(sharedState_.get() != nullptr);
-    if (status != NIXL_SUCCESS) {
+    nixl_status_t completion_status = status;
+    if (completion_status == NIXL_SUCCESS && hasAutonomousTerminal()) {
+        completion_status = clearAutonomousPostingState();
+    }
+    if (completion_status != NIXL_SUCCESS) {
         nixlUcxBackendReqH::release();
-        sharedState_->status.store(status);
+        sharedState_->status.store(completion_status);
     }
     sharedState_->pendingReqs.fetch_sub(1);
-    NIXL_TRACE << *this << " completed with status: " << status << ", " << *sharedState_;
+    NIXL_TRACE << *this << " completed with status: " << completion_status << ", "
+               << *sharedState_;
     setWorker(nullptr, UINT64_MAX);
     sharedState_.reset();
 }
