@@ -532,6 +532,9 @@ public:
     void
     operator()() {
         tlsThread() = this;
+        for (nixlUcxWorker *worker : workers_) {
+            NIXL_ASSERT(worker->claimProgressOwner() == NIXL_SUCCESS);
+        }
         threadActive_->set_value();
         run();
     }
@@ -619,6 +622,7 @@ protected:
                 nixlUcxWorker *worker = getWorkers()[i];
                 do {
                     worker->progressLoop();
+                    NIXL_ASSERT(worker->drainContinuationsOnOwner() == NIXL_SUCCESS);
                 } while (worker->arm() == NIXL_IN_PROG);
             }
             timeout = false;
@@ -898,6 +902,7 @@ protected:
                 io_.run_one();
             }
 
+            NIXL_ASSERT(getWorkers()[0]->drainContinuationsOnOwner() == NIXL_SUCCESS);
             if (requests_.empty()) {
                 continue;
             }

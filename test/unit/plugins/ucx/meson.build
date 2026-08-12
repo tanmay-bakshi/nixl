@@ -85,3 +85,10 @@ if get_option('buildtype') != 'release'
     endif
 
 endif
+
+ucx_terminal_progress_test = executable('ucx_terminal_progress_test',
+        'ucx_terminal_progress_test.cpp',
+        dependencies: ucx_backend_test_dep,
+        include_directories: ucx_test_include_directories)
+
+test('ucx_terminal_progress', ucx_terminal_progress_test)
