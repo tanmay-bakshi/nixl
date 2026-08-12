@@ -515,7 +515,7 @@ private:
             .nativeTimestampNs = completed.nativeTimestampNs,
         });
         delivered_.notify_all();
-        return status == NIXL_SUCCESS ? NIXL_SUCCESS : status;
+        return NIXL_SUCCESS;
     }
 
     [[nodiscard]] nixl_status_t
