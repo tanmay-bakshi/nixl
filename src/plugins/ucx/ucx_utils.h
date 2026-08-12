@@ -20,6 +20,7 @@
 #include <memory>
 #include <string>
 #include <type_traits>
+#include <thread>
 #include <vector>
 
 extern "C" {
@@ -30,6 +31,7 @@ extern "C" {
 
 #include "rkey.h"
 #include "ucx_enums.h"
+#include "ucx_terminal_progress.h"
 
 #include "absl/strings/numbers.h"
 
@@ -230,6 +232,7 @@ public:
     explicit nixlUcxWorker(
         const nixlUcxContext &,
         ucp_err_handling_mode_t ucp_err_handling_mode = UCP_ERR_HANDLING_MODE_NONE);
+    ~nixlUcxWorker();
 
     nixlUcxWorker(nixlUcxWorker &&) = delete;
     nixlUcxWorker(const nixlUcxWorker &) = delete;
@@ -269,6 +272,31 @@ public:
     [[nodiscard]] int
     getEfd() const;
 
+    [[nodiscard]] nixl_status_t
+    claimProgressOwner() noexcept;
+
+    [[nodiscard]] nixl_status_t
+    drainContinuationsOnOwner();
+
+    [[nodiscard]] bool
+    hasProgressOwner() const noexcept {
+        return hasProgressOwner_;
+    }
+
+    [[nodiscard]] const std::shared_ptr<nixl::ucx::ucx_worker_continuation_queue_t> &
+    getContinuationQueue() const noexcept {
+        return continuations_;
+    }
+
+    [[nodiscard]] nixl_status_t
+    closeContinuations();
+
+    [[nodiscard]] nixl_status_t
+    makeTerminalCallbackSlot(
+        std::shared_ptr<nixl::ucx::terminal_submission_state_t> state,
+        nixl::ucx::ucx_callback_kind_t kind,
+        std::shared_ptr<nixl::ucx::ucx_callback_slot_t> &slot);
+
     /* GPU signal management */
     void
     prepGpuSignal(const nixlUcxMem &mem, void *signal) const;
@@ -290,6 +318,10 @@ private:
     const std::unique_ptr<ucp_worker, void (*)(ucp_worker *)> worker;
     ucp_err_handling_mode_t err_handling_mode_;
     const uint64_t identity_;
+    std::shared_ptr<nixl::ucx::ucx_worker_continuation_queue_t> continuations_;
+    bool hasProgressOwner_ = false;
+    std::thread::id progressOwnerThread_;
+    static constexpr std::size_t maxPendingContinuations = 65536;
 };
 
 [[nodiscard]] nixl_b_params_t

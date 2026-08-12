@@ -26,6 +26,7 @@ ucx_backend_sources = ['config.cpp',
                        'ucx_enums.cpp',
                        'ucx_notif_wire.cpp',
                        'ucx_notif_state.cpp',
+                       'ucx_terminal_progress.cpp',
                        'ucx_plugin.cpp',
                        'ucx_utils.cpp']
 

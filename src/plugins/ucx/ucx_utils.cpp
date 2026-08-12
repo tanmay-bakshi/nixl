@@ -24,6 +24,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <nixl_types.h>
@@ -640,7 +641,20 @@ nixlUcxWorker::createUcpWorker(const nixlUcxContext &ctx) {
 nixlUcxWorker::nixlUcxWorker(const nixlUcxContext &ctx, ucp_err_handling_mode_t err_handling_mode)
     : worker(createUcpWorker(ctx), &ucp_worker_destroy),
       err_handling_mode_(err_handling_mode),
-      identity_(allocateIdentity(next_worker_identity)) {}
+      identity_(allocateIdentity(next_worker_identity)),
+      continuations_(std::make_shared<nixl::ucx::ucx_worker_continuation_queue_t>(
+          maxPendingContinuations,
+          [worker = worker.get()]() noexcept {
+              return nixl::ucx::ucsToNixlStatus(ucp_worker_signal(worker));
+          })) {}
+
+nixlUcxWorker::~nixlUcxWorker() {
+    const nixl_status_t status = closeContinuations();
+    if (status != NIXL_SUCCESS) {
+        NIXL_ERROR << "UCX worker terminal continuation queue closed with status "
+                   << status;
+    }
+}
 
 std::string
 nixlUcxWorker::epAddr() {
@@ -838,4 +852,50 @@ nixlUcxWorker::getEfd() const {
         throw std::runtime_error(err_str);
     }
     return fd;
+}
+
+nixl_status_t
+nixlUcxWorker::claimProgressOwner() noexcept {
+    if (hasProgressOwner_) {
+        return NIXL_ERR_NOT_ALLOWED;
+    }
+    hasProgressOwner_ = true;
+    progressOwnerThread_ = std::this_thread::get_id();
+    return NIXL_SUCCESS;
+}
+
+nixl_status_t
+nixlUcxWorker::drainContinuationsOnOwner() {
+    if (!hasProgressOwner_ || progressOwnerThread_ != std::this_thread::get_id()) {
+        return NIXL_ERR_NOT_ALLOWED;
+    }
+    (void)continuations_->drain();
+    return continuations_->fatalStatus();
+}
+
+nixl_status_t
+nixlUcxWorker::closeContinuations() {
+    if (continuations_ == nullptr) {
+        return NIXL_SUCCESS;
+    }
+    return continuations_->close();
+}
+
+nixl_status_t
+nixlUcxWorker::makeTerminalCallbackSlot(
+    std::shared_ptr<nixl::ucx::terminal_submission_state_t> state,
+    nixl::ucx::ucx_callback_kind_t kind,
+    std::shared_ptr<nixl::ucx::ucx_callback_slot_t> &slot) {
+    if (!hasProgressOwner_) {
+        return NIXL_ERR_NOT_SUPPORTED;
+    }
+    if (state == nullptr || slot != nullptr) {
+        return NIXL_ERR_INVALID_PARAM;
+    }
+    slot = nixl::ucx::ucx_callback_slot_t::create(
+        std::move(state),
+        kind,
+        continuations_,
+        [this](void *request) { reqRelease(request); });
+    return NIXL_SUCCESS;
 }
