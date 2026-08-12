@@ -251,8 +251,9 @@ agentConfig() {
 }
 
 [[nodiscard]] nixl_b_params_t
-backendParameters(const std::string &engine) {
+backendParameters(const std::string &transport, const std::string &engine) {
     nixl_b_params_t parameters;
+    parameters["ucx_error_handling_mode"] = transport == "self" ? "none" : "peer";
     if (engine == "shared") {
         parameters["num_workers"] = "2";
         parameters["num_threads"] = "0";
@@ -576,7 +577,7 @@ run(int argc, char **argv) {
 
     nixlBackendH *source_backend = nullptr;
     nixlBackendH *destination_backend = nullptr;
-    const nixl_b_params_t parameters = backendParameters(options.engine);
+    const nixl_b_params_t parameters = backendParameters(options.transport, options.engine);
     requireStatus(source_agent.createBackend("UCX", parameters, source_backend),
                   NIXL_SUCCESS,
                   "create source UCX backend");
