@@ -21,8 +21,11 @@
 #include "telemetry.h"
 #include "stream/metadata_stream.h"
 #include "sync.h"
+#include "terminal_event_api.h"
 
 #include <memory>
+#include <set>
+#include <tuple>
 #include <unordered_set>
 
 #if HAVE_ETCD
@@ -145,6 +148,12 @@ class nixlAgentData {
         std::unordered_map<nixl_backend_t, std::unique_ptr<nixlBackendH>> backendHandles_;
         std::unordered_map<nixl_backend_t, nixl_blob_t> connMd_;
         backend_map_t backendEngines_;
+        std::unique_ptr<nixlTerminalEventChannelH> terminalEventChannel_;
+        std::unordered_map<uint64_t, std::shared_ptr<nixlTerminalEventSubscriptionH>>
+            terminalSubscriptions_;
+        std::unordered_map<const nixlTerminalEventSubscriptionH *, uint64_t>
+            ownedTerminalSubscriptions_;
+        std::unordered_set<const nixlXferReqH *> ownedXferHandles_;
         std::unordered_map<std::string, nixlRemoteSection> remoteSections_;
         std::unique_ptr<nixlTelemetry> telemetry_;
         nixlLocalSection localSection_;

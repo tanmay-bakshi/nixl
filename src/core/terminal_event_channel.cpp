@@ -114,6 +114,13 @@ public:
         return terminal_event_publish_result_t::PUBLISHED;
     }
 
+    void
+    fail(terminal_channel_fatal_t fatal) noexcept {
+        const std::lock_guard lock(mutex_);
+        setFatalLocked(fatal, 0);
+        static_cast<void>(signalLocked());
+    }
+
     [[nodiscard]] int
     fileno() const noexcept {
         return eventFd_;
@@ -336,6 +343,15 @@ terminalEventChannel::subscription::release() noexcept {
         state = std::move(state_);
     }
     state->releaseSubscription();
+}
+
+void
+terminalEventChannel::subscription::failInvalidPublication() noexcept {
+    const std::lock_guard lock(mutex_);
+    if (released_) {
+        return;
+    }
+    state_->fail(terminal_channel_fatal_t::INVALID_PUBLICATION);
 }
 
 terminalEventChannel::terminalEventChannel(std::size_t capacity)
