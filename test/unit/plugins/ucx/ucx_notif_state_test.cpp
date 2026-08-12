@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -100,6 +101,39 @@ makeInbound(const notif_wire_envelope_t &local_offer,
         .capabilityEpoch = capability_epoch,
     };
 }
+
+class querying_transition_sink_t final : public notif_route_transition_sink_t {
+public:
+    querying_transition_sink_t(notif_capability_state_t &state, notif_route_key_t route)
+        : state_(state),
+          route_(std::move(route)) {
+        transitions_.reserve(8);
+    }
+
+    void
+    publish(const notif_route_transition_t &transition) noexcept override {
+        notif_route_snapshot_t snapshot;
+        reentrantQuerySucceeded_ =
+            state_.queryRemoteNotificationState(route_, snapshot) == notif_state_status_t::SUCCESS;
+        transitions_.push_back(transition);
+    }
+
+    [[nodiscard]] const std::vector<notif_route_transition_t> &
+    transitions() const noexcept {
+        return transitions_;
+    }
+
+    [[nodiscard]] bool
+    reentrantQuerySucceeded() const noexcept {
+        return reentrantQuerySucceeded_;
+    }
+
+private:
+    notif_capability_state_t &state_;
+    notif_route_key_t route_;
+    std::vector<notif_route_transition_t> transitions_;
+    bool reentrantQuerySucceeded_ = false;
+};
 
 void
 testConvergenceAndEarlyData() {
@@ -352,6 +386,199 @@ testSiblingIsolationAndUnknownCapability() {
             "unknown capability did not poison authenticated draining");
 }
 
+void
+testCapabilitySubscriptionTransitions() {
+    const notif_wire_uuid_t local_agent = makeUuid(131);
+    const notif_wire_uuid_t local_backend = makeUuid(132);
+    const notif_wire_uuid_t local_worker = makeUuid(133);
+    const notif_wire_uuid_t remote_agent = makeUuid(141);
+    const notif_wire_uuid_t remote_backend = makeUuid(142);
+    const notif_wire_uuid_t remote_worker = makeUuid(143);
+    notif_capability_state_t state(local_agent, local_backend, {local_worker});
+    const notif_route_key_t route = makeRoute(601, 3, remote_agent, remote_backend);
+    bind(state, makeBinding(route, 6001, {{remote_worker, 10001}}));
+
+    const auto sink = std::make_shared<querying_transition_sink_t>(state, route);
+    notif_route_subscription_t subscription;
+    require(state.subscribeRemoteNotificationState(route, sink, subscription) ==
+                notif_route_subscription_status_t::SUCCESS,
+            "subscription before capability readiness failed");
+    require(subscription.route == route && subscription.generation != 0,
+            "subscription did not bind the exact route generation");
+    require(sink->transitions().empty(), "NOT_READY subscription published an event");
+
+    notif_route_subscription_t duplicate_output;
+    const auto duplicate_sink = std::make_shared<querying_transition_sink_t>(state, route);
+    require(state.subscribeRemoteNotificationState(route, duplicate_sink, duplicate_output) ==
+                notif_route_subscription_status_t::DUPLICATE_SUBSCRIPTION,
+            "duplicate exact-route subscription was accepted");
+    require(duplicate_output.generation == 0, "failed duplicate subscription mutated its output");
+
+    notif_wire_envelope_t local_offer;
+    require(state.makeOffer(route, local_worker, local_offer) == notif_state_status_t::SUCCESS,
+            "subscription-test OFFER generation failed");
+    const notif_wire_uuid_t first_capability = makeUuid(151);
+    notif_offer_acceptance_t acceptance;
+    require(
+        state.acceptOffer(
+            makeInbound(local_offer, notif_wire_type_t::OFFER, remote_worker, first_capability, 20),
+            local_worker,
+            acceptance) == notif_state_status_t::SUCCESS,
+        "first subscribed capability was rejected");
+    require(sink->transitions().size() == 1 && sink->transitions()[0].route == route &&
+                sink->transitions()[0].state == notif_route_transition_state_t::READY &&
+                sink->transitions()[0].capabilityEpoch == 20 &&
+                sink->transitions()[0].nativeTimestampNs != 0,
+            "first readiness transition was not published exactly");
+    require(sink->reentrantQuerySucceeded(),
+            "subscription callback could not re-enter route state");
+
+    require(
+        state.acceptOffer(
+            makeInbound(local_offer, notif_wire_type_t::OFFER, remote_worker, first_capability, 20),
+            local_worker,
+            acceptance) == notif_state_status_t::SUCCESS &&
+            sink->transitions().size() == 1,
+        "idempotent capability replay published a duplicate transition");
+
+    const notif_wire_uuid_t second_capability = makeUuid(152);
+    require(state.acceptOffer(
+                makeInbound(
+                    local_offer, notif_wire_type_t::OFFER, remote_worker, second_capability, 21),
+                local_worker,
+                acceptance) == notif_state_status_t::SUCCESS,
+            "capability epoch advance failed");
+    require(sink->transitions().size() == 2 &&
+                sink->transitions()[1].state == notif_route_transition_state_t::READY &&
+                sink->transitions()[1].capabilityEpoch == 21 &&
+                sink->transitions()[1].nativeTimestampNs >=
+                    sink->transitions()[0].nativeTimestampNs,
+            "capability epoch advance did not publish ordered readiness");
+
+    require(
+        state.acceptOffer(
+            makeInbound(local_offer, notif_wire_type_t::OFFER, remote_worker, makeUuid(153), 21),
+            local_worker,
+            acceptance) == notif_state_status_t::EPOCH_CONFLICT,
+        "equal-epoch conflict did not fail the subscribed route");
+    require(sink->transitions().size() == 3 &&
+                sink->transitions()[2].state == notif_route_transition_state_t::FAILED &&
+                sink->transitions()[2].capabilityEpoch == 21,
+            "route failure did not publish the exact capability epoch");
+
+    require(state.retireRemoteAgent(route) == notif_state_status_t::SUCCESS,
+            "subscribed route retirement failed");
+    require(sink->transitions().size() == 4 &&
+                sink->transitions()[3].state == notif_route_transition_state_t::RETIRED &&
+                sink->transitions()[3].capabilityEpoch == 21,
+            "route retirement did not publish after failure");
+    require(state.unsubscribeRemoteNotificationState(subscription) ==
+                    notif_route_subscription_status_t::SUCCESS &&
+                state.unsubscribeRemoteNotificationState(subscription) ==
+                    notif_route_subscription_status_t::UNKNOWN_SUBSCRIPTION,
+            "exact subscription cancellation was not take-once");
+}
+
+void
+testCapabilitySubscriptionSnapshotAndCancellation() {
+    const notif_wire_uuid_t local_agent = makeUuid(161);
+    const notif_wire_uuid_t local_backend = makeUuid(162);
+    const notif_wire_uuid_t local_worker = makeUuid(163);
+    const notif_wire_uuid_t remote_agent = makeUuid(171);
+    const notif_wire_uuid_t remote_backend = makeUuid(172);
+    const notif_wire_uuid_t remote_worker = makeUuid(173);
+    notif_capability_state_t state(local_agent, local_backend, {local_worker});
+    const notif_route_key_t route = makeRoute(701, 9, remote_agent, remote_backend);
+    bind(state, makeBinding(route, 7001, {{remote_worker, 11001}}));
+
+    notif_wire_envelope_t local_offer;
+    require(state.makeOffer(route, local_worker, local_offer) == notif_state_status_t::SUCCESS,
+            "snapshot-test OFFER generation failed");
+    notif_offer_acceptance_t acceptance;
+    require(
+        state.acceptOffer(
+            makeInbound(local_offer, notif_wire_type_t::OFFER, remote_worker, makeUuid(181), 30),
+            local_worker,
+            acceptance) == notif_state_status_t::SUCCESS,
+        "snapshot-test readiness failed");
+
+    const auto ready_sink = std::make_shared<querying_transition_sink_t>(state, route);
+    notif_route_subscription_t first_subscription;
+    require(state.subscribeRemoteNotificationState(route, ready_sink, first_subscription) ==
+                    notif_route_subscription_status_t::SUCCESS &&
+                ready_sink->transitions().size() == 1 &&
+                ready_sink->transitions()[0].state == notif_route_transition_state_t::READY &&
+                ready_sink->transitions()[0].capabilityEpoch == 30,
+            "subscribe-after-ready did not publish the atomic snapshot");
+    require(state.unsubscribeRemoteNotificationState(first_subscription) ==
+                notif_route_subscription_status_t::SUCCESS,
+            "ready subscription cancellation failed");
+
+    const auto cancelled_sink = std::make_shared<querying_transition_sink_t>(state, route);
+    notif_route_subscription_t cancelled_subscription;
+    require(state.subscribeRemoteNotificationState(route, cancelled_sink, cancelled_subscription) ==
+                    notif_route_subscription_status_t::SUCCESS &&
+                cancelled_sink->transitions().size() == 1,
+            "replacement subscription did not receive current readiness");
+    require(state.unsubscribeRemoteNotificationState(cancelled_subscription) ==
+                notif_route_subscription_status_t::SUCCESS,
+            "replacement subscription cancellation failed");
+    require(state.retireRemoteAgent(route) == notif_state_status_t::SUCCESS &&
+                cancelled_sink->transitions().size() == 1,
+            "cancelled subscription received a retirement transition");
+
+    const auto retired_sink = std::make_shared<querying_transition_sink_t>(state, route);
+    notif_route_subscription_t retired_subscription;
+    require(state.subscribeRemoteNotificationState(route, retired_sink, retired_subscription) ==
+                    notif_route_subscription_status_t::SUCCESS &&
+                retired_sink->transitions().size() == 1 &&
+                retired_sink->transitions()[0].state == notif_route_transition_state_t::RETIRED &&
+                retired_sink->transitions()[0].capabilityEpoch == 30,
+            "subscribe-after-retirement did not publish the atomic snapshot");
+    require(state.unsubscribeRemoteNotificationState(cancelled_subscription) ==
+                notif_route_subscription_status_t::UNKNOWN_SUBSCRIPTION,
+            "stale cancellation removed a replacement subscription generation");
+    require(state.unsubscribeRemoteNotificationState(retired_subscription) ==
+                notif_route_subscription_status_t::SUCCESS,
+            "retired subscription cancellation failed");
+
+    const notif_wire_uuid_t pending_remote_agent = makeUuid(182);
+    const notif_wire_uuid_t pending_remote_backend = makeUuid(183);
+    const notif_wire_uuid_t pending_remote_worker = makeUuid(184);
+    const notif_route_key_t pending_route =
+        makeRoute(702, 1, pending_remote_agent, pending_remote_backend);
+    bind(state, makeBinding(pending_route, 7002, {{pending_remote_worker, 11002}}));
+    const auto pending_sink = std::make_shared<querying_transition_sink_t>(state, pending_route);
+    notif_route_subscription_t pending_subscription;
+    require(
+        state.subscribeRemoteNotificationState(pending_route, pending_sink, pending_subscription) ==
+                notif_route_subscription_status_t::SUCCESS &&
+            pending_sink->transitions().empty(),
+        "pending-route subscription published before readiness");
+    require(state.unsubscribeRemoteNotificationState(pending_subscription) ==
+                notif_route_subscription_status_t::SUCCESS,
+            "pending-route subscription cancellation failed");
+    notif_wire_envelope_t pending_local_offer;
+    require(state.makeOffer(pending_route, local_worker, pending_local_offer) ==
+                    notif_state_status_t::SUCCESS &&
+                state.acceptOffer(makeInbound(pending_local_offer,
+                                              notif_wire_type_t::OFFER,
+                                              pending_remote_worker,
+                                              makeUuid(185),
+                                              1),
+                                  local_worker,
+                                  acceptance) == notif_state_status_t::SUCCESS &&
+                pending_sink->transitions().empty(),
+            "cancelled pending subscription received readiness");
+
+    notif_route_subscription_t unknown_output;
+    require(state.subscribeRemoteNotificationState(
+                makeRoute(999, 1, makeUuid(191), makeUuid(192)), retired_sink, unknown_output) ==
+                    notif_route_subscription_status_t::UNKNOWN_ROUTE &&
+                unknown_output.generation == 0,
+            "unknown-route subscription did not fail without output mutation");
+}
+
 } // namespace
 
 int
@@ -361,6 +588,8 @@ main() {
         testOfferReplayAndEpochConflict();
         testRetirementPreservesExactAttribution();
         testSiblingIsolationAndUnknownCapability();
+        testCapabilitySubscriptionTransitions();
+        testCapabilitySubscriptionSnapshotAndCancellation();
     }
     catch (const std::exception &error) {
         std::cerr << "ucx_notif_state_test failed: " << error.what() << '\n';

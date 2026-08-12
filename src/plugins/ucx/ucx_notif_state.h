@@ -19,6 +19,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
@@ -88,6 +89,42 @@ struct notif_route_snapshot_t {
     std::uint64_t remoteCapabilityEpoch = 0;
 };
 
+enum class notif_route_transition_state_t {
+    READY,
+    FAILED,
+    RETIRED,
+};
+
+struct notif_route_transition_t {
+    notif_route_key_t route;
+    notif_route_transition_state_t state = notif_route_transition_state_t::FAILED;
+    std::uint64_t capabilityEpoch = 0;
+    std::uint64_t nativeTimestampNs = 0;
+};
+
+class notif_route_transition_sink_t {
+public:
+    virtual ~notif_route_transition_sink_t() = default;
+
+    /** Called without the route-state mutex. Implementations must not block or throw. */
+    virtual void
+    publish(const notif_route_transition_t &transition) noexcept = 0;
+};
+
+struct notif_route_subscription_t {
+    notif_route_key_t route;
+    std::uint64_t generation = 0;
+};
+
+enum class notif_route_subscription_status_t {
+    SUCCESS,
+    INVALID_ARGUMENT,
+    UNKNOWN_ROUTE,
+    DUPLICATE_SUBSCRIPTION,
+    UNKNOWN_SUBSCRIPTION,
+    GENERATION_EXHAUSTED,
+};
+
 struct notif_offer_acceptance_t {
     notif_route_key_t route;
     notif_wire_envelope_t acknowledgement;
@@ -135,6 +172,18 @@ public:
     queryRemoteNotificationState(const notif_route_key_t &route,
                                  notif_route_snapshot_t &snapshot) const;
 
+    [[nodiscard]] notif_route_subscription_status_t
+    subscribeRemoteNotificationState(const notif_route_key_t &route,
+                                     std::shared_ptr<notif_route_transition_sink_t> sink,
+                                     notif_route_subscription_t &subscription);
+
+    /**
+     * Cancels future delivery for one exact subscription generation. A callback already invoking
+     * publish() may finish after this method returns; shared sink ownership keeps that race safe.
+     */
+    [[nodiscard]] notif_route_subscription_status_t
+    unsubscribeRemoteNotificationState(const notif_route_subscription_t &subscription) noexcept;
+
     [[nodiscard]] notif_state_status_t
     makeOffer(const notif_route_key_t &route,
               const notif_wire_uuid_t &local_sender_worker,
@@ -157,6 +206,8 @@ public:
     resolveData(const notif_wire_envelope_t &data) const;
 
 private:
+    class route_delivery_state_t;
+
     struct uuid_hash_t {
         [[nodiscard]] std::size_t
         operator()(const notif_wire_uuid_t &uuid) const noexcept;
@@ -193,6 +244,16 @@ private:
         std::uint64_t remoteCapabilityEpoch = 0;
     };
 
+    struct route_subscription_record_t {
+        std::uint64_t generation = 0;
+        std::shared_ptr<route_delivery_state_t> delivery;
+    };
+
+    struct pending_route_delivery_t {
+        std::shared_ptr<route_delivery_state_t> delivery;
+        bool dispatchRequired = false;
+    };
+
     [[nodiscard]] bool
     isLocalWorker(const notif_wire_uuid_t &worker) const;
 
@@ -214,12 +275,23 @@ private:
     [[nodiscard]] notif_route_snapshot_t
     makeSnapshotLocked(const binding_state_t &binding) const;
 
+    [[nodiscard]] pending_route_delivery_t
+    enqueueRouteTransitionLocked(const notif_route_key_t &route,
+                                 notif_route_transition_state_t state,
+                                 std::uint64_t capability_epoch) const;
+
+    static void
+    dispatchRouteTransition(pending_route_delivery_t pending) noexcept;
+
     notif_wire_uuid_t localAgentIncarnation_;
     notif_wire_uuid_t localBackendIncarnation_;
     std::unordered_set<notif_wire_uuid_t, uuid_hash_t> localWorkers_;
     mutable std::mutex mutex_;
     std::uint64_t nextCapabilityEpoch_ = 1;
+    std::uint64_t nextSubscriptionGeneration_ = 1;
     std::unordered_map<notif_route_key_t, binding_state_t, route_hash_t> bindings_;
+    std::unordered_map<notif_route_key_t, route_subscription_record_t, route_hash_t>
+        routeSubscriptions_;
     std::unordered_map<peer_key_t, notif_route_key_t, peer_hash_t> activePeers_;
     std::unordered_map<notif_wire_uuid_t, notif_route_key_t, uuid_hash_t> localCapabilities_;
 };

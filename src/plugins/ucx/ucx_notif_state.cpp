@@ -18,6 +18,8 @@
 #include "ucx_notif_state.h"
 
 #include <algorithm>
+#include <ctime>
+#include <deque>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -52,7 +54,74 @@ namespace {
         return {.bytes = generated.get_data()};
     }
 
+    [[nodiscard]] std::uint64_t
+    monotonicRawTimestampNs() noexcept {
+        timespec timestamp = {};
+        if (::clock_gettime(CLOCK_MONOTONIC_RAW, &timestamp) != 0) {
+            return 0;
+        }
+        return static_cast<std::uint64_t>(timestamp.tv_sec) * 1'000'000'000ULL +
+            static_cast<std::uint64_t>(timestamp.tv_nsec);
+    }
+
 } // namespace
+
+class notif_capability_state_t::route_delivery_state_t {
+public:
+    explicit route_delivery_state_t(std::shared_ptr<notif_route_transition_sink_t> sink)
+        : sink_(std::move(sink)) {}
+
+    [[nodiscard]] bool
+    enqueue(notif_route_transition_t transition) {
+        const std::lock_guard lock(mutex_);
+        if (cancelled_) {
+            return false;
+        }
+
+        // Route transitions enqueue while the route mutex is held. One dispatcher then invokes
+        // the sink outside that mutex, preserving order even when a callback re-enters the state.
+        pending_.push_back(std::move(transition));
+        if (dispatching_) {
+            return false;
+        }
+        dispatching_ = true;
+        return true;
+    }
+
+    void
+    dispatch() noexcept {
+        while (true) {
+            notif_route_transition_t transition;
+            std::shared_ptr<notif_route_transition_sink_t> sink;
+            {
+                const std::lock_guard lock(mutex_);
+                if (cancelled_ || pending_.empty()) {
+                    dispatching_ = false;
+                    return;
+                }
+                transition = std::move(pending_.front());
+                pending_.pop_front();
+                sink = sink_;
+            }
+            sink->publish(transition);
+        }
+    }
+
+    void
+    cancel() noexcept {
+        const std::lock_guard lock(mutex_);
+        cancelled_ = true;
+        pending_.clear();
+        sink_.reset();
+    }
+
+private:
+    std::mutex mutex_;
+    std::shared_ptr<notif_route_transition_sink_t> sink_;
+    std::deque<notif_route_transition_t> pending_;
+    bool dispatching_ = false;
+    bool cancelled_ = false;
+};
 
 std::size_t
 notif_capability_state_t::uuid_hash_t::operator()(const notif_wire_uuid_t &uuid) const noexcept {
@@ -194,24 +263,33 @@ notif_capability_state_t::bindRemoteAgent(const notif_remote_binding_t &binding,
 
 notif_state_status_t
 notif_capability_state_t::retireRemoteAgent(const notif_route_key_t &route) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    const auto known = bindings_.find(route);
-    if (known == bindings_.end()) {
-        return notif_state_status_t::UNKNOWN_ROUTE;
-    }
-    if (known->second.retired) {
-        return notif_state_status_t::SUCCESS;
-    }
+    pending_route_delivery_t pending;
+    {
+        const std::lock_guard lock(mutex_);
+        const auto known = bindings_.find(route);
+        if (known == bindings_.end()) {
+            return notif_state_status_t::UNKNOWN_ROUTE;
+        }
+        if (known->second.retired) {
+            return notif_state_status_t::SUCCESS;
+        }
 
-    known->second.retired = true;
-    const peer_key_t peer = {
-        .agentIncarnation = route.remoteAgentIncarnation,
-        .backendIncarnation = route.remoteBackendIncarnation,
-    };
-    const auto active = activePeers_.find(peer);
-    if (active != activePeers_.end() && active->second == route) {
-        activePeers_.erase(active);
+        known->second.retired = true;
+        const peer_key_t peer = {
+            .agentIncarnation = route.remoteAgentIncarnation,
+            .backendIncarnation = route.remoteBackendIncarnation,
+        };
+        const auto active = activePeers_.find(peer);
+        if (active != activePeers_.end() && active->second == route) {
+            activePeers_.erase(active);
+        }
+        const std::uint64_t epoch = known->second.remoteCapabilityEpoch != 0 ?
+            known->second.remoteCapabilityEpoch :
+            known->second.localCapabilityEpoch;
+        pending =
+            enqueueRouteTransitionLocked(route, notif_route_transition_state_t::RETIRED, epoch);
     }
+    dispatchRouteTransition(std::move(pending));
     return notif_state_status_t::SUCCESS;
 }
 
@@ -238,6 +316,35 @@ notif_capability_state_t::makeSnapshotLocked(const binding_state_t &binding) con
     };
 }
 
+notif_capability_state_t::pending_route_delivery_t
+notif_capability_state_t::enqueueRouteTransitionLocked(const notif_route_key_t &route,
+                                                       notif_route_transition_state_t state,
+                                                       std::uint64_t capability_epoch) const {
+    const auto known = routeSubscriptions_.find(route);
+    if (known == routeSubscriptions_.end()) {
+        return {};
+    }
+
+    pending_route_delivery_t pending = {
+        .delivery = known->second.delivery,
+    };
+    pending.dispatchRequired = pending.delivery->enqueue({
+        .route = route,
+        .state = state,
+        .capabilityEpoch = capability_epoch,
+        .nativeTimestampNs = monotonicRawTimestampNs(),
+    });
+    return pending;
+}
+
+void
+notif_capability_state_t::dispatchRouteTransition(pending_route_delivery_t pending) noexcept {
+    if (pending.delivery == nullptr || !pending.dispatchRequired) {
+        return;
+    }
+    pending.delivery->dispatch();
+}
+
 notif_state_status_t
 notif_capability_state_t::queryRemoteNotificationState(const notif_route_key_t &route,
                                                        notif_route_snapshot_t &snapshot) const {
@@ -248,6 +355,84 @@ notif_capability_state_t::queryRemoteNotificationState(const notif_route_key_t &
     }
     snapshot = makeSnapshotLocked(known->second);
     return notif_state_status_t::SUCCESS;
+}
+
+notif_route_subscription_status_t
+notif_capability_state_t::subscribeRemoteNotificationState(
+    const notif_route_key_t &route,
+    std::shared_ptr<notif_route_transition_sink_t> sink,
+    notif_route_subscription_t &subscription) {
+    if (sink == nullptr) {
+        return notif_route_subscription_status_t::INVALID_ARGUMENT;
+    }
+
+    pending_route_delivery_t pending;
+    notif_route_subscription_t candidate;
+    {
+        const std::lock_guard lock(mutex_);
+        const auto binding = bindings_.find(route);
+        if (binding == bindings_.end()) {
+            return notif_route_subscription_status_t::UNKNOWN_ROUTE;
+        }
+        if (routeSubscriptions_.find(route) != routeSubscriptions_.end()) {
+            return notif_route_subscription_status_t::DUPLICATE_SUBSCRIPTION;
+        }
+        if (nextSubscriptionGeneration_ == std::numeric_limits<std::uint64_t>::max()) {
+            return notif_route_subscription_status_t::GENERATION_EXHAUSTED;
+        }
+
+        candidate = {
+            .route = route,
+            .generation = nextSubscriptionGeneration_++,
+        };
+        const bool did_insert =
+            routeSubscriptions_
+                .emplace(route,
+                         route_subscription_record_t{
+                             .generation = candidate.generation,
+                             .delivery = std::make_shared<route_delivery_state_t>(std::move(sink)),
+                         })
+                .second;
+        if (!did_insert) {
+            return notif_route_subscription_status_t::DUPLICATE_SUBSCRIPTION;
+        }
+
+        const binding_state_t &state = binding->second;
+        const std::uint64_t epoch = state.remoteCapabilityEpoch != 0 ? state.remoteCapabilityEpoch :
+                                                                       state.localCapabilityEpoch;
+        if (state.failed) {
+            pending =
+                enqueueRouteTransitionLocked(route, notif_route_transition_state_t::FAILED, epoch);
+        } else if (state.retired) {
+            pending =
+                enqueueRouteTransitionLocked(route, notif_route_transition_state_t::RETIRED, epoch);
+        } else if (state.hasRemoteCapability) {
+            pending =
+                enqueueRouteTransitionLocked(route, notif_route_transition_state_t::READY, epoch);
+        }
+    }
+
+    subscription = candidate;
+    dispatchRouteTransition(std::move(pending));
+    return notif_route_subscription_status_t::SUCCESS;
+}
+
+notif_route_subscription_status_t
+notif_capability_state_t::unsubscribeRemoteNotificationState(
+    const notif_route_subscription_t &subscription) noexcept {
+    std::shared_ptr<route_delivery_state_t> delivery;
+    {
+        const std::lock_guard lock(mutex_);
+        const auto known = routeSubscriptions_.find(subscription.route);
+        if (known == routeSubscriptions_.end() ||
+            known->second.generation != subscription.generation) {
+            return notif_route_subscription_status_t::UNKNOWN_SUBSCRIPTION;
+        }
+        delivery = std::move(known->second.delivery);
+        routeSubscriptions_.erase(known);
+    }
+    delivery->cancel();
+    return notif_route_subscription_status_t::SUCCESS;
 }
 
 notif_wire_envelope_t
@@ -324,7 +509,7 @@ notif_capability_state_t::acceptOffer(const notif_wire_envelope_t &offer,
         return notif_state_status_t::INVALID_ARGUMENT;
     }
 
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
     if (!isLocalWorker(local_sender_worker) ||
         offer.recipientAgentIncarnation != localAgentIncarnation_ ||
         offer.recipientBackendIncarnation != localBackendIncarnation_) {
@@ -359,24 +544,33 @@ notif_capability_state_t::acceptOffer(const notif_wire_envelope_t &offer,
         return notif_state_status_t::ROUTE_FAILED;
     }
 
+    pending_route_delivery_t pending;
     bool reemit_local_offer = false;
+    bool capability_changed = false;
     if (!binding.hasRemoteCapability) {
         binding.hasRemoteCapability = true;
         binding.remoteCapability = offer.capability;
         binding.remoteCapabilityEpoch = offer.capabilityEpoch;
         reemit_local_offer = true;
+        capability_changed = true;
     } else if (offer.capabilityEpoch < binding.remoteCapabilityEpoch) {
         return notif_state_status_t::STALE_EPOCH;
     } else if (offer.capabilityEpoch == binding.remoteCapabilityEpoch) {
         if (offer.capability != binding.remoteCapability) {
             binding.failed = true;
             binding.hasRemoteCapability = false;
+            pending = enqueueRouteTransitionLocked(binding.binding.route,
+                                                   notif_route_transition_state_t::FAILED,
+                                                   offer.capabilityEpoch);
+            lock.unlock();
+            dispatchRouteTransition(std::move(pending));
             return notif_state_status_t::EPOCH_CONFLICT;
         }
     } else {
         binding.remoteCapability = offer.capability;
         binding.remoteCapabilityEpoch = offer.capabilityEpoch;
         reemit_local_offer = true;
+        capability_changed = true;
     }
 
     acceptance = {
@@ -393,6 +587,13 @@ notif_capability_state_t::acceptOffer(const notif_wire_envelope_t &offer,
                                          binding.localCapabilityEpoch),
         .reemitLocalOffer = reemit_local_offer,
     };
+    if (capability_changed) {
+        pending = enqueueRouteTransitionLocked(binding.binding.route,
+                                               notif_route_transition_state_t::READY,
+                                               binding.remoteCapabilityEpoch);
+    }
+    lock.unlock();
+    dispatchRouteTransition(std::move(pending));
     return notif_state_status_t::SUCCESS;
 }
 
