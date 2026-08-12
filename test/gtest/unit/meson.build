@@ -40,6 +40,7 @@ unit_test_exe = executable('unit',
     sources : [
         'main.cpp',
         '../common.cpp',
+        'terminal_event_channel.cpp',
     ],
     cpp_args : cpp_args,
     dependencies : unit_test_deps,
