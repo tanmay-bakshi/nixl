@@ -14,3 +14,15 @@ terminal_ucx_qualification_exe = executable(
     dependencies: [nixl_dep, nixl_infra, qualification_crypto_dep, thread_dep],
     install: false,
 )
+
+terminal_ucx_endpoint_failure_qualification_exe = executable(
+    'terminal_ucx_endpoint_failure_qualification',
+    sources: [
+        'terminal_ucx_endpoint_failure_qualification.cpp',
+        'terminal_ucx_api_adapter.cpp',
+        'terminal_ucx_peer_fixture.cpp',
+    ],
+    include_directories: [nixl_inc_dirs, utils_inc_dirs],
+    dependencies: [nixl_dep, nixl_infra, qualification_crypto_dep, thread_dep],
+    install: false,
+)
