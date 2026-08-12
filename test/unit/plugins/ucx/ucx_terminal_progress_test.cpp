@@ -373,6 +373,36 @@ testCompositeFolding() {
 }
 
 void
+testFailedSlotAllocationCanUndoOnlyUnpostedRegistration() {
+    auto sink = std::make_shared<recording_sink_t>();
+    auto state = std::make_shared<terminal_submission_state_t>(
+        22, 112, 18, 1, 1, false, sink);
+    require(state->registerChunk() == NIXL_SUCCESS &&
+                state->registerChunk() == NIXL_SUCCESS,
+            "slot rollback chunk registration failed");
+    require(state->completeChunk(NIXL_SUCCESS, 120) == NIXL_SUCCESS,
+            "slot rollback completed chunk failed");
+    require(state->unregisterChunk() == NIXL_SUCCESS,
+            "unposted chunk registration could not be rolled back");
+    require(state->unregisterChunk() == NIXL_ERR_NOT_ALLOWED,
+            "slot rollback removed a completed chunk registration");
+
+    require(state->registerFlush() == NIXL_SUCCESS &&
+                state->registerFlush() == NIXL_SUCCESS,
+            "slot rollback flush registration failed");
+    require(state->completeFlush(NIXL_SUCCESS, 121) == NIXL_SUCCESS,
+            "slot rollback completed flush failed");
+    require(state->unregisterFlush() == NIXL_SUCCESS,
+            "unposted flush registration could not be rolled back");
+    require(state->unregisterFlush() == NIXL_ERR_NOT_ALLOWED,
+            "slot rollback removed a completed flush registration");
+    require(state->sealPosting({}, 122) == NIXL_SUCCESS &&
+                sink->results.size() == 1 &&
+                sink->results[0].status == NIXL_SUCCESS,
+            "slot rollback changed the surviving submission terminality");
+}
+
+void
 testContinuationOverflowAndShutdown() {
     std::size_t wake_count = 0;
     auto queue = makeQueue(1, wake_count);
@@ -550,6 +580,7 @@ main() {
         testCancellationAndFailure();
         testNotificationFailure();
         testCompositeFolding();
+        testFailedSlotAllocationCanUndoOnlyUnpostedRegistration();
         testContinuationOverflowAndShutdown();
         testOwnerEnqueueDrainsToQuiescenceWithoutReentrantWake();
         testOverflowDrainsCallbackOwnership();

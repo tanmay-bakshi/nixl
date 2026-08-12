@@ -217,7 +217,7 @@ nixl_status_t
 terminal_submission_state_t::unregisterChunk() {
     const std::lock_guard lock(mutex_);
     if (phase_ != terminal_submission_phase_t::POSTING || postingSealed_ ||
-        registeredChunks_ == 0 || completedChunks_ != 0) {
+        registeredChunks_ == completedChunks_) {
         return NIXL_ERR_NOT_ALLOWED;
     }
     --registeredChunks_;
@@ -238,7 +238,7 @@ nixl_status_t
 terminal_submission_state_t::unregisterFlush() {
     const std::lock_guard lock(mutex_);
     if (phase_ != terminal_submission_phase_t::POSTING || postingSealed_ ||
-        registeredFlushes_ == 0 || completedFlushes_ != 0) {
+        registeredFlushes_ == completedFlushes_) {
         return NIXL_ERR_NOT_ALLOWED;
     }
     --registeredFlushes_;
@@ -617,23 +617,6 @@ ucx_callback_slot_t::requestForCancellation() const noexcept {
         return nullptr;
     }
     return posterRequest_;
-}
-
-nixl_status_t
-ucx_callback_slot_t::abandonBeforePost() noexcept {
-    owner_after_completion_t owner_after_completion;
-    {
-        const std::lock_guard lock(mutex_);
-        if (posterArmed_ || callbackArrived_ || scheduled_ || delivered_) {
-            return NIXL_ERR_NOT_ALLOWED;
-        }
-        delivered_ = true;
-        owner_after_completion = ownerAfterCompletion_;
-    }
-    if (owner_after_completion) {
-        owner_after_completion();
-    }
-    return NIXL_SUCCESS;
 }
 
 nixl_status_t

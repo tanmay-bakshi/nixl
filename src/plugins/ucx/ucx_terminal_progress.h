@@ -253,8 +253,6 @@ public:
     isScheduled() const noexcept;
     [[nodiscard]] void *
     requestForCancellation() const noexcept;
-    [[nodiscard]] nixl_status_t
-    abandonBeforePost() noexcept;
 
 private:
     ucx_callback_slot_t(std::shared_ptr<terminal_submission_state_t> state,

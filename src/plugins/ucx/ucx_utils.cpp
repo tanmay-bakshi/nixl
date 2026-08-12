@@ -978,11 +978,6 @@ nixlUcxWorker::makeTerminalCallbackSlot(
     if (failNextTerminalCallbackSlot_.exchange(false, std::memory_order_acq_rel)) {
         return NIXL_ERR_BACKEND;
     }
-    const nixl_status_t producer_status = continuations_->registerProducer();
-    if (producer_status != NIXL_SUCCESS) {
-        return producer_status;
-    }
-    activeTerminalCallbacks_.fetch_add(1, std::memory_order_release);
     slot = nixl::ucx::ucx_callback_slot_t::create(
         std::move(state),
         kind,
@@ -1002,5 +997,11 @@ nixlUcxWorker::makeTerminalCallbackSlot(
                 owner_after_completion();
             }
         });
+    const nixl_status_t producer_status = continuations_->registerProducer();
+    if (producer_status != NIXL_SUCCESS) {
+        slot.reset();
+        return producer_status;
+    }
+    activeTerminalCallbacks_.fetch_add(1, std::memory_order_release);
     return NIXL_SUCCESS;
 }
