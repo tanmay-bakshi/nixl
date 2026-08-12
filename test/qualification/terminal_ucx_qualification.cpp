@@ -1385,10 +1385,12 @@ run(int argc, char **argv) {
             "queue overflow did not preserve exactly one admitted event");
     shutdown_result_t shutdown_cancellation = runShutdownCancellation(options, suffix);
     if (tcp_shutdown_cancellation.has_value()) {
-        shutdown_cancellation = {
-            .terminalStatus = tcp_shutdown_cancellation->transfer.terminalStatus,
-            .terminalEventCount = tcp_shutdown_cancellation->transfer.terminalEventCount,
-            .ownerWoken = tcp_shutdown_cancellation->transfer.ownerWoken,
+        shutdown_cancellation = shutdown_result_t{
+            terminal_fault_result_t{
+                .terminalStatus = tcp_shutdown_cancellation->transfer.terminalStatus,
+                .terminalEventCount = tcp_shutdown_cancellation->transfer.terminalEventCount,
+                .ownerWoken = tcp_shutdown_cancellation->transfer.ownerWoken,
+            },
             .cancelStatus = tcp_shutdown_cancellation->cancelStatus,
             .backendProducersBeforeCancel =
                 tcp_shutdown_cancellation->inventoryBeforeCancellation.backendProducers,
