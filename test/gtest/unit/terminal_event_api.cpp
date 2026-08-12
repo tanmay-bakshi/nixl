@@ -262,6 +262,7 @@ TEST(TerminalEventApi, ReadyThenRetiredAtSameEpochIsTerminal) {
         .generation = 4,
     });
     nixlTerminalCapabilityAdapter adapter(20, 4, channel_subscription);
+    adapter.bindTerminalCallback([]() {});
 
     adapter.publish({20, 4, nixl_backend_capability_state_t::READY, 21, 100});
     adapter.publish({20, 4, nixl_backend_capability_state_t::RETIRED, 21, 101});
@@ -283,6 +284,7 @@ TEST(TerminalEventApi, ReadyEpochMayAdvanceBeforeTerminalState) {
         .generation = 4,
     });
     nixlTerminalCapabilityAdapter adapter(20, 4, channel_subscription);
+    adapter.bindTerminalCallback([]() {});
 
     adapter.publish({20, 4, nixl_backend_capability_state_t::READY, 21, 100});
     adapter.publish({20, 4, nixl_backend_capability_state_t::READY, 22, 101});

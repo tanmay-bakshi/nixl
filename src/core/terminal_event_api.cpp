@@ -33,17 +33,18 @@ nixlTerminalTransferAdapter::nixlTerminalTransferAdapter(
 void
 nixlTerminalTransferAdapter::bindTerminalCallback(
     std::function<void()> terminal_callback) {
-    terminal_callback_t callback;
+    std::optional<nixlBackendTransferTransition> pending;
     {
         const std::lock_guard lock(mutex_);
-        terminalCallback_ = std::move(terminal_callback);
-        if (terminal_ && !terminalCallbackDelivered_) {
-            terminalCallbackDelivered_ = true;
-            callback = terminalCallback_;
+        if (terminalCallback_ != nullptr) {
+            return;
         }
+        terminalCallback_ = std::move(terminal_callback);
+        pending = std::move(pendingTransition_);
+        pendingTransition_.reset();
     }
-    if (callback != nullptr) {
-        callback();
+    if (pending.has_value()) {
+        publishBound(*pending);
     }
 }
 
@@ -56,47 +57,52 @@ nixlTerminalTransferAdapter::isTerminal() const noexcept {
 void
 nixlTerminalTransferAdapter::publish(
     const nixlBackendTransferTransition &transition) noexcept {
-    std::shared_ptr<nixl::terminalEventChannel::subscription> subscription;
     {
         const std::lock_guard lock(mutex_);
         if (terminal_) {
             return;
         }
-        subscription = channelSubscription_;
-    }
-    if (subscription == nullptr) {
-        return;
-    }
-    bool invalid_publication = false;
-    nixl::terminal_event_publish_result_t result =
-        nixl::terminal_event_publish_result_t::INVALID_EVENT;
-    if (transition.binding.handleIdentity != binding_.handleIdentity ||
-        transition.binding.generation != binding_.generation) {
-        invalid_publication = true;
-    } else {
-        result = subscription->publishTransfer(
-            transition.status, transition.nativeTimestampNs);
-        invalid_publication =
-            result == nixl::terminal_event_publish_result_t::INVALID_EVENT ||
-            result == nixl::terminal_event_publish_result_t::ALREADY_PUBLISHED;
-    }
-
-    if (invalid_publication) {
-        subscription->failInvalidPublication();
-    }
-    subscription->release();
-    terminal_callback_t callback;
-    {
-        const std::lock_guard lock(mutex_);
-        terminal_ = true;
-        if (terminalCallback_ != nullptr && !terminalCallbackDelivered_) {
-            terminalCallbackDelivered_ = true;
-            callback = terminalCallback_;
+        if (terminalCallback_ == nullptr) {
+            if (pendingTransition_.has_value()) {
+                channelSubscription_->failInvalidPublication();
+                terminal_ = true;
+                return;
+            }
+            pendingTransition_ = transition;
+            return;
         }
     }
-    if (callback != nullptr) {
-        callback();
+    publishBound(transition);
+}
+
+void
+nixlTerminalTransferAdapter::publishBound(
+    const nixlBackendTransferTransition &transition) noexcept {
+    const std::lock_guard lock(mutex_);
+    if (terminal_ || terminalCallback_ == nullptr || channelSubscription_ == nullptr) {
+        return;
     }
+
+    terminal_ = true;
+    terminalCallbackDelivered_ = true;
+    const terminal_callback_t authority_commit = terminalCallback_;
+    const bool invalid_publication =
+        transition.binding.handleIdentity != binding_.handleIdentity ||
+        transition.binding.generation != binding_.generation;
+    if (invalid_publication) {
+        channelSubscription_->failInvalidPublicationAuthoritative(authority_commit);
+        channelSubscription_.reset();
+        return;
+    }
+
+    const nixl::terminal_event_publish_result_t result =
+        channelSubscription_->publishTransferAuthoritative(
+            transition.status, transition.nativeTimestampNs, authority_commit);
+    if (result == nixl::terminal_event_publish_result_t::INVALID_EVENT ||
+        result == nixl::terminal_event_publish_result_t::ALREADY_PUBLISHED) {
+        channelSubscription_->failInvalidPublicationAuthoritative(authority_commit);
+    }
+    channelSubscription_.reset();
 }
 
 void
@@ -122,17 +128,17 @@ nixlTerminalCapabilityAdapter::nixlTerminalCapabilityAdapter(
 void
 nixlTerminalCapabilityAdapter::bindTerminalCallback(
     std::function<void()> terminal_callback) {
-    terminal_callback_t callback;
+    std::vector<nixlBackendCapabilityTransition> pending;
     {
         const std::lock_guard lock(mutex_);
-        terminalCallback_ = std::move(terminal_callback);
-        if (terminal_ && !terminalCallbackDelivered_) {
-            terminalCallbackDelivered_ = true;
-            callback = terminalCallback_;
+        if (terminalCallback_ != nullptr) {
+            return;
         }
+        terminalCallback_ = std::move(terminal_callback);
+        pending.swap(pendingTransitions_);
     }
-    if (callback != nullptr) {
-        callback();
+    for (const nixlBackendCapabilityTransition &transition : pending) {
+        publishBound(transition);
     }
 }
 
@@ -145,72 +151,66 @@ nixlTerminalCapabilityAdapter::isTerminal() const noexcept {
 void
 nixlTerminalCapabilityAdapter::publish(
     const nixlBackendCapabilityTransition &transition) noexcept {
-    std::shared_ptr<nixl::terminalEventChannel::subscription> subscription;
-    uint64_t last_capability_epoch = 0;
-    bool has_capability_state = false;
     {
         const std::lock_guard lock(mutex_);
         if (terminal_) {
             return;
         }
-        subscription = channelSubscription_;
-        last_capability_epoch = lastCapabilityEpoch_;
-        has_capability_state = hasCapabilityState_;
+        if (terminalCallback_ == nullptr) {
+            pendingTransitions_.push_back(transition);
+            return;
+        }
     }
-    if (subscription == nullptr) {
+    publishBound(transition);
+}
+
+void
+nixlTerminalCapabilityAdapter::publishBound(
+    const nixlBackendCapabilityTransition &transition) noexcept {
+    const std::lock_guard lock(mutex_);
+    if (terminal_ || terminalCallback_ == nullptr || channelSubscription_ == nullptr) {
         return;
     }
 
     const std::optional<nixl::terminal_capability_state_t> capability_state =
         mapCapabilityState(transition.state);
-    bool invalid_publication = false;
-    nixl::terminal_event_publish_result_t result =
-        nixl::terminal_event_publish_result_t::INVALID_EVENT;
     const bool terminal_state =
         transition.state == nixl_backend_capability_state_t::FAILED ||
         transition.state == nixl_backend_capability_state_t::RETIRED;
-    const bool valid_epoch = !has_capability_state ||
-        transition.capabilityEpoch > last_capability_epoch ||
-        (terminal_state && transition.capabilityEpoch == last_capability_epoch);
-    if (transition.remoteHandleIdentity != remoteHandleIdentity_ ||
+    const bool valid_epoch = !hasCapabilityState_ ||
+        transition.capabilityEpoch > lastCapabilityEpoch_ ||
+        (terminal_state && transition.capabilityEpoch == lastCapabilityEpoch_);
+    const bool invalid_publication =
+        transition.remoteHandleIdentity != remoteHandleIdentity_ ||
         transition.remoteHandleGeneration != remoteHandleGeneration_ ||
         capability_state == std::nullopt || transition.capabilityEpoch == 0 ||
-        !valid_epoch) {
-        invalid_publication = true;
-    } else {
-        result = subscription->publishCapability(
-            *capability_state,
-            transition.capabilityEpoch,
-            transition.nativeTimestampNs);
-        invalid_publication =
-            result == nixl::terminal_event_publish_result_t::INVALID_EVENT ||
-            result == nixl::terminal_event_publish_result_t::ALREADY_PUBLISHED;
+        !valid_epoch;
+    const terminal_callback_t authority_commit = terminalCallback_;
+    if (invalid_publication) {
+        terminal_ = true;
+        terminalCallbackDelivered_ = true;
+        channelSubscription_->failInvalidPublicationAuthoritative(authority_commit);
+        channelSubscription_.reset();
+        return;
     }
 
+    const nixl::terminal_event_publish_result_t result =
+        channelSubscription_->publishCapabilityAuthoritative(
+            *capability_state,
+            transition.capabilityEpoch,
+            transition.nativeTimestampNs,
+            terminal_state,
+            authority_commit);
     const bool publication_failed =
         result != nixl::terminal_event_publish_result_t::PUBLISHED;
-    if (!invalid_publication && !publication_failed) {
-        const std::lock_guard lock(mutex_);
+    if (!publication_failed) {
         lastCapabilityEpoch_ = transition.capabilityEpoch;
         hasCapabilityState_ = true;
     }
-    if (invalid_publication) {
-        subscription->failInvalidPublication();
-    }
     if (terminal_state || publication_failed) {
-        subscription->release();
-        terminal_callback_t callback;
-        {
-            const std::lock_guard lock(mutex_);
-            terminal_ = true;
-            if (terminalCallback_ != nullptr && !terminalCallbackDelivered_) {
-                terminalCallbackDelivered_ = true;
-                callback = terminalCallback_;
-            }
-        }
-        if (callback != nullptr) {
-            callback();
-        }
+        terminal_ = true;
+        terminalCallbackDelivered_ = true;
+        channelSubscription_.reset();
     }
 }
 
@@ -265,23 +265,11 @@ nixlTerminalEventSubscriptionH::nixlTerminalEventSubscriptionH(
 
 void
 nixlTerminalEventSubscriptionH::markTerminal() noexcept {
-    std::shared_ptr<nixlTerminalTransferAdapter> transfer_adapter;
-    std::shared_ptr<nixlTerminalCapabilityAdapter> capability_adapter;
-    {
-        const std::lock_guard lock(mutex_);
-        if (!info_.active) {
-            return;
-        }
-        info_.active = false;
-        transfer_adapter = transferAdapter_;
-        capability_adapter = capabilityAdapter_;
+    const std::lock_guard lock(mutex_);
+    if (!info_.active) {
+        return;
     }
-    if (transfer_adapter != nullptr) {
-        transfer_adapter->release();
-    }
-    if (capability_adapter != nullptr) {
-        capability_adapter->release();
-    }
+    info_.active = false;
 }
 
 nixl_status_t
@@ -315,6 +303,7 @@ nixlTerminalEventSubscriptionH::requestCancellation() noexcept {
 
     if (kind == nixl_terminal_event_kind_t::CAPABILITY && status == NIXL_SUCCESS) {
         markTerminal();
+        capabilityAdapter_->release();
     }
     {
         const std::lock_guard lock(mutex_);
