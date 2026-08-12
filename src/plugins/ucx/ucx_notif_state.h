@@ -17,10 +17,13 @@
 #ifndef NIXL_SRC_PLUGINS_UCX_UCX_NOTIF_STATE_H
 #define NIXL_SRC_PLUGINS_UCX_UCX_NOTIF_STATE_H
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -307,6 +310,43 @@ private:
         routeSubscriptions_;
     std::unordered_map<peer_key_t, notif_route_key_t, peer_hash_t> activePeers_;
     std::unordered_map<notif_wire_uuid_t, notif_route_key_t, uuid_hash_t> localCapabilities_;
+};
+
+struct notif_exact_route_record_t {
+    notif_route_key_t route;
+    std::string remoteAgent;
+    std::uint64_t connectionIdentity = 0;
+};
+
+/**
+ * Serializes exact-route binding against asynchronous endpoint failure.
+ */
+class notif_endpoint_failure_state_t final {
+public:
+    explicit notif_endpoint_failure_state_t(
+        std::shared_ptr<notif_capability_state_t> notification_state);
+
+    notif_endpoint_failure_state_t(const notif_endpoint_failure_state_t &) = delete;
+    notif_endpoint_failure_state_t &
+    operator=(const notif_endpoint_failure_state_t &) = delete;
+
+    [[nodiscard]] notif_state_status_t
+    bindRemoteAgent(const notif_exact_route_record_t &record,
+                    const notif_remote_binding_t &binding,
+                    const std::atomic<bool> &endpoint_failure_observed,
+                    notif_route_snapshot_t &snapshot);
+
+    [[nodiscard]] std::optional<notif_exact_route_record_t>
+    getExactRoute(std::uint64_t handle_identity,
+                  std::uint64_t generation) const;
+
+    [[nodiscard]] notif_state_status_t
+    failRemoteConnection(std::uint64_t connection_identity) noexcept;
+
+private:
+    const std::shared_ptr<notif_capability_state_t> notificationState_;
+    mutable std::mutex mutex_;
+    std::unordered_map<std::uint64_t, notif_exact_route_record_t> exactRoutes_;
 };
 
 } // namespace nixl::ucx

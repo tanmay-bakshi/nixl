@@ -31,13 +31,36 @@ ucx_worker_continuation_queue_t::ucx_worker_continuation_queue_t(
 
 nixl_status_t
 ucx_worker_continuation_queue_t::enqueue(continuation_t continuation) {
+    return enqueueImpl(std::move(continuation), false);
+}
+
+nixl_status_t
+ucx_worker_continuation_queue_t::enqueueProducer(continuation_t continuation) {
+    return enqueueImpl(std::move(continuation), true);
+}
+
+nixl_status_t
+ucx_worker_continuation_queue_t::enqueueImpl(continuation_t continuation,
+                                             bool lifecycle_counted) {
     if (!continuation) {
         return NIXL_ERR_INVALID_PARAM;
+    }
+    if (lifecycle_counted) {
+        continuation = [this, continuation = std::move(continuation)]() mutable noexcept {
+            const nixl_status_t continuation_status = continuation();
+            const nixl_status_t retire_status = retireProducer();
+            return continuation_status != NIXL_SUCCESS ?
+                continuation_status :
+                retire_status;
+        };
     }
     {
         const std::lock_guard lock(mutex_);
         if (closed_) {
             return fatalStatus_ != NIXL_SUCCESS ? fatalStatus_ : NIXL_ERR_NOT_ALLOWED;
+        }
+        if (lifecycle_counted) {
+            ++registeredProducers_;
         }
         if (fatalStatus_ != NIXL_SUCCESS || queue_.size() == capacity_) {
             (void)failLocked(NIXL_ERR_BACKEND);
