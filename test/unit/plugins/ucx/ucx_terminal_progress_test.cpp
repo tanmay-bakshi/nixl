@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -181,16 +182,13 @@ testNotificationAfterFlush() {
     flush_slot->recordCallback(flush_request, NIXL_SUCCESS, 40);
     require(flush_slot->armPoster(flush_request, NIXL_IN_PROG, 41) == NIXL_SUCCESS,
             "flush poster handshake failed");
-    require(queue->drain() == 1, "flush continuation was not isolated");
-    require(order == std::vector<std::string>({"flush-release", "notification-post"}),
-            "notification was not posted after flush completion on the owner");
-    require(sink->results.empty() && queue->size() == 1,
-            "notification post incorrectly implied terminality");
-    require(queue->drain() == 1, "notification continuation was not delivered");
+    require(queue->drain() == 2,
+            "owner drain did not reach quiescence after notification posting");
     require(order == std::vector<std::string>(
                          {"flush-release", "notification-post", "notification-release"}),
             "notification completion ordering changed");
-    require(sink->results.size() == 1 && sink->results[0].status == NIXL_SUCCESS,
+    require(queue->size() == 0 && sink->results.size() == 1 &&
+                sink->results[0].status == NIXL_SUCCESS,
             "notification completion did not seal terminal success");
     require(wake_count == 2, "each owner continuation did not wake its worker");
 }
@@ -372,6 +370,36 @@ testCompositeFolding() {
 }
 
 void
+testFailedSlotAllocationCanUndoOnlyUnpostedRegistration() {
+    auto sink = std::make_shared<recording_sink_t>();
+    auto state = std::make_shared<terminal_submission_state_t>(
+        22, 112, 18, 1, 1, false, sink);
+    require(state->registerChunk() == NIXL_SUCCESS &&
+                state->registerChunk() == NIXL_SUCCESS,
+            "slot rollback chunk registration failed");
+    require(state->completeChunk(NIXL_SUCCESS, 120) == NIXL_SUCCESS,
+            "slot rollback completed chunk failed");
+    require(state->unregisterChunk() == NIXL_SUCCESS,
+            "unposted chunk registration could not be rolled back");
+    require(state->unregisterChunk() == NIXL_ERR_NOT_ALLOWED,
+            "slot rollback removed a completed chunk registration");
+
+    require(state->registerFlush() == NIXL_SUCCESS &&
+                state->registerFlush() == NIXL_SUCCESS,
+            "slot rollback flush registration failed");
+    require(state->completeFlush(NIXL_SUCCESS, 121) == NIXL_SUCCESS,
+            "slot rollback completed flush failed");
+    require(state->unregisterFlush() == NIXL_SUCCESS,
+            "unposted flush registration could not be rolled back");
+    require(state->unregisterFlush() == NIXL_ERR_NOT_ALLOWED,
+            "slot rollback removed a completed flush registration");
+    require(state->sealPosting({}, 122) == NIXL_SUCCESS &&
+                sink->results.size() == 1 &&
+                sink->results[0].status == NIXL_SUCCESS,
+            "slot rollback changed the surviving submission terminality");
+}
+
+void
 testContinuationOverflowAndShutdown() {
     std::size_t wake_count = 0;
     auto queue = makeQueue(1, wake_count);
@@ -400,6 +428,30 @@ testContinuationOverflowAndShutdown() {
             "closed continuation queue accepted new work");
     require(shutdown_queue->drain() == 1,
             "shutdown drain lost an admitted continuation");
+}
+
+void
+testOwnerEnqueueDrainsToQuiescenceWithoutReentrantWake() {
+    std::size_t wake_count = 0;
+    auto queue = makeQueue(8, wake_count);
+    require(queue->bindOwnerThread(std::this_thread::get_id()) == NIXL_SUCCESS,
+            "continuation owner binding failed");
+
+    std::vector<int> order;
+    require(queue->enqueue([&]() {
+                order.push_back(1);
+                return queue->enqueue([&]() {
+                    order.push_back(2);
+                    return NIXL_SUCCESS;
+                });
+            }) == NIXL_SUCCESS,
+            "owner continuation enqueue failed");
+    require(wake_count == 0,
+            "owner-thread enqueue re-entered UCX worker signalling");
+    require(queue->drain() == 2 && order == std::vector<int>({1, 2}),
+            "owner drain stranded a continuation scheduled by its predecessor");
+    require(queue->size() == 0 && queue->fatalStatus() == NIXL_SUCCESS,
+            "quiescent owner drain left native work or a fatal state");
 }
 
 void
@@ -488,6 +540,31 @@ testNoProgressOwnerIsUnsupported() {
             "claimed progress owner could not allocate a stable callback slot");
 }
 
+void
+testCallbackSlotAllocationFailureDoesNotRegisterProducer() {
+    nixlUcxContext context({},
+                           false,
+                           1,
+                           nixl_thread_sync_t::NIXL_THREAD_SYNC_STRICT,
+                           0,
+                           "TLS=self");
+    nixlUcxWorker worker(context);
+    require(worker.claimProgressOwner() == NIXL_SUCCESS,
+            "progress owner claim failed for allocation fault test");
+    auto sink = std::make_shared<recording_sink_t>();
+    auto state = std::make_shared<terminal_submission_state_t>(
+        21, 111, 17, 1, 1, false, sink);
+    std::shared_ptr<ucx_callback_slot_t> slot;
+    worker.failNextTerminalCallbackSlotForTest();
+    require(worker.makeTerminalCallbackSlot(
+                state, ucx_callback_kind_t::DATA_CHUNK, slot) == NIXL_ERR_BACKEND,
+            "injected callback-slot allocation failure was not returned");
+    require(slot == nullptr && worker.activeTerminalCallbackCount() == 0 &&
+                worker.getContinuationQueue()->producerCount() == 0 &&
+                worker.terminalLifecycleDrained(),
+            "callback-slot allocation failure leaked native ownership");
+}
+
 } // namespace
 
 int
@@ -500,9 +577,12 @@ main() {
         testCancellationAndFailure();
         testNotificationFailure();
         testCompositeFolding();
+        testFailedSlotAllocationCanUndoOnlyUnpostedRegistration();
         testContinuationOverflowAndShutdown();
+        testOwnerEnqueueDrainsToQuiescenceWithoutReentrantWake();
         testOverflowDrainsCallbackOwnership();
         testNoProgressOwnerIsUnsupported();
+        testCallbackSlotAllocationFailureDoesNotRegisterProducer();
     }
     catch (const std::exception &error) {
         std::cerr << "ucx terminal progress test failed: " << error.what() << '\n';

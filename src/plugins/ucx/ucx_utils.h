@@ -324,6 +324,11 @@ public:
         nixl::ucx::ucx_callback_slot_t::owner_after_completion_t
             owner_after_completion = {});
 
+    void
+    failNextTerminalCallbackSlotForTest() noexcept {
+        failNextTerminalCallbackSlot_.store(true, std::memory_order_release);
+    }
+
     /* GPU signal management */
     void
     prepGpuSignal(const nixlUcxMem &mem, void *signal) const;
@@ -349,6 +354,7 @@ private:
     bool hasProgressOwner_ = false;
     std::thread::id progressOwnerThread_;
     std::atomic<std::size_t> activeTerminalCallbacks_{0};
+    std::atomic<bool> failNextTerminalCallbackSlot_{false};
     static constexpr std::size_t maxPendingContinuations = 65536;
 };
 

@@ -25,6 +25,7 @@
 #include <limits>
 #include <future>
 #include <set>
+#include <new>
 #include <string.h>
 #include <unistd.h>
 #include "absl/strings/numbers.h"
@@ -219,6 +220,11 @@ nixlUcxNotificationQueue::poison() {
 class nixlUcxTerminalArm final :
     public nixl::ucx::terminal_submission_sink_t,
     public std::enable_shared_from_this<nixlUcxTerminalArm> {
+    struct slot_record_t {
+        nixlUcxWorker *worker = nullptr;
+        std::shared_ptr<nixl::ucx::ucx_callback_slot_t> slot;
+    };
+
 public:
     nixlUcxTerminalArm(
         nixlBackendTransferEventBinding binding,
@@ -254,15 +260,18 @@ public:
         nixl::ucx::ucx_callback_kind_t kind,
         nixl::ucx::ucx_callback_slot_t::owner_before_completion_t before,
         std::shared_ptr<nixl::ucx::ucx_callback_slot_t> &slot) {
-        std::shared_ptr<nixl::ucx::terminal_submission_state_t> state;
-        {
-            const std::lock_guard lock(mutex_);
-            if (terminal_ || publishing_ || state_ == nullptr || worker == nullptr ||
-                !worker->hasProgressOwner()) {
-                return NIXL_ERR_NOT_ALLOWED;
-            }
-            state = state_;
+        const std::lock_guard lock(mutex_);
+        if (terminal_ || publishing_ || state_ == nullptr || worker == nullptr ||
+            !worker->hasProgressOwner()) {
+            return NIXL_ERR_NOT_ALLOWED;
         }
+        try {
+            slots_.reserve(slots_.size() + 1);
+        }
+        catch (const std::bad_alloc &) {
+            return NIXL_ERR_BACKEND;
+        }
+        const std::shared_ptr<nixl::ucx::terminal_submission_state_t> state = state_;
         const nixl_status_t register_status =
             kind == nixl::ucx::ucx_callback_kind_t::DATA_CHUNK ?
             state->registerChunk() :
@@ -285,13 +294,26 @@ public:
                 }
             });
         if (slot_status != NIXL_SUCCESS) {
+            const nixl_status_t unregister_status =
+                kind == nixl::ucx::ucx_callback_kind_t::DATA_CHUNK ?
+                state->unregisterChunk() :
+                (kind == nixl::ucx::ucx_callback_kind_t::ENDPOINT_FLUSH ?
+                     state->unregisterFlush() : NIXL_SUCCESS);
+            if (unregister_status != NIXL_SUCCESS) {
+                return NIXL_ERR_BACKEND;
+            }
             return slot_status;
         }
-        {
-            const std::lock_guard lock(mutex_);
-            slots_.push_back({worker, slot});
-            ++activeSlots_;
+        if (slot == nullptr) {
+            const nixl_status_t unregister_status =
+                kind == nixl::ucx::ucx_callback_kind_t::DATA_CHUNK ?
+                state->unregisterChunk() :
+                (kind == nixl::ucx::ucx_callback_kind_t::ENDPOINT_FLUSH ?
+                     state->unregisterFlush() : NIXL_SUCCESS);
+            return unregister_status == NIXL_SUCCESS ? NIXL_ERR_BACKEND : unregister_status;
         }
+        slots_.push_back({worker, slot});
+        ++activeSlots_;
         return NIXL_SUCCESS;
     }
 
@@ -444,11 +466,6 @@ public:
     }
 
 private:
-    struct slot_record_t {
-        nixlUcxWorker *worker = nullptr;
-        std::shared_ptr<nixl::ucx::ucx_callback_slot_t> slot;
-    };
-
     [[nodiscard]] nixl_status_t
     finalizeTerminal(nixl::ucx::terminal_submission_result_t completed) noexcept {
         completed.diagnostics.activeCallbackSlotsAtTerminal = 0;
@@ -923,6 +940,16 @@ public:
         return false;
     }
 
+    [[nodiscard]] nixl_status_t
+    clearAutonomousPostingState() {
+        if (!requests_.empty() || notif.has_value()) {
+            return NIXL_ERR_REPOST_ACTIVE;
+        }
+        connections_.clear();
+        setActiveTerminal(nullptr);
+        return NIXL_SUCCESS;
+    }
+
     virtual void
     release() {
         const bool has_transport_request =
@@ -1326,12 +1353,17 @@ struct nixlUcxBackendSharedState {
 void
 nixlUcxChunkBackendReqH::complete(const nixl_status_t status) {
     NIXL_ASSERT(sharedState_.get() != nullptr);
-    if (status != NIXL_SUCCESS) {
+    nixl_status_t completion_status = status;
+    if (completion_status == NIXL_SUCCESS && hasAutonomousTerminal()) {
+        completion_status = clearAutonomousPostingState();
+    }
+    if (completion_status != NIXL_SUCCESS) {
         nixlUcxBackendReqH::release();
-        sharedState_->status.store(status);
+        sharedState_->status.store(completion_status);
     }
     sharedState_->pendingReqs.fetch_sub(1);
-    NIXL_TRACE << *this << " completed with status: " << status << ", " << *sharedState_;
+    NIXL_TRACE << *this << " completed with status: " << completion_status << ", "
+               << *sharedState_;
     setWorker(nullptr, UINT64_MAX);
     sharedState_.reset();
 }

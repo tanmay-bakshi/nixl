@@ -22,6 +22,7 @@
 #include <cstring>
 #include <exception>
 #include <limits>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -918,8 +919,13 @@ nixlUcxWorker::claimProgressOwner() noexcept {
     if (hasProgressOwner_) {
         return NIXL_ERR_NOT_ALLOWED;
     }
+    const std::thread::id owner_thread = std::this_thread::get_id();
+    const nixl_status_t bind_status = continuations_->bindOwnerThread(owner_thread);
+    if (bind_status != NIXL_SUCCESS) {
+        return bind_status;
+    }
     hasProgressOwner_ = true;
-    progressOwnerThread_ = std::this_thread::get_id();
+    progressOwnerThread_ = owner_thread;
     return NIXL_SUCCESS;
 }
 
@@ -970,29 +976,38 @@ nixlUcxWorker::makeTerminalCallbackSlot(
     if (state == nullptr || slot != nullptr) {
         return NIXL_ERR_INVALID_PARAM;
     }
+    if (failNextTerminalCallbackSlot_.exchange(false, std::memory_order_acq_rel)) {
+        return NIXL_ERR_BACKEND;
+    }
+    try {
+        slot = nixl::ucx::ucx_callback_slot_t::create(
+            std::move(state),
+            kind,
+            continuations_,
+            [this](void *request) { reqRelease(request); },
+            std::move(owner_before_completion),
+            [this, owner_after_completion = std::move(owner_after_completion)]() {
+                const nixl_status_t retire_status = continuations_->retireProducer();
+                const std::size_t previous =
+                    activeTerminalCallbacks_.fetch_sub(1, std::memory_order_acq_rel);
+                if (previous == 0 ||
+                    (retire_status != NIXL_SUCCESS &&
+                     retire_status != continuations_->fatalStatus())) {
+                    (void)continuations_->fail(NIXL_ERR_BACKEND);
+                }
+                if (owner_after_completion) {
+                    owner_after_completion();
+                }
+            });
+    }
+    catch (const std::bad_alloc &) {
+        return NIXL_ERR_BACKEND;
+    }
     const nixl_status_t producer_status = continuations_->registerProducer();
     if (producer_status != NIXL_SUCCESS) {
+        slot.reset();
         return producer_status;
     }
     activeTerminalCallbacks_.fetch_add(1, std::memory_order_release);
-    slot = nixl::ucx::ucx_callback_slot_t::create(
-        std::move(state),
-        kind,
-        continuations_,
-        [this](void *request) { reqRelease(request); },
-        std::move(owner_before_completion),
-        [this, owner_after_completion = std::move(owner_after_completion)]() {
-            const nixl_status_t retire_status = continuations_->retireProducer();
-            const std::size_t previous =
-                activeTerminalCallbacks_.fetch_sub(1, std::memory_order_acq_rel);
-            if (previous == 0 ||
-                (retire_status != NIXL_SUCCESS &&
-                 retire_status != continuations_->fatalStatus())) {
-                (void)continuations_->fail(NIXL_ERR_BACKEND);
-            }
-            if (owner_after_completion) {
-                owner_after_completion();
-            }
-        });
     return NIXL_SUCCESS;
 }
