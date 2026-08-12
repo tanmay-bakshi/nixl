@@ -1,0 +1,62 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+#ifndef NIXL_TEST_QUALIFICATION_TERMINAL_UCX_API_ADAPTER_H
+#define NIXL_TEST_QUALIFICATION_TERMINAL_UCX_API_ADAPTER_H
+
+#include <cstddef>
+#include <cstdint>
+
+#include "nixl.h"
+
+namespace nixl::qualification {
+
+struct terminal_channel_inventory_t {
+    std::size_t activeSubscriptions = 0;
+    std::size_t activeProducers = 0;
+    std::size_t queuedEvents = 0;
+    bool closed = false;
+    std::uint32_t fatal = 0;
+};
+
+/**
+ * Isolated qualification seam around the concurrently landing public API.
+ *
+ * The executable uses public agent calls for transfers, subscriptions, and
+ * attestation. Only producer inventory is temporarily isolated here because
+ * the backend lifecycle counter is landing with the callback implementation.
+ */
+class terminal_ucx_api_adapter_t final {
+public:
+    terminal_ucx_api_adapter_t(nixlAgent &agent, std::size_t capacity);
+
+    terminal_ucx_api_adapter_t(const terminal_ucx_api_adapter_t &) = delete;
+    terminal_ucx_api_adapter_t &
+    operator=(const terminal_ucx_api_adapter_t &) = delete;
+
+    [[nodiscard]] nixl_status_t
+    subscribeTransfer(nixlXferReqH *request,
+                      std::uint64_t owner_cookie,
+                      nixlTerminalEventSubscriptionH *&subscription);
+
+    [[nodiscard]] nixl_status_t
+    drain(nixl_terminal_event_batch_t &batch);
+
+    [[nodiscard]] nixl_status_t
+    release(nixlTerminalEventSubscriptionH *subscription);
+
+    [[nodiscard]] nixl_status_t
+    queryInventory(terminal_channel_inventory_t &inventory);
+
+    [[nodiscard]] nixl_status_t
+    close();
+
+private:
+    nixlAgent &agent_;
+    nixlTerminalEventChannelH *channel_ = nullptr;
+};
+
+} // namespace nixl::qualification
+
+#endif // NIXL_TEST_QUALIFICATION_TERMINAL_UCX_API_ADAPTER_H
