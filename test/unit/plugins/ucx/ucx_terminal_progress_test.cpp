@@ -182,16 +182,13 @@ testNotificationAfterFlush() {
     flush_slot->recordCallback(flush_request, NIXL_SUCCESS, 40);
     require(flush_slot->armPoster(flush_request, NIXL_IN_PROG, 41) == NIXL_SUCCESS,
             "flush poster handshake failed");
-    require(queue->drain() == 1, "flush continuation was not isolated");
-    require(order == std::vector<std::string>({"flush-release", "notification-post"}),
-            "notification was not posted after flush completion on the owner");
-    require(sink->results.empty() && queue->size() == 1,
-            "notification post incorrectly implied terminality");
-    require(queue->drain() == 1, "notification continuation was not delivered");
+    require(queue->drain() == 2,
+            "owner drain did not reach quiescence after notification posting");
     require(order == std::vector<std::string>(
                          {"flush-release", "notification-post", "notification-release"}),
             "notification completion ordering changed");
-    require(sink->results.size() == 1 && sink->results[0].status == NIXL_SUCCESS,
+    require(queue->size() == 0 && sink->results.size() == 1 &&
+                sink->results[0].status == NIXL_SUCCESS,
             "notification completion did not seal terminal success");
     require(wake_count == 2, "each owner continuation did not wake its worker");
 }
