@@ -55,6 +55,8 @@ namespace {
         REMOTE_METADATA_LOADED = 3,
         SHUTDOWN = 4,
         ERROR = 5,
+        ARM_STOP_AFTER_WRITE = 6,
+        STOP_WATCH_ARMED = 7,
     };
 
     class peer_fixture_error final : public std::runtime_error {
@@ -203,6 +205,30 @@ namespace {
         };
     }
 
+    [[nodiscard]] std::string
+    encodeStopWatch(std::size_t offset, std::uint8_t expected) {
+        const std::array<std::uint64_t, 2> values = {
+            static_cast<std::uint64_t>(offset),
+            static_cast<std::uint64_t>(expected),
+        };
+        return std::string(reinterpret_cast<const char *>(values.data()), sizeof(values));
+    }
+
+    [[nodiscard]] std::pair<std::size_t, std::uint8_t>
+    decodeStopWatch(std::string_view payload) {
+        require(payload.size() == sizeof(std::uint64_t) * 2,
+                "peer stop-watch frame has an invalid length");
+        std::array<std::uint64_t, 2> values = {};
+        std::memcpy(values.data(), payload.data(), payload.size());
+        require(values[0] <= std::numeric_limits<std::size_t>::max() &&
+                    values[1] <= std::numeric_limits<std::uint8_t>::max(),
+                "peer stop-watch frame is invalid");
+        return {
+            static_cast<std::size_t>(values[0]),
+            static_cast<std::uint8_t>(values[1]),
+        };
+    }
+
     [[nodiscard]] nixlAgentConfig
     agentConfig() {
         nixlAgentConfig config;
@@ -269,6 +295,24 @@ namespace {
         [[nodiscard]] std::size_t
         capacity() const noexcept {
             return bytes_.size();
+        }
+
+        [[nodiscard]] std::uint8_t
+        byteAt(std::size_t offset) const {
+            require(offset < bytes_.size(), "peer DRAM byte offset is out of range");
+            return bytes_[offset];
+        }
+
+        void
+        stopProcessAfterByte(std::size_t offset, std::uint8_t expected) const {
+            require(offset < bytes_.size(), "peer stop-watch offset is out of range");
+            const volatile std::uint8_t *const observed = bytes_.data() + offset;
+            while (*observed != expected) {
+                std::this_thread::yield();
+            }
+            if (::raise(SIGSTOP) != 0) {
+                throw peer_fixture_error("peer worker failed to stop at the data boundary");
+            }
         }
 
         [[nodiscard]] nixl_xfer_dlist_t
@@ -368,6 +412,28 @@ namespace {
             static_cast<void>(expect(frame_kind_t::REMOTE_METADATA_LOADED));
         }
 
+        void
+        armStopAfterWrite(std::size_t offset, std::uint8_t expected) {
+            require(!stopped_, "peer worker is already stopped");
+            sendFrame(socket_, frame_kind_t::ARM_STOP_AFTER_WRITE, encodeStopWatch(offset, expected));
+            static_cast<void>(expect(frame_kind_t::STOP_WATCH_ARMED));
+        }
+
+        void
+        waitUntilStopped() {
+            require(pid_ > 0 && !waited_ && !stopped_, "peer worker cannot enter stop boundary");
+            int status = 0;
+            while (::waitpid(pid_, &status, WUNTRACED) < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                throw peer_fixture_error("failed to observe stopped TCP peer worker");
+            }
+            require(WIFSTOPPED(status) && WSTOPSIG(status) == SIGSTOP,
+                    "TCP peer did not stop at the data boundary");
+            stopped_ = true;
+        }
+
         [[nodiscard]] bool
         killAndWait() {
             require(pid_ > 0 && !waited_, "peer worker is not live");
@@ -382,6 +448,7 @@ namespace {
                 throw peer_fixture_error("failed to reap TCP peer worker");
             }
             waited_ = true;
+            stopped_ = false;
             static_cast<void>(::close(socket_));
             socket_ = -1;
             return WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL;
@@ -413,6 +480,7 @@ namespace {
         pid_t pid_ = -1;
         int socket_ = -1;
         bool waited_ = false;
+        bool stopped_ = false;
         peer_hello_t hello_;
     };
 
@@ -660,8 +728,14 @@ namespace {
         sendFrame(fd, frame_kind_t::REMOTE_METADATA_LOADED);
 
         frame = receiveFrame(fd);
-        require(frame.kind == frame_kind_t::SHUTDOWN,
-                "peer worker received an invalid terminal command");
+        if (frame.kind == frame_kind_t::ARM_STOP_AFTER_WRITE) {
+            const auto [offset, expected] = decodeStopWatch(frame.payload);
+            require(offset < memory.capacity(), "peer stop-watch exceeds registered DRAM");
+            sendFrame(fd, frame_kind_t::STOP_WATCH_ARMED);
+            memory.stopProcessAfterByte(offset, expected);
+            throw peer_fixture_error("peer stop-watch resumed without termination");
+        }
+        require(frame.kind == frame_kind_t::SHUTDOWN, "peer worker received an invalid command");
         requireStatus(
             agent.invalidateRemoteMD(remote), NIXL_SUCCESS, "retire peer worker source handle");
         return EXIT_SUCCESS;
@@ -822,8 +896,11 @@ runTcpNotificationFailureFixture(const std::string &engine) {
     require(transfer_info.active && transfer_info.identity == prepared_attestation.handleIdentity &&
                 transfer_info.generation == prepared_attestation.generation,
             "notification-failure subscription changed transfer generation");
+    const std::size_t terminal_byte_offset = notification_failure_bytes - 1;
+    peer.armStopAfterWrite(terminal_byte_offset, source.memory->byteAt(terminal_byte_offset));
     const nixl_status_t post_status = source.agent.postXferReq(request);
     require(post_status == NIXL_IN_PROG, "notification-failure transfer completed during post");
+    peer.waitUntilStopped();
 
     const std::uint64_t deadline =
         monotonicRawNs() + static_cast<std::uint64_t>(event_timeout_ms) * 1000000ULL;
@@ -840,6 +917,12 @@ runTcpNotificationFailureFixture(const std::string &engine) {
         std::this_thread::yield();
     }
     require(remote_flushed, "notification-failure transfer never exposed remote flush");
+    nixl_terminal_subscription_info_t pre_failure_info;
+    requireStatus(adapter.querySubscription(transfer_subscription, pre_failure_info),
+                  NIXL_SUCCESS,
+                  "query notification transfer at the stopped-peer boundary");
+    require(pre_failure_info.active,
+            "notification completed before the stopped-peer failure boundary");
     const bool peer_exited_by_signal = peer.killAndWait();
     require(peer_exited_by_signal, "TCP notification peer did not exit by SIGKILL");
     const observed_event_t transfer =
