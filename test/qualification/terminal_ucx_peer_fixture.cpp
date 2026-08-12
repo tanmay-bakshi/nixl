@@ -55,8 +55,6 @@ namespace {
         REMOTE_METADATA_LOADED = 3,
         SHUTDOWN = 4,
         ERROR = 5,
-        ARM_EXIT_AFTER_WRITE = 6,
-        EXIT_WATCH_ARMED = 7,
     };
 
     class peer_fixture_error final : public std::runtime_error {
@@ -205,30 +203,6 @@ namespace {
         };
     }
 
-    [[nodiscard]] std::string
-    encodeExitWatch(std::size_t offset, std::uint8_t expected) {
-        const std::array<std::uint64_t, 2> values = {
-            static_cast<std::uint64_t>(offset),
-            static_cast<std::uint64_t>(expected),
-        };
-        return std::string(reinterpret_cast<const char *>(values.data()), sizeof(values));
-    }
-
-    [[nodiscard]] std::pair<std::size_t, std::uint8_t>
-    decodeExitWatch(std::string_view payload) {
-        require(payload.size() == sizeof(std::uint64_t) * 2,
-                "peer exit-watch frame has an invalid length");
-        std::array<std::uint64_t, 2> values = {};
-        std::memcpy(values.data(), payload.data(), payload.size());
-        require(values[0] <= std::numeric_limits<std::size_t>::max() &&
-                    values[1] <= std::numeric_limits<std::uint8_t>::max(),
-                "peer exit-watch frame is invalid");
-        return {
-            static_cast<std::size_t>(values[0]),
-            static_cast<std::uint8_t>(values[1]),
-        };
-    }
-
     [[nodiscard]] nixlAgentConfig
     agentConfig() {
         nixlAgentConfig config;
@@ -295,21 +269,6 @@ namespace {
         [[nodiscard]] std::size_t
         capacity() const noexcept {
             return bytes_.size();
-        }
-
-        [[nodiscard]] std::uint8_t
-        byteAt(std::size_t offset) const {
-            require(offset < bytes_.size(), "peer DRAM byte offset is out of range");
-            return bytes_[offset];
-        }
-
-        void
-        waitForByte(std::size_t offset, std::uint8_t expected) const {
-            require(offset < bytes_.size(), "peer exit-watch offset is out of range");
-            const volatile std::uint8_t *const observed = bytes_.data() + offset;
-            while (*observed != expected) {
-                std::this_thread::yield();
-            }
         }
 
         [[nodiscard]] nixl_xfer_dlist_t
@@ -410,25 +369,21 @@ namespace {
         }
 
         void
-        armExitAfterWrite(std::size_t offset, std::uint8_t expected) {
-            sendFrame(socket_, frame_kind_t::ARM_EXIT_AFTER_WRITE, encodeExitWatch(offset, expected));
-            static_cast<void>(expect(frame_kind_t::EXIT_WATCH_ARMED));
-        }
-
-        [[nodiscard]] bool
-        waitForExitSignal(int expected_signal) {
-            require(pid_ > 0 && !waited_, "peer worker is not live");
+        stopAndWait() {
+            require(pid_ > 0 && !waited_ && !stopped_, "peer worker cannot be stopped");
+            if (::kill(pid_, SIGSTOP) != 0) {
+                throw peer_fixture_error("failed to stop TCP peer worker");
+            }
             int status = 0;
-            while (::waitpid(pid_, &status, 0) < 0) {
+            while (::waitpid(pid_, &status, WUNTRACED) < 0) {
                 if (errno == EINTR) {
                     continue;
                 }
-                throw peer_fixture_error("failed to reap self-terminated TCP peer worker");
+                throw peer_fixture_error("failed to observe stopped TCP peer worker");
             }
-            waited_ = true;
-            static_cast<void>(::close(socket_));
-            socket_ = -1;
-            return WIFSIGNALED(status) && WTERMSIG(status) == expected_signal;
+            require(WIFSTOPPED(status) && WSTOPSIG(status) == SIGSTOP,
+                    "TCP peer did not stop at the remote-flush boundary");
+            stopped_ = true;
         }
 
         [[nodiscard]] bool
@@ -445,6 +400,7 @@ namespace {
                 throw peer_fixture_error("failed to reap TCP peer worker");
             }
             waited_ = true;
+            stopped_ = false;
             static_cast<void>(::close(socket_));
             socket_ = -1;
             return WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL;
@@ -476,6 +432,7 @@ namespace {
         pid_t pid_ = -1;
         int socket_ = -1;
         bool waited_ = false;
+        bool stopped_ = false;
         peer_hello_t hello_;
     };
 
@@ -667,6 +624,35 @@ namespace {
         return remote;
     }
 
+    [[nodiscard]] bool
+    attestationIsRemoteFlushed(const nixl_xfer_attestation_t &attestation) {
+        return attestation.state == nixl_xfer_attestation_state_t::REMOTE_FLUSHED &&
+            !attestation.endpoints.empty() &&
+            std::all_of(attestation.endpoints.begin(),
+                        attestation.endpoints.end(),
+                        [](const auto &endpoint) { return endpoint.remoteFlushed; });
+    }
+
+    void
+    stopPeerAtRemoteFlush(source_fixture_t &source, nixlXferReqH *request, peer_process_t &peer) {
+        const std::uint64_t deadline =
+            monotonicRawNs() + static_cast<std::uint64_t>(event_timeout_ms) * 1000000ULL;
+        while (monotonicRawNs() < deadline) {
+            nixl_xfer_attestation_t attestation;
+            requireStatus(source.agent.queryXferAttestation(request, attestation),
+                          NIXL_SUCCESS,
+                          "query notification remote-flush boundary");
+            if (attestationIsRemoteFlushed(attestation)) {
+                peer.stopAndWait();
+                return;
+            }
+            require(attestation.state != nixl_xfer_attestation_state_t::FAILED,
+                    "notification transfer failed before remote flush");
+            std::this_thread::yield();
+        }
+        throw peer_fixture_error("notification transfer never reached remote flush");
+    }
+
     [[nodiscard]] int
     parseWorkerFd(int argc, char **argv, std::string &engine) {
         int fd = -1;
@@ -714,19 +700,6 @@ namespace {
         sendFrame(fd, frame_kind_t::REMOTE_METADATA_LOADED);
 
         frame = receiveFrame(fd);
-        if (frame.kind == frame_kind_t::ARM_EXIT_AFTER_WRITE) {
-            const auto [offset, expected] = decodeExitWatch(frame.payload);
-            require(offset < memory.capacity(), "peer exit-watch exceeds registered DRAM");
-            sendFrame(fd, frame_kind_t::EXIT_WATCH_ARMED);
-            memory.waitForByte(offset, expected);
-            requireStatus(agent.invalidateRemoteMD(remote),
-                          NIXL_SUCCESS,
-                          "retire source route at data boundary");
-            if (::raise(SIGKILL) != 0) {
-                throw peer_fixture_error("peer worker failed to exit at the data boundary");
-            }
-            throw peer_fixture_error("peer exit-watch survived SIGKILL");
-        }
         require(frame.kind == frame_kind_t::SHUTDOWN, "peer worker received an invalid command");
         requireStatus(
             agent.invalidateRemoteMD(remote), NIXL_SUCCESS, "retire peer worker source handle");
@@ -888,11 +861,30 @@ runTcpNotificationFailureFixture(const std::string &engine) {
     require(transfer_info.active && transfer_info.identity == prepared_attestation.handleIdentity &&
                 transfer_info.generation == prepared_attestation.generation + 1,
             "notification-failure subscription changed transfer generation");
-    const std::size_t terminal_byte_offset = notification_failure_bytes - 1;
-    peer.armExitAfterWrite(terminal_byte_offset, source.memory->byteAt(terminal_byte_offset));
     const nixl_status_t post_status = source.agent.postXferReq(request);
     require(post_status == NIXL_IN_PROG, "notification-failure transfer completed during post");
-    const bool peer_exited_by_signal = peer.waitForExitSignal(SIGKILL);
+    stopPeerAtRemoteFlush(source, request, peer);
+    nixl_xfer_attestation_t pre_failure_attestation;
+    requireStatus(source.agent.queryXferAttestation(request, pre_failure_attestation),
+                  NIXL_SUCCESS,
+                  "query stopped-peer remote-flush boundary");
+    const bool data_remote_flushed = attestationIsRemoteFlushed(pre_failure_attestation);
+    require(data_remote_flushed,
+            "notification transfer lost remote-flush authority before failure");
+    nixl_terminal_subscription_info_t pre_failure_info;
+    requireStatus(adapter.querySubscription(transfer_subscription, pre_failure_info),
+                  NIXL_SUCCESS,
+                  "query notification subscription at remote-flush boundary");
+    require(pre_failure_info.active,
+            "notification completed before the remote-flush failure boundary");
+    terminal_channel_inventory_t pre_failure_inventory;
+    requireStatus(adapter.queryInventory(pre_failure_inventory),
+                  NIXL_SUCCESS,
+                  "query notification inventory at remote-flush boundary");
+    require(pre_failure_inventory.backendProducers == 1 &&
+                pre_failure_inventory.activeCallbackSlots > 0,
+            "notification failure boundary exposed no live native producer");
+    const bool peer_exited_by_signal = peer.killAndWait();
     require(peer_exited_by_signal, "TCP notification peer did not exit by SIGKILL");
     const observed_event_t transfer =
         inbox.take(nixl_terminal_event_kind_t::TRANSFER, transfer_cookie);
@@ -910,12 +902,11 @@ runTcpNotificationFailureFixture(const std::string &engine) {
     require(failed_attestation.state == nixl_xfer_attestation_state_t::FAILED &&
                 failed_attestation.status == NIXL_ERR_REMOTE_DISCONNECT,
             "notification failure did not seal failed attestation");
-    const bool data_remote_flushed = !failed_attestation.endpoints.empty() &&
-        std::all_of(failed_attestation.endpoints.begin(),
-                    failed_attestation.endpoints.end(),
-                    [](const auto &endpoint) { return endpoint.remoteFlushed; });
-    require(data_remote_flushed,
-            "notification failure occurred before every endpoint was remotely flushed");
+    require(!failed_attestation.endpoints.empty() &&
+                std::all_of(failed_attestation.endpoints.begin(),
+                            failed_attestation.endpoints.end(),
+                            [](const auto &endpoint) { return endpoint.remoteFlushed; }),
+            "notification failure discarded established remote-flush authority");
     nixl_terminal_subscription_info_t terminal_transfer_info;
     requireStatus(adapter.querySubscription(transfer_subscription, terminal_transfer_info),
                   NIXL_SUCCESS,
