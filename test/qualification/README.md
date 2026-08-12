@@ -9,21 +9,25 @@ contract:
 | `self` | unset | shared progress thread, thread pool/composite |
 | `tcp` | `lo` | shared progress thread, thread pool/composite |
 
-Each transport arm runs in a fresh process because UCX configuration is
+Each coordinate runs in a fresh process because UCX configuration is
 process-scoped. The runner sets `CUDA_VISIBLE_DEVICES=` and
 `NVIDIA_VISIBLE_DEVICES=void`, passes only `DRAM` descriptors, captures the
 NIXL/UCX revisions and executable digest, and traces device opens without
-calling CUDA, NVML, or `nvidia-smi`. The receipt records the observed transport
-from completion attestation rather than trusting the requested environment.
+calling CUDA, NVML, or `nvidia-smi`. The receipt records exact argv and relevant
+environment beside the transport observed from completion attestation, rather
+than trusting launch intent.
 
-The native executable must cover subscription-before-post, immediate and
-asynchronous completion populations, notification terminality, capability
-snapshot-after-ready and retirement, destination byte/SHA-256 verification,
-completion-attestation digest and take-once authority, explicit
-callback-before-return observations, loaded runtime paths/build IDs, exact
-argv/environment, and exact zero
-subscription/producer inventory at shutdown. `terminal_ucx_receipt.py`
-validates and seals the combined matrix.
+Every coordinate must cover separately registered source and destination
+memory over two exact endpoints, both immediate and asynchronous callback
+populations, subscription-before-post, notification-before-terminal ordering,
+destination byte/SHA-256 verification, completion-attestation digest and
+take-once authority, and callback/poster ordering counts. It must also bind
+capability READY, FAILED, RETIRED, and epoch transitions plus isolated transfer
+cancellation, remote failure, notification failure, queue overflow, and
+shutdown-cancellation cases. Coordinate and aggregate shutdown inventories must
+contain zero public subscriptions, backend producers, callback slots,
+continuations, and queued events. `terminal_ucx_receipt.py` rejects the
+predecessor schema and seals only this complete matrix.
 
 `terminal_ucx_api_adapter.*` is the only API seam. It exists so this checkpoint
 can compile while the terminal-agent and UCX callback branches converge; the
