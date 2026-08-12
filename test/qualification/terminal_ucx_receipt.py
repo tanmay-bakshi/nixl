@@ -608,11 +608,12 @@ def _validate_terminal_fault(fault: object, expected_status: str, context: str) 
     _require(fault.get("owner_woken") is True, f"{context} did not wake the owner")
 
 
-def _validate_faults(faults: object, transport: str) -> None:
+def _validate_faults(faults: object, transport: str, engine: str) -> None:
     """Validate transport-aware isolated failure coverage.
 
     :param faults: Failure-path evidence.
     :param transport: Coordinate transport.
+    :param engine: Coordinate progress engine.
     :raises ValueError: If a common fault or applicable remote fault is absent.
     """
     _require(isinstance(faults, dict), "failure-path evidence is missing")
@@ -688,10 +689,16 @@ def _validate_faults(faults: object, transport: str) -> None:
         notification_failure.get("source_progress_mode") == "production",
         "notification fixture did not retain the production source progress mode",
     )
+    expected_peer_engine = "thread_pool" if engine == "thread_pool" else "shared"
+    expected_shared_worker_quiescence = engine == "thread_pool"
     _require(
-        notification_failure.get("fault_peer_engine") == "thread_pool"
-        and notification_failure.get("fault_peer_shared_worker_quiesced") is True,
-        "notification fixture did not prove controlled fault-peer quiescence",
+        notification_failure.get("fault_peer_engine") == expected_peer_engine,
+        "notification fixture used the wrong fault-peer engine",
+    )
+    _require(
+        notification_failure.get("fault_peer_shared_worker_quiesced")
+        is expected_shared_worker_quiescence,
+        "notification fixture reported the wrong shared-worker quiescence mechanism",
     )
 
 
@@ -792,7 +799,7 @@ def _validate_case(case: object) -> tuple[str, str]:
             and attached_notification.get("success_count") == 2,
             "TCP attached-notification success coverage is incomplete",
         )
-    _validate_faults(case.get("faults"), str(transport))
+    _validate_faults(case.get("faults"), str(transport), str(engine))
     _validate_runtime_artifacts(case.get("runtime_artifacts"))
     _validate_zero_inventory(case.get("shutdown"), f"{transport}/{engine}")
     return str(transport), str(engine)

@@ -201,10 +201,11 @@ def _terminal_fault(status: str) -> dict[str, object]:
     }
 
 
-def _faults(transport: str) -> dict[str, object]:
+def _faults(transport: str, engine: str) -> dict[str, object]:
     """Build transport-aware failure-path evidence.
 
     :param transport: Self or TCP coordinate.
+    :param engine: Shared or thread-pool progress engine.
     :returns: Complete common and remote failure receipt.
     """
     cancellation = _terminal_fault("NIXL_ERR_CANCELED")
@@ -238,8 +239,12 @@ def _faults(transport: str) -> dict[str, object]:
     notification_failure["data_remote_flushed_before_failure"] = True
     notification_failure["notification_failed_after_remote_flush"] = True
     notification_failure["source_progress_mode"] = "production"
-    notification_failure["fault_peer_engine"] = "thread_pool"
-    notification_failure["fault_peer_shared_worker_quiesced"] = True
+    notification_failure["fault_peer_engine"] = (
+        "thread_pool" if engine == "thread_pool" else "shared"
+    )
+    notification_failure["fault_peer_shared_worker_quiesced"] = (
+        engine == "thread_pool"
+    )
     faults["notification_failure"] = notification_failure
     return faults
 
@@ -308,7 +313,7 @@ def _case(transport: str, engine: str, address_seed: int) -> dict[str, object]:
             if self_transport
             else {"applicability": "applicable", "success_count": 2}
         ),
-        "faults": _faults(transport),
+        "faults": _faults(transport, engine),
         "runtime_artifacts": [
             {
                 "component": "libnixl",
@@ -561,6 +566,46 @@ def test_validate_receipt_accepts_transport_aware_matrix() -> None:
                 "faults",
                 "notification_failure",
                 "notification_failed_after_remote_flush",
+            ),
+            False,
+        ),
+        (
+            (
+                "cases",
+                2,
+                "faults",
+                "notification_failure",
+                "fault_peer_engine",
+            ),
+            "thread_pool",
+        ),
+        (
+            (
+                "cases",
+                2,
+                "faults",
+                "notification_failure",
+                "fault_peer_shared_worker_quiesced",
+            ),
+            True,
+        ),
+        (
+            (
+                "cases",
+                3,
+                "faults",
+                "notification_failure",
+                "fault_peer_engine",
+            ),
+            "shared",
+        ),
+        (
+            (
+                "cases",
+                3,
+                "faults",
+                "notification_failure",
+                "fault_peer_shared_worker_quiesced",
             ),
             False,
         ),
