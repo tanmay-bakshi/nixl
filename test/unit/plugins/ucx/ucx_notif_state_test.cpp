@@ -15,10 +15,14 @@
  * limitations under the License.
  */
 
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <future>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -133,6 +137,47 @@ private:
     notif_route_key_t route_;
     std::vector<notif_route_transition_t> transitions_;
     bool reentrantQuerySucceeded_ = false;
+};
+
+class blocking_transition_sink_t final : public notif_route_transition_sink_t {
+public:
+    void
+    publish(const notif_route_transition_t &) noexcept override {
+        std::unique_lock lock(mutex_);
+        ++enteredCount_;
+        entered_.notify_all();
+        release_.wait(lock, [this] { return released_; });
+        ++completedCount_;
+    }
+
+    void
+    waitUntilEntered() {
+        std::unique_lock lock(mutex_);
+        const bool entered = entered_.wait_for(
+            lock, std::chrono::seconds(5), [this] { return enteredCount_ == 1; });
+        require(entered, "route transition callback did not enter");
+    }
+
+    void
+    release() {
+        const std::lock_guard lock(mutex_);
+        released_ = true;
+        release_.notify_all();
+    }
+
+    [[nodiscard]] std::size_t
+    completedCount() const {
+        const std::lock_guard lock(mutex_);
+        return completedCount_;
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::condition_variable entered_;
+    std::condition_variable release_;
+    std::size_t enteredCount_ = 0;
+    std::size_t completedCount_ = 0;
+    bool released_ = false;
 };
 
 void
@@ -579,6 +624,55 @@ testCapabilitySubscriptionSnapshotAndCancellation() {
             "unknown-route subscription did not fail without output mutation");
 }
 
+void
+testCapabilitySubscriptionCancellationDrainsInFlightDelivery() {
+    const notif_wire_uuid_t local_agent = makeUuid(201);
+    const notif_wire_uuid_t local_backend = makeUuid(202);
+    const notif_wire_uuid_t local_worker = makeUuid(203);
+    const notif_wire_uuid_t remote_agent = makeUuid(211);
+    const notif_wire_uuid_t remote_backend = makeUuid(212);
+    const notif_wire_uuid_t remote_worker = makeUuid(213);
+    notif_capability_state_t state(local_agent, local_backend, {local_worker});
+    const notif_route_key_t route = makeRoute(801, 4, remote_agent, remote_backend);
+    bind(state, makeBinding(route, 8001, {{remote_worker, 12001}}));
+
+    const auto sink = std::make_shared<blocking_transition_sink_t>();
+    notif_route_subscription_t subscription;
+    require(state.subscribeRemoteNotificationState(route, sink, subscription) ==
+                notif_route_subscription_status_t::SUCCESS,
+            "blocking subscription setup failed");
+
+    notif_wire_envelope_t local_offer;
+    require(state.makeOffer(route, local_worker, local_offer) == notif_state_status_t::SUCCESS,
+            "blocking subscription OFFER generation failed");
+    const notif_wire_envelope_t remote_offer =
+        makeInbound(local_offer, notif_wire_type_t::OFFER, remote_worker, makeUuid(214), 40);
+    auto publisher = std::async(std::launch::async, [&state, &remote_offer, local_worker] {
+        notif_offer_acceptance_t acceptance;
+        return state.acceptOffer(remote_offer, local_worker, acceptance);
+    });
+    sink->waitUntilEntered();
+
+    require(state.retireRemoteAgent(route) == notif_state_status_t::SUCCESS,
+            "retirement could not queue behind an active callback");
+    auto cancellation = std::async(std::launch::async, [&state, &subscription] {
+        return state.unsubscribeRemoteNotificationState(subscription);
+    });
+
+    const std::future_status blocked_status =
+        cancellation.wait_for(std::chrono::milliseconds(100));
+    sink->release();
+    require(publisher.get() == notif_state_status_t::SUCCESS,
+            "readiness publisher failed after callback release");
+    const notif_route_subscription_status_t cancellation_status = cancellation.get();
+    require(blocked_status == std::future_status::timeout,
+            "unsubscribe returned while a route callback remained in flight");
+    require(cancellation_status == notif_route_subscription_status_t::SUCCESS,
+            "in-flight subscription cancellation failed");
+    require(sink->completedCount() == 1,
+            "cancellation did not drain the active callback or cancel queued delivery");
+}
+
 } // namespace
 
 int
@@ -590,6 +684,7 @@ main() {
         testSiblingIsolationAndUnknownCapability();
         testCapabilitySubscriptionTransitions();
         testCapabilitySubscriptionSnapshotAndCancellation();
+        testCapabilitySubscriptionCancellationDrainsInFlightDelivery();
     }
     catch (const std::exception &error) {
         std::cerr << "ucx_notif_state_test failed: " << error.what() << '\n';

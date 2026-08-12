@@ -18,6 +18,7 @@
 #include "ucx_notif_state.h"
 
 #include <algorithm>
+#include <condition_variable>
 #include <ctime>
 #include <deque>
 #include <limits>
@@ -102,23 +103,34 @@ public:
                 transition = std::move(pending_.front());
                 pending_.pop_front();
                 sink = sink_;
+                ++callbacksInFlight_;
             }
             sink->publish(transition);
+            {
+                const std::lock_guard lock(mutex_);
+                --callbacksInFlight_;
+                if (callbacksInFlight_ == 0) {
+                    callbacksDrained_.notify_all();
+                }
+            }
         }
     }
 
     void
     cancel() noexcept {
-        const std::lock_guard lock(mutex_);
+        std::unique_lock lock(mutex_);
         cancelled_ = true;
         pending_.clear();
         sink_.reset();
+        callbacksDrained_.wait(lock, [this] { return callbacksInFlight_ == 0; });
     }
 
 private:
     std::mutex mutex_;
+    std::condition_variable callbacksDrained_;
     std::shared_ptr<notif_route_transition_sink_t> sink_;
     std::deque<notif_route_transition_t> pending_;
+    std::size_t callbacksInFlight_ = 0;
     bool dispatching_ = false;
     bool cancelled_ = false;
 };
@@ -425,13 +437,22 @@ notif_capability_state_t::unsubscribeRemoteNotificationState(
         const std::lock_guard lock(mutex_);
         const auto known = routeSubscriptions_.find(subscription.route);
         if (known == routeSubscriptions_.end() ||
-            known->second.generation != subscription.generation) {
+            known->second.generation != subscription.generation || known->second.closing) {
             return notif_route_subscription_status_t::UNKNOWN_SUBSCRIPTION;
         }
-        delivery = std::move(known->second.delivery);
-        routeSubscriptions_.erase(known);
+        known->second.closing = true;
+        delivery = known->second.delivery;
     }
     delivery->cancel();
+
+    // Keep the exact generation registered until its copied callback has drained. This makes
+    // successful unsubscribe the lifecycle boundary backend inventory can safely project.
+    const std::lock_guard lock(mutex_);
+    const auto known = routeSubscriptions_.find(subscription.route);
+    if (known != routeSubscriptions_.end() &&
+        known->second.generation == subscription.generation && known->second.closing) {
+        routeSubscriptions_.erase(known);
+    }
     return notif_route_subscription_status_t::SUCCESS;
 }
 
