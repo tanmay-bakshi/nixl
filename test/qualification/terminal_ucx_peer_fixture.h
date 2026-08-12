@@ -54,6 +54,7 @@ struct tcp_notification_failure_observation_t {
     tcp_peer_terminal_observation_t transfer;
     tcp_peer_channel_observation_t channel;
     bool dataRemoteFlushedBeforeFailure = false;
+    bool notificationPendingAtRemoteFlush = false;
     bool peerExitedBySignal = false;
 };
 
