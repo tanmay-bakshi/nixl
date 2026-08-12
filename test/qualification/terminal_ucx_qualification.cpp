@@ -1385,22 +1385,20 @@ run(int argc, char **argv) {
             "queue overflow did not preserve exactly one admitted event");
     shutdown_result_t shutdown_cancellation = runShutdownCancellation(options, suffix);
     if (tcp_shutdown_cancellation.has_value()) {
-        shutdown_cancellation = shutdown_result_t{
-            terminal_fault_result_t{
-                .terminalStatus = tcp_shutdown_cancellation->transfer.terminalStatus,
-                .terminalEventCount = tcp_shutdown_cancellation->transfer.terminalEventCount,
-                .ownerWoken = tcp_shutdown_cancellation->transfer.ownerWoken,
-            },
-            .cancelStatus = tcp_shutdown_cancellation->cancelStatus,
-            .backendProducersBeforeCancel =
-                tcp_shutdown_cancellation->inventoryBeforeCancellation.backendProducers,
-            .activeCallbackSlotsBeforeCancel =
-                tcp_shutdown_cancellation->inventoryBeforeCancellation.activeCallbackSlots,
-            .queuedOwnerContinuationsBeforeCancel =
-                tcp_shutdown_cancellation->inventoryBeforeCancellation.queuedOwnerContinuations,
-            .postedInFlight = tcp_shutdown_cancellation->postedInFlight,
-            .drained = tcp_shutdown_cancellation->drained,
-        };
+        shutdown_result_t observed;
+        observed.terminalStatus = tcp_shutdown_cancellation->transfer.terminalStatus;
+        observed.terminalEventCount = tcp_shutdown_cancellation->transfer.terminalEventCount;
+        observed.ownerWoken = tcp_shutdown_cancellation->transfer.ownerWoken;
+        observed.cancelStatus = tcp_shutdown_cancellation->cancelStatus;
+        observed.backendProducersBeforeCancel =
+            tcp_shutdown_cancellation->inventoryBeforeCancellation.backendProducers;
+        observed.activeCallbackSlotsBeforeCancel =
+            tcp_shutdown_cancellation->inventoryBeforeCancellation.activeCallbackSlots;
+        observed.queuedOwnerContinuationsBeforeCancel =
+            tcp_shutdown_cancellation->inventoryBeforeCancellation.queuedOwnerContinuations;
+        observed.postedInFlight = tcp_shutdown_cancellation->postedInFlight;
+        observed.drained = tcp_shutdown_cancellation->drained;
+        shutdown_cancellation = observed;
     }
     requireStatus(shutdown_cancellation.terminalStatus,
                   NIXL_ERR_CANCELED,
