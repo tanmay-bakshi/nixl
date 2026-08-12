@@ -15,6 +15,7 @@
 #include "terminal_event_channel.h"
 
 class nixlBackendEngine;
+class nixlTerminalEventSubscriptionTestPeer;
 
 class nixlTerminalTransferAdapter final : public nixlBackendTransferTransitionSink {
 public:
@@ -42,6 +43,7 @@ private:
     std::shared_ptr<nixl::terminalEventChannel::subscription> channelSubscription_;
     terminal_callback_t terminalCallback_;
     bool terminal_ = false;
+    bool terminalCallbackDelivered_ = false;
 };
 
 class nixlTerminalCapabilityAdapter final : public nixlBackendCapabilityTransitionSink {
@@ -72,6 +74,9 @@ private:
     std::shared_ptr<nixl::terminalEventChannel::subscription> channelSubscription_;
     terminal_callback_t terminalCallback_;
     bool terminal_ = false;
+    bool terminalCallbackDelivered_ = false;
+    uint64_t lastCapabilityEpoch_ = 0;
+    bool hasCapabilityState_ = false;
 };
 
 class nixlTerminalEventChannelH {
@@ -85,7 +90,7 @@ private:
 };
 
 class nixlTerminalEventSubscriptionH {
-public:
+private:
     nixlTerminalEventSubscriptionH(
         uint64_t owner_identity,
         uint64_t subscription_identity,
@@ -103,15 +108,23 @@ public:
         std::unique_ptr<nixlBackendEventSubscription> backend_subscription,
         std::shared_ptr<nixlTerminalCapabilityAdapter> capability_adapter);
 
-    [[nodiscard]] std::unique_ptr<nixlBackendEventSubscription>
-    takeBackendSubscription() noexcept;
+    void
+    markTerminal() noexcept;
+
+    [[nodiscard]] nixl_status_t
+    requestCancellation() noexcept;
+
+    [[nodiscard]] nixlBackendEventSubscriptionInventory
+    backendInventory() const noexcept;
+
+    [[nodiscard]] nixl_status_t
+    drainCancellation() noexcept;
+
+    [[nodiscard]] bool
+    claimPublicRelease() noexcept;
 
     void
-    restoreBackendSubscription(
-        std::unique_ptr<nixlBackendEventSubscription> backend_subscription) noexcept;
-
-    void
-    finishRelease() noexcept;
+    restorePublicRelease() noexcept;
 
     [[nodiscard]] nixl_terminal_subscription_info_t
     snapshot() const noexcept;
@@ -126,8 +139,11 @@ private:
     std::unique_ptr<nixlBackendEventSubscription> backendSubscription_;
     std::shared_ptr<nixlTerminalTransferAdapter> transferAdapter_;
     std::shared_ptr<nixlTerminalCapabilityAdapter> capabilityAdapter_;
+    bool cancellationRequested_ = false;
+    bool publicReleaseClaimed_ = false;
 
     friend class nixlAgent;
+    friend class nixlTerminalEventSubscriptionTestPeer;
 };
 
 #endif // NIXL_SRC_CORE_TERMINAL_EVENT_API_H

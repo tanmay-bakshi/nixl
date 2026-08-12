@@ -61,19 +61,18 @@ terminal_ucx_api_adapter_t::queryInventory(terminal_channel_inventory_t &invento
         return status;
     }
 
-    std::size_t subscription_count = 0;
-    const nixl_status_t count_status =
-        agent_.getTerminalEventSubscriptionCount(channel_, subscription_count);
-    if (count_status != NIXL_SUCCESS) {
-        return count_status;
-    }
-
     inventory = {
-        .activeSubscriptions = subscription_count,
-        .activeProducers = channel_inventory.activeSubscriptions,
-        .queuedEvents = channel_inventory.queuedEvents,
+        .capacity = channel_inventory.capacity,
+        .queuedChannelEvents = channel_inventory.queuedChannelEvents,
+        .activeChannelSubscriptions = channel_inventory.activeChannelSubscriptions,
+        .retainedPublicSubscriptions = channel_inventory.retainedPublicSubscriptions,
+        .backendProducers = channel_inventory.backendProducers,
+        .activeCallbackSlots = channel_inventory.activeCallbackSlots,
+        .queuedOwnerContinuations = channel_inventory.queuedOwnerContinuations,
+        .acceptingSubscriptions = channel_inventory.acceptingSubscriptions,
         .closed = channel_inventory.closed,
         .fatal = static_cast<std::uint32_t>(channel_inventory.fatal),
+        .eventfdError = channel_inventory.eventfdError,
     };
     return NIXL_SUCCESS;
 }

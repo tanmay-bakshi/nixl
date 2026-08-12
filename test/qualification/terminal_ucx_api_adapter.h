@@ -13,19 +13,21 @@
 namespace nixl::qualification {
 
 struct terminal_channel_inventory_t {
-    std::size_t activeSubscriptions = 0;
-    std::size_t activeProducers = 0;
-    std::size_t queuedEvents = 0;
+    std::size_t capacity = 0;
+    std::size_t queuedChannelEvents = 0;
+    std::size_t activeChannelSubscriptions = 0;
+    std::size_t retainedPublicSubscriptions = 0;
+    std::size_t backendProducers = 0;
+    std::size_t activeCallbackSlots = 0;
+    std::size_t queuedOwnerContinuations = 0;
+    bool acceptingSubscriptions = false;
     bool closed = false;
     std::uint32_t fatal = 0;
+    int eventfdError = 0;
 };
 
 /**
- * Isolated qualification seam around the concurrently landing public API.
- *
- * The executable uses public agent calls for transfers, subscriptions, and
- * attestation. Only producer inventory is temporarily isolated here because
- * the backend lifecycle counter is landing with the callback implementation.
+ * Narrow qualification wrapper around the public terminal-event API.
  */
 class terminal_ucx_api_adapter_t final {
 public:

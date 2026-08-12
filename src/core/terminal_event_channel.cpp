@@ -18,11 +18,7 @@ namespace nixl {
 namespace {
 
     [[nodiscard]] int
-    createEventFd(std::size_t capacity) {
-        if (capacity == 0) {
-            throw std::invalid_argument("terminal event channel capacity must be positive");
-        }
-
+    createEventFd() {
         const int event_fd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
         if (event_fd < 0) {
             throw std::system_error(errno, std::generic_category(), "failed to create eventfd");
@@ -53,8 +49,8 @@ class terminalEventChannelState {
 public:
     explicit terminalEventChannelState(std::size_t capacity)
         : capacity_(capacity),
-          eventFd_(createEventFd(capacity)),
-          events_(capacity) {}
+          events_(capacity),
+          eventFd_(createEventFd()) {}
 
     terminalEventChannelState(const terminalEventChannelState &) = delete;
     terminalEventChannelState &
@@ -255,9 +251,9 @@ private:
     }
 
     const std::size_t capacity_;
-    const int eventFd_;
     mutable std::mutex mutex_;
     std::vector<terminal_event_t> events_;
+    const int eventFd_;
     std::size_t head_ = 0;
     std::size_t queuedEvents_ = 0;
     std::size_t activeSubscriptions_ = 0;
@@ -355,7 +351,12 @@ terminalEventChannel::subscription::failInvalidPublication() noexcept {
 }
 
 terminalEventChannel::terminalEventChannel(std::size_t capacity)
-    : state_(std::make_shared<terminalEventChannelState>(capacity)) {}
+    : state_([capacity]() {
+          if (capacity == 0 || capacity > terminal_event_channel_max_capacity) {
+              throw std::invalid_argument("terminal event channel capacity is out of range");
+          }
+          return std::make_shared<terminalEventChannelState>(capacity);
+      }()) {}
 
 terminalEventChannel::~terminalEventChannel() {
     static_cast<void>(close());

@@ -125,6 +125,63 @@ private:
     nixl_xfer_attestation_t attestation_;
 };
 
+class nixlTerminalEventSnapshot {
+public:
+    explicit nixlTerminalEventSnapshot(nixl_terminal_event_t event)
+        : event_(std::move(event)) {}
+
+    [[nodiscard]] const nixl_terminal_event_t &
+    get() const noexcept {
+        return event_;
+    }
+
+private:
+    nixl_terminal_event_t event_;
+};
+
+class nixlTerminalChannelInventorySnapshot {
+public:
+    explicit nixlTerminalChannelInventorySnapshot(
+        nixl_terminal_channel_inventory_t inventory)
+        : inventory_(std::move(inventory)) {}
+
+    [[nodiscard]] const nixl_terminal_channel_inventory_t &
+    get() const noexcept {
+        return inventory_;
+    }
+
+private:
+    nixl_terminal_channel_inventory_t inventory_;
+};
+
+class nixlTerminalEventBatchSnapshot {
+public:
+    explicit nixlTerminalEventBatchSnapshot(nixl_terminal_event_batch_t batch)
+        : batch_(std::move(batch)) {}
+
+    [[nodiscard]] const nixl_terminal_event_batch_t &
+    get() const noexcept {
+        return batch_;
+    }
+
+private:
+    nixl_terminal_event_batch_t batch_;
+};
+
+class nixlTerminalSubscriptionInfoSnapshot {
+public:
+    explicit nixlTerminalSubscriptionInfoSnapshot(nixl_terminal_subscription_info_t info)
+        : info_(std::move(info)) {}
+
+    [[nodiscard]] const nixl_terminal_subscription_info_t &
+    get() const noexcept {
+        return info_;
+    }
+
+private:
+    nixl_terminal_subscription_info_t info_;
+};
+
 template<typename T>
 py::tuple
 immutableTuple(const std::vector<T> &values) {
@@ -310,6 +367,166 @@ PYBIND11_MODULE(_bindings, m) {
         .value("NIXL_XFER_ATTESTATION_FAILED",
                nixl_xfer_attestation_state_t::FAILED)
         .export_values();
+
+    py::enum_<nixl_terminal_event_kind_t>(m, "nixl_terminal_event_kind_t")
+        .value("TRANSFER", nixl_terminal_event_kind_t::TRANSFER)
+        .value("CAPABILITY", nixl_terminal_event_kind_t::CAPABILITY);
+
+    py::enum_<nixl_terminal_capability_state_t>(m, "nixl_terminal_capability_state_t")
+        .value("READY", nixl_terminal_capability_state_t::READY)
+        .value("FAILED", nixl_terminal_capability_state_t::FAILED)
+        .value("RETIRED", nixl_terminal_capability_state_t::RETIRED);
+
+    py::enum_<nixl_terminal_channel_fatal_t>(m, "nixl_terminal_channel_fatal_t")
+        .value("NONE", nixl_terminal_channel_fatal_t::NONE)
+        .value("QUEUE_OVERFLOW", nixl_terminal_channel_fatal_t::QUEUE_OVERFLOW)
+        .value("EVENTFD_FAILURE", nixl_terminal_channel_fatal_t::EVENTFD_FAILURE)
+        .value("ACTIVE_SUBSCRIPTIONS_ON_CLOSE",
+               nixl_terminal_channel_fatal_t::ACTIVE_SUBSCRIPTIONS_ON_CLOSE)
+        .value("INVALID_PUBLICATION", nixl_terminal_channel_fatal_t::INVALID_PUBLICATION);
+
+    py::class_<nixlTerminalEventSnapshot>(m, "nixlTerminalEvent")
+        .def_property_readonly(
+            "kind", [](const nixlTerminalEventSnapshot &value) { return value.get().kind; })
+        .def_property_readonly(
+            "ownerCookie",
+            [](const nixlTerminalEventSnapshot &value) { return value.get().ownerCookie; })
+        .def_property_readonly(
+            "identity",
+            [](const nixlTerminalEventSnapshot &value) { return value.get().identity; })
+        .def_property_readonly(
+            "generation",
+            [](const nixlTerminalEventSnapshot &value) { return value.get().generation; })
+        .def_property_readonly(
+            "transferStatus",
+            [](const nixlTerminalEventSnapshot &value) -> py::object {
+                if (value.get().kind != nixl_terminal_event_kind_t::TRANSFER) {
+                    return py::none();
+                }
+                return py::cast(value.get().transferStatus);
+            })
+        .def_property_readonly(
+            "capabilityState",
+            [](const nixlTerminalEventSnapshot &value) -> py::object {
+                if (value.get().kind != nixl_terminal_event_kind_t::CAPABILITY) {
+                    return py::none();
+                }
+                return py::cast(value.get().capabilityState);
+            })
+        .def_property_readonly(
+            "capabilityEpoch",
+            [](const nixlTerminalEventSnapshot &value) -> py::object {
+                if (value.get().kind != nixl_terminal_event_kind_t::CAPABILITY) {
+                    return py::none();
+                }
+                return py::cast(value.get().capabilityEpoch);
+            })
+        .def_property_readonly(
+            "nativeTimestampNs",
+            [](const nixlTerminalEventSnapshot &value) { return value.get().nativeTimestampNs; });
+
+    py::class_<nixlTerminalChannelInventorySnapshot>(m, "nixlTerminalChannelInventory")
+        .def_property_readonly(
+            "capacity",
+            [](const nixlTerminalChannelInventorySnapshot &value) {
+                return value.get().capacity;
+            })
+        .def_property_readonly(
+            "queuedChannelEvents",
+            [](const nixlTerminalChannelInventorySnapshot &value) {
+                return value.get().queuedChannelEvents;
+            })
+        .def_property_readonly(
+            "activeChannelSubscriptions",
+            [](const nixlTerminalChannelInventorySnapshot &value) {
+                return value.get().activeChannelSubscriptions;
+            })
+        .def_property_readonly(
+            "retainedPublicSubscriptions",
+            [](const nixlTerminalChannelInventorySnapshot &value) {
+                return value.get().retainedPublicSubscriptions;
+            })
+        .def_property_readonly(
+            "backendProducers",
+            [](const nixlTerminalChannelInventorySnapshot &value) {
+                return value.get().backendProducers;
+            })
+        .def_property_readonly(
+            "activeCallbackSlots",
+            [](const nixlTerminalChannelInventorySnapshot &value) {
+                return value.get().activeCallbackSlots;
+            })
+        .def_property_readonly(
+            "queuedOwnerContinuations",
+            [](const nixlTerminalChannelInventorySnapshot &value) {
+                return value.get().queuedOwnerContinuations;
+            })
+        .def_property_readonly(
+            "acceptingSubscriptions",
+            [](const nixlTerminalChannelInventorySnapshot &value) {
+                return value.get().acceptingSubscriptions;
+            })
+        .def_property_readonly(
+            "closed",
+            [](const nixlTerminalChannelInventorySnapshot &value) {
+                return value.get().closed;
+            })
+        .def_property_readonly(
+            "fatal",
+            [](const nixlTerminalChannelInventorySnapshot &value) {
+                return value.get().fatal;
+            })
+        .def_property_readonly(
+            "eventfdError",
+            [](const nixlTerminalChannelInventorySnapshot &value) {
+                return value.get().eventfdError;
+            });
+
+    py::class_<nixlTerminalEventBatchSnapshot>(m, "nixlTerminalEventBatch")
+        .def_property_readonly(
+            "events",
+            [](const nixlTerminalEventBatchSnapshot &value) {
+                py::tuple events(value.get().events.size());
+                for (size_t index = 0; index < value.get().events.size(); ++index) {
+                    events[index] = py::cast(nixlTerminalEventSnapshot(value.get().events[index]));
+                }
+                return events;
+            })
+        .def_property_readonly(
+            "wakeCount",
+            [](const nixlTerminalEventBatchSnapshot &value) { return value.get().wakeCount; })
+        .def_property_readonly(
+            "inventory",
+            [](const nixlTerminalEventBatchSnapshot &value) {
+                return nixlTerminalChannelInventorySnapshot(value.get().inventory);
+            });
+
+    py::class_<nixlTerminalSubscriptionInfoSnapshot>(m, "nixlTerminalSubscriptionInfo")
+        .def_property_readonly(
+            "kind",
+            [](const nixlTerminalSubscriptionInfoSnapshot &value) {
+                return value.get().kind;
+            })
+        .def_property_readonly(
+            "ownerCookie",
+            [](const nixlTerminalSubscriptionInfoSnapshot &value) {
+                return value.get().ownerCookie;
+            })
+        .def_property_readonly(
+            "identity",
+            [](const nixlTerminalSubscriptionInfoSnapshot &value) {
+                return value.get().identity;
+            })
+        .def_property_readonly(
+            "generation",
+            [](const nixlTerminalSubscriptionInfoSnapshot &value) {
+                return value.get().generation;
+            })
+        .def_property_readonly(
+            "active",
+            [](const nixlTerminalSubscriptionInfoSnapshot &value) {
+                return value.get().active;
+            });
 
     py::class_<nixl_xfer_telem_t>(m, "nixlXferTelemetry")
         .def(py::init<>())
@@ -624,11 +841,113 @@ PYBIND11_MODULE(_bindings, m) {
              },
              py::is_operator());
 
+    py::class_<nixlTerminalEventChannelH,
+               std::unique_ptr<nixlTerminalEventChannelH, py::nodelete>>(
+        m, "nixlTerminalEventChannelH");
+
+    py::class_<nixlTerminalEventSubscriptionH,
+               std::unique_ptr<nixlTerminalEventSubscriptionH, py::nodelete>>(
+        m, "nixlTerminalEventSubscriptionH");
+
     // note: pybind will automatically convert notif_map to python types:
     // so, a Dictionary of string: List<string>
 
     py::class_<nixlAgent>(m, "nixlAgent")
         .def(py::init<std::string, nixlAgentConfig>())
+        .def("createTerminalEventChannel",
+             [](nixlAgent &agent, size_t capacity) {
+                 nixlTerminalEventChannelH *channel = nullptr;
+                 throw_nixl_exception(agent.createTerminalEventChannel(capacity, channel));
+                 return channel;
+             },
+             py::return_value_policy::reference_internal)
+        .def("getTerminalEventChannelFd",
+             [](nixlAgent &agent, const nixlTerminalEventChannelH *channel) {
+                 int fd = -1;
+                 throw_nixl_exception(agent.getTerminalEventChannelFd(channel, fd));
+                 return fd;
+             })
+        .def("drainTerminalEvents",
+             [](nixlAgent &agent, nixlTerminalEventChannelH *channel) {
+                 nixl_terminal_event_batch_t batch;
+                 nixl_status_t status;
+                 {
+                     py::gil_scoped_release release;
+                     status = agent.drainTerminalEvents(channel, batch);
+                 }
+                 throw_nixl_exception(status);
+                 return nixlTerminalEventBatchSnapshot(std::move(batch));
+             })
+        .def("queryTerminalEventChannel",
+             [](nixlAgent &agent, const nixlTerminalEventChannelH *channel) {
+                 nixl_terminal_channel_inventory_t inventory;
+                 throw_nixl_exception(agent.queryTerminalEventChannel(channel, inventory));
+                 return nixlTerminalChannelInventorySnapshot(std::move(inventory));
+             })
+        .def("closeTerminalEventChannel",
+             [](nixlAgent &agent, nixlTerminalEventChannelH *channel) {
+                 nixl_status_t status = agent.closeTerminalEventChannel(channel);
+                 throw_nixl_exception(status);
+                 return status;
+             })
+        .def("subscribeXferTerminal",
+             [](nixlAgent &agent,
+                nixlTerminalEventChannelH *channel,
+                uintptr_t request,
+                uint64_t owner_cookie) {
+                 nixlTerminalEventSubscriptionH *subscription = nullptr;
+                 nixl_status_t status;
+                 {
+                     py::gil_scoped_release release;
+                     status = agent.subscribeXferTerminal(
+                         channel,
+                         reinterpret_cast<nixlXferReqH *>(request),
+                         owner_cookie,
+                         subscription);
+                 }
+                 throw_nixl_exception(status);
+                 return subscription;
+             },
+             py::return_value_policy::reference_internal)
+        .def("subscribeRemoteNotificationState",
+             [](nixlAgent &agent,
+                nixlTerminalEventChannelH *channel,
+                const nixlRemoteAgentH *remote_agent,
+                uintptr_t backend,
+                uint64_t owner_cookie) {
+                 nixlTerminalEventSubscriptionH *subscription = nullptr;
+                 nixl_status_t status;
+                 {
+                     py::gil_scoped_release release;
+                     status = agent.subscribeRemoteNotificationState(
+                         channel,
+                         remote_agent,
+                         reinterpret_cast<nixlBackendH *>(backend),
+                         owner_cookie,
+                         subscription);
+                 }
+                 throw_nixl_exception(status);
+                 return subscription;
+             },
+             py::return_value_policy::reference_internal)
+        .def("queryTerminalEventSubscription",
+             [](nixlAgent &agent,
+                const nixlTerminalEventSubscriptionH *subscription) {
+                 nixl_terminal_subscription_info_t info;
+                 throw_nixl_exception(
+                     agent.queryTerminalEventSubscription(subscription, info));
+                 return nixlTerminalSubscriptionInfoSnapshot(std::move(info));
+             })
+        .def("releaseTerminalEventSubscription",
+             [](nixlAgent &agent, nixlTerminalEventSubscriptionH *subscription) {
+                 nixl_status_t status;
+                 {
+                     py::gil_scoped_release release;
+                     status = agent.releaseTerminalEventSubscription(subscription);
+                 }
+                 throw_nixl_exception(status);
+                 return status;
+             })
         .def("getAvailPlugins",
              [](nixlAgent &agent) -> std::vector<nixl_backend_t> {
                  std::vector<nixl_backend_t> backends;
