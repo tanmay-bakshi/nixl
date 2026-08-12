@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #include "terminal_ucx_api_adapter.h"
+#include "terminal_ucx_peer_fixture.h"
 
 #include <poll.h>
 #include <time.h>
@@ -37,8 +38,6 @@ constexpr std::size_t channel_capacity = 64;
 constexpr std::size_t descriptor_bytes = 8U * 1024U * 1024U;
 constexpr std::size_t large_descriptor_count = 8;
 constexpr std::size_t arena_bytes = descriptor_bytes * large_descriptor_count;
-constexpr std::size_t remote_failure_bytes = 512U * 1024U * 1024U;
-constexpr std::size_t notification_failure_bytes = 256U * 1024U * 1024U;
 constexpr int event_timeout_ms = 30000;
 constexpr std::uint64_t device_id = 0;
 constexpr std::string_view self_na_reason =
@@ -116,6 +115,12 @@ struct capability_result_t {
     bool subscribeBeforeReady = false;
     bool snapshotAfterReady = false;
     std::vector<route_result_t> routes;
+};
+
+struct tcp_fixture_result_t {
+    tcp_endpoint_failure_observation_t endpointFailure;
+    tcp_notification_failure_observation_t notificationFailure;
+    tcp_shutdown_cancellation_observation_t shutdownCancellation;
 };
 
 struct tcp_fault_results_t {
@@ -732,7 +737,8 @@ runCapabilities(const options_t &options,
                 nixlBackendH *source_backend,
                 nixl::qualification::terminal_ucx_api_adapter_t &adapter,
                 terminal_event_inbox_t &inbox,
-                std::uint64_t suffix) {
+                std::uint64_t suffix,
+                const tcp_peer_capability_observation_t &endpoint_failure) {
     capability_result_t result;
     nixl_blob_t source_metadata;
     requireStatus(source.getLocalMD(source_metadata), NIXL_SUCCESS, "get source metadata");
@@ -769,34 +775,15 @@ runCapabilities(const options_t &options,
     epoch_route.releaseStatus = adapter.release(epoch_route.subscription);
     requireStatus(epoch_route.releaseStatus, NIXL_SUCCESS, "release epoch capability");
 
-    endpoint_t failed = makeEndpoint("qualification-failed-" + std::to_string(suffix), options);
-    nixlRemoteAgentH *failed_handle = loadRemote(source, *failed.agent);
-    constexpr std::uint64_t failed_cookie = 8002;
-    bool failed_active_before_ready = false;
-    route_result_t failed_route = subscribeRoute(adapter,
-                                                 failed_handle,
-                                                 source_backend,
-                                                 "endpoint_failure",
-                                                 failed_cookie,
-                                                 failed_active_before_ready);
-    nixlRemoteAgentH *failed_reverse = nullptr;
-    requireStatus(failed.agent->loadRemoteMD(source_metadata, failed_reverse),
-                  NIXL_SUCCESS,
-                  "load failed-route reverse metadata");
-    appendCapabilityEvent(failed_route, inbox, failed_cookie);
-    require(failed_route.states.back() == nixl_terminal_capability_state_t::READY,
-            "failed route did not become ready");
-    failed.agent.reset();
-    appendCapabilityEvent(failed_route, inbox, failed_cookie);
-    require(failed_route.states.back() == nixl_terminal_capability_state_t::FAILED,
-            "endpoint death did not publish failed capability");
-    nixl_terminal_subscription_info_t failed_info;
-    requireStatus(adapter.querySubscription(failed_route.subscription, failed_info),
-                  NIXL_SUCCESS,
-                  "query failed capability subscription");
-    failed_route.subscriptionTerminal = !failed_info.active;
-    failed_route.releaseStatus = adapter.release(failed_route.subscription);
-    requireStatus(failed_route.releaseStatus, NIXL_SUCCESS, "release failed capability");
+    route_result_t failed_route{
+        .name = "endpoint_failure",
+        .identity = endpoint_failure.handleIdentity,
+        .generation = endpoint_failure.handleGeneration,
+        .states = endpoint_failure.states,
+        .epochs = endpoint_failure.epochs,
+        .releaseStatus = endpoint_failure.releaseStatus,
+        .subscriptionTerminal = endpoint_failure.subscriptionTerminal,
+    };
 
     endpoint_t retired = makeEndpoint("qualification-retired-" + std::to_string(suffix), options);
     nixlRemoteAgentH *retired_handle = loadRemote(source, *retired.agent);
@@ -882,125 +869,6 @@ makeReadyRoute(nixlAgent &source,
     requireStatus(
         adapter.release(readiness.subscription), NIXL_SUCCESS, "release readiness subscription");
     return route;
-}
-
-[[nodiscard]] terminal_fault_result_t
-runTcpRemoteFailure(const options_t &options,
-                    nixlAgent &source,
-                    nixlBackendH *source_backend,
-                    nixl::qualification::terminal_ucx_api_adapter_t &adapter,
-                    terminal_event_inbox_t &inbox,
-                    std::uint64_t suffix) {
-    endpoint_t destination =
-        makeEndpoint("qualification-remote-failure-" + std::to_string(suffix), options);
-    registered_arena_t source_arena(source, source_backend, remote_failure_bytes, 1);
-    registered_arena_t destination_arena(
-        *destination.agent, destination.backend, remote_failure_bytes, 1);
-    ready_route_t route =
-        makeReadyRoute(source, source_backend, *destination.agent, adapter, inbox, 8201);
-    const population_spec_t spec{
-        .name = "remote_failure",
-        .descriptorCount = 1,
-        .bytesPerDescriptor = remote_failure_bytes,
-        .seed = 181,
-    };
-    source_arena.fill(spec);
-    destination_arena.clear(spec);
-    nixlXferReqH *request = createRequest(
-        source, source_backend, source_arena, destination_arena, spec, {}, route.sourceHandle, {});
-    nixlTerminalEventSubscriptionH *subscription = nullptr;
-    constexpr std::uint64_t cookie = 8202;
-    requireStatus(adapter.subscribeTransfer(request, cookie, subscription),
-                  NIXL_SUCCESS,
-                  "subscribe remote failure transfer");
-    const nixl_status_t post_status = source.postXferReq(request);
-    require(post_status == NIXL_IN_PROG, "remote failure transfer completed before endpoint death");
-    destination_arena.abandonAgent();
-    destination.agent.reset();
-    const nixl_terminal_event_t event = inbox.take(nixl_terminal_event_kind_t::TRANSFER, cookie);
-    requireStatus(
-        event.transferStatus, NIXL_ERR_REMOTE_DISCONNECT, "remote failure terminal status");
-    requireStatus(
-        adapter.release(subscription), NIXL_SUCCESS, "release remote failure subscription");
-    requireStatus(source.releaseXferReq(request), NIXL_SUCCESS, "release remote failure request");
-    return {
-        .terminalStatus = event.transferStatus,
-        .terminalEventCount = 1,
-        .ownerWoken = true,
-    };
-}
-
-[[nodiscard]] terminal_fault_result_t
-runTcpNotificationFailure(const options_t &options,
-                          nixlAgent &source,
-                          nixlBackendH *source_backend,
-                          nixl::qualification::terminal_ucx_api_adapter_t &adapter,
-                          terminal_event_inbox_t &inbox,
-                          std::uint64_t suffix,
-                          bool &remote_flushed_before_failure) {
-    endpoint_t destination =
-        makeEndpoint("qualification-notification-failure-" + std::to_string(suffix), options);
-    registered_arena_t source_arena(source, source_backend, notification_failure_bytes, 1);
-    registered_arena_t destination_arena(
-        *destination.agent, destination.backend, notification_failure_bytes, 1);
-    ready_route_t route =
-        makeReadyRoute(source, source_backend, *destination.agent, adapter, inbox, 8301);
-    const population_spec_t spec{
-        .name = "notification_failure",
-        .descriptorCount = 1,
-        .bytesPerDescriptor = notification_failure_bytes,
-        .seed = 211,
-    };
-    source_arena.fill(spec);
-    destination_arena.clear(spec);
-    const std::string notification(60U * 1024U, 'n');
-    nixlXferReqH *request = createRequest(source,
-                                          source_backend,
-                                          source_arena,
-                                          destination_arena,
-                                          spec,
-                                          {},
-                                          route.sourceHandle,
-                                          notification);
-    nixlTerminalEventSubscriptionH *subscription = nullptr;
-    constexpr std::uint64_t cookie = 8302;
-    requireStatus(adapter.subscribeTransfer(request, cookie, subscription),
-                  NIXL_SUCCESS,
-                  "subscribe notification failure transfer");
-    const nixl_status_t post_status = source.postXferReq(request);
-    require(post_status == NIXL_IN_PROG,
-            "notification transfer completed before failure observation");
-
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::milliseconds(event_timeout_ms);
-    while (std::chrono::steady_clock::now() < deadline) {
-        nixl_xfer_attestation_t snapshot;
-        const nixl_status_t status = source.queryXferAttestation(request, snapshot);
-        requireStatus(status, NIXL_SUCCESS, "query notification transfer attestation");
-        if (snapshot.state == nixl_xfer_attestation_state_t::REMOTE_FLUSHED) {
-            remote_flushed_before_failure = true;
-            break;
-        }
-        require(snapshot.state != nixl_xfer_attestation_state_t::FAILED,
-                "notification transfer failed before remote flush");
-        std::this_thread::yield();
-    }
-    require(remote_flushed_before_failure,
-            "notification transfer never exposed remote-flushed evidence");
-    destination_arena.abandonAgent();
-    destination.agent.reset();
-    const nixl_terminal_event_t event = inbox.take(nixl_terminal_event_kind_t::TRANSFER, cookie);
-    requireStatus(
-        event.transferStatus, NIXL_ERR_REMOTE_DISCONNECT, "notification failure terminal status");
-    requireStatus(
-        adapter.release(subscription), NIXL_SUCCESS, "release notification failure subscription");
-    requireStatus(
-        source.releaseXferReq(request), NIXL_SUCCESS, "release notification failure request");
-    return {
-        .terminalStatus = event.transferStatus,
-        .terminalEventCount = 1,
-        .ownerWoken = true,
-    };
 }
 
 [[nodiscard]] std::size_t
@@ -1410,6 +1278,8 @@ run(int argc, char **argv) {
     nixl::qualification::terminal_ucx_api_adapter_t adapter(*source.agent, channel_capacity);
     terminal_event_inbox_t inbox(adapter);
     capability_result_t capability;
+    tcp_fault_results_t tcp_faults;
+    std::optional<tcp_shutdown_cancellation_observation_t> tcp_shutdown_cancellation;
     if (options.transport == "tcp") {
         ready_route_t route =
             makeReadyRoute(*source.agent, source.backend, destination_agent, adapter, inbox, 9001);
@@ -1459,8 +1329,39 @@ run(int argc, char **argv) {
         requireStatus(source.agent->invalidateRemoteMD(destination_handle),
                       NIXL_SUCCESS,
                       "retire population route");
-        capability =
-            runCapabilities(options, *source.agent, source.backend, adapter, inbox, suffix);
+        const tcp_fixture_result_t fixtures{
+            .endpointFailure = nixl::qualification::runTcpEndpointFailureFixture(options.engine),
+            .notificationFailure =
+                nixl::qualification::runTcpNotificationFailureFixture(options.engine),
+            .shutdownCancellation =
+                nixl::qualification::runTcpShutdownCancellationFixture(options.engine),
+        };
+        require(fixtures.endpointFailure.peerExitedBySignal,
+                "endpoint-failure peer did not die independently");
+        require(fixtures.notificationFailure.peerExitedBySignal,
+                "notification-failure peer did not die independently");
+        require(fixtures.shutdownCancellation.peerExitedBySignal,
+                "shutdown-cancellation peer did not die independently");
+        capability = runCapabilities(options,
+                                     *source.agent,
+                                     source.backend,
+                                     adapter,
+                                     inbox,
+                                     suffix,
+                                     fixtures.endpointFailure.capability);
+        tcp_faults.remoteFailure = {
+            .terminalStatus = fixtures.endpointFailure.transfer.terminalStatus,
+            .terminalEventCount = fixtures.endpointFailure.transfer.terminalEventCount,
+            .ownerWoken = fixtures.endpointFailure.transfer.ownerWoken,
+        };
+        tcp_faults.notificationFailure = {
+            .terminalStatus = fixtures.notificationFailure.transfer.terminalStatus,
+            .terminalEventCount = fixtures.notificationFailure.transfer.terminalEventCount,
+            .ownerWoken = fixtures.notificationFailure.transfer.ownerWoken,
+        };
+        tcp_faults.dataRemoteFlushedBeforeNotificationFailure =
+            fixtures.notificationFailure.dataRemoteFlushedBeforeFailure;
+        tcp_shutdown_cancellation = fixtures.shutdownCancellation;
     }
 
     const terminal_fault_result_t cancellation = runCancellation(options, suffix);
@@ -1470,25 +1371,20 @@ run(int argc, char **argv) {
                     static_cast<std::uint32_t>(nixl_terminal_channel_fatal_t::QUEUE_OVERFLOW) &&
                 overflow.admittedEvents == 1,
             "queue overflow did not preserve exactly one admitted event");
-    const shutdown_result_t shutdown_cancellation = runShutdownCancellation(options, suffix);
+    shutdown_result_t shutdown_cancellation = runShutdownCancellation(options, suffix);
+    if (tcp_shutdown_cancellation.has_value()) {
+        shutdown_cancellation = {
+            .terminalStatus = tcp_shutdown_cancellation->transfer.terminalStatus,
+            .terminalEventCount = tcp_shutdown_cancellation->transfer.terminalEventCount,
+            .ownerWoken = tcp_shutdown_cancellation->transfer.ownerWoken,
+            .cancelStatus = tcp_shutdown_cancellation->cancelStatus,
+            .drained = tcp_shutdown_cancellation->drained,
+        };
+    }
     requireStatus(shutdown_cancellation.terminalStatus,
                   NIXL_ERR_CANCELED,
                   "shutdown cancellation terminal result");
     require(shutdown_cancellation.drained, "shutdown cancellation retained native lifecycle state");
-
-    tcp_fault_results_t tcp_faults;
-    if (options.transport == "tcp") {
-        tcp_faults.remoteFailure =
-            runTcpRemoteFailure(options, *source.agent, source.backend, adapter, inbox, suffix);
-        tcp_faults.notificationFailure =
-            runTcpNotificationFailure(options,
-                                      *source.agent,
-                                      source.backend,
-                                      adapter,
-                                      inbox,
-                                      suffix,
-                                      tcp_faults.dataRemoteFlushedBeforeNotificationFailure);
-    }
 
     requireStatus(adapter.close(), NIXL_SUCCESS, "close primary terminal channel");
     nixl::qualification::terminal_channel_inventory_t inventory;
@@ -1519,6 +1415,9 @@ run(int argc, char **argv) {
 
 int
 main(int argc, char **argv) {
+    if (nixl::qualification::isTerminalUcxPeerWorkerInvocation(argc, argv)) {
+        return nixl::qualification::runTerminalUcxPeerWorker(argc, argv);
+    }
     try {
         return run(argc, argv);
     }
