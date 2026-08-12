@@ -88,6 +88,24 @@ MockBackendEngine::checkXfer(nixlBackendReqH *handle) const {
 }
 
 nixl_status_t
+MockBackendEngine::queryXferAttestation(
+    const nixlBackendReqH *handle,
+    nixl_xfer_attestation_t &attestation) const {
+    assert(sharedState > 0);
+    return gmock_backend_engine->queryXferAttestation(handle, attestation);
+}
+
+nixl_status_t
+MockBackendEngine::subscribeXferTerminal(
+    nixlBackendReqH *handle,
+    const nixlBackendTransferEventBinding &binding,
+    const std::shared_ptr<nixlBackendTransferTransitionSink> &sink,
+    std::unique_ptr<nixlBackendEventSubscription> &subscription) {
+    sharedState++;
+    return gmock_backend_engine->subscribeXferTerminal(handle, binding, sink, subscription);
+}
+
+nixl_status_t
 MockBackendEngine::releaseReqH(nixlBackendReqH *handle) const {
     assert(sharedState > 0);
     return gmock_backend_engine->releaseReqH(handle);
@@ -125,6 +143,16 @@ MockBackendEngine::queryRemoteNotificationState(
     const nixlRemoteAgentBinding &binding) const {
     assert(sharedState > 0);
     return gmock_backend_engine->queryRemoteNotificationState(binding);
+}
+
+nixl_status_t
+MockBackendEngine::subscribeRemoteNotificationState(
+    const nixlRemoteAgentBinding &binding,
+    const std::shared_ptr<nixlBackendCapabilityTransitionSink> &sink,
+    std::unique_ptr<nixlBackendEventSubscription> &subscription) {
+    sharedState++;
+    return gmock_backend_engine->subscribeRemoteNotificationState(
+        binding, sink, subscription);
 }
 
 nixl_status_t

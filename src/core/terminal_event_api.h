@@ -117,6 +117,15 @@ private:
     [[nodiscard]] nixlBackendEventSubscriptionInventory
     backendInventory() const noexcept;
 
+    [[nodiscard]] nixl_status_t
+    drainCancellation() noexcept;
+
+    [[nodiscard]] bool
+    claimPublicRelease() noexcept;
+
+    void
+    restorePublicRelease() noexcept;
+
     [[nodiscard]] nixl_terminal_subscription_info_t
     snapshot() const noexcept;
 
@@ -131,6 +140,7 @@ private:
     std::shared_ptr<nixlTerminalTransferAdapter> transferAdapter_;
     std::shared_ptr<nixlTerminalCapabilityAdapter> capabilityAdapter_;
     bool cancellationRequested_ = false;
+    bool publicReleaseClaimed_ = false;
 
     friend class nixlAgent;
     friend class nixlTerminalEventSubscriptionTestPeer;

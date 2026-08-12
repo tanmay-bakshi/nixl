@@ -72,6 +72,15 @@ public:
                          const nixl_opt_b_args_t *opt_args) const override;
   nixl_status_t checkXfer(nixlBackendReqH *handle) const override;
   nixl_status_t
+  queryXferAttestation(const nixlBackendReqH *handle,
+                       nixl_xfer_attestation_t &attestation) const override;
+  nixl_status_t
+  subscribeXferTerminal(
+      nixlBackendReqH *handle,
+      const nixlBackendTransferEventBinding &binding,
+      const std::shared_ptr<nixlBackendTransferTransitionSink> &sink,
+      std::unique_ptr<nixlBackendEventSubscription> &subscription) override;
+  nixl_status_t
   releaseReqH(nixlBackendReqH *handle) const override;
 
   nixl_status_t
@@ -98,6 +107,11 @@ public:
   nixl_status_t retireRemoteAgent(const nixlRemoteAgentBinding &binding) override;
   nixl_status_t queryRemoteNotificationState(
       const nixlRemoteAgentBinding &binding) const override;
+  nixl_status_t
+  subscribeRemoteNotificationState(
+      const nixlRemoteAgentBinding &binding,
+      const std::shared_ptr<nixlBackendCapabilityTransitionSink> &sink,
+      std::unique_ptr<nixlBackendEventSubscription> &subscription) override;
   nixl_status_t loadRemoteMD(const nixlBlobDesc &input,
                              const nixl_mem_t &nixl_mem,
                              const std::string &remote_agent,

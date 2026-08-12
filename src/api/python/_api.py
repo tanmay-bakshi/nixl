@@ -31,8 +31,17 @@ DEFAULT_COMM_PORT = nixlBind.DEFAULT_COMM_PORT
 nixl_xfer_attestation_snapshot = nixlBind.nixlXferAttestationSnapshot
 nixl_xfer_attestation_transport = nixlBind.nixlXferAttestationTransport
 nixl_xfer_completion_receipt = nixlBind.nixlXferCompletionReceipt
+nixl_terminal_event = nixlBind.nixlTerminalEvent
+nixl_terminal_event_batch = nixlBind.nixlTerminalEventBatch
+nixl_terminal_channel_inventory = nixlBind.nixlTerminalChannelInventory
+nixl_terminal_subscription_info = nixlBind.nixlTerminalSubscriptionInfo
+nixl_terminal_event_kind_t = nixlBind.nixl_terminal_event_kind_t
+nixl_terminal_capability_state_t = nixlBind.nixl_terminal_capability_state_t
+nixl_terminal_channel_fatal_t = nixlBind.nixl_terminal_channel_fatal_t
 
 _REMOTE_HANDLE_CONSTRUCTION_TOKEN = object()
+_TERMINAL_CHANNEL_CONSTRUCTION_TOKEN = object()
+_TERMINAL_SUBSCRIPTION_CONSTRUCTION_TOKEN = object()
 
 
 """
@@ -189,6 +198,177 @@ class nixl_remote_agent_handle:
         )
 
 
+class nixl_terminal_event_subscription:
+    """Agent-owned exact-generation terminal-event subscription.
+
+    The channel retains this wrapper until :meth:`release` succeeds. An
+    asynchronous transfer cancellation returns ``NIXL_IN_PROG`` and preserves
+    the native handle until its exact terminal event is delivered.
+    """
+
+    __slots__ = ("_channel", "_native_handle", "_released")
+
+    _channel: "nixl_terminal_event_channel"
+    _native_handle: nixlBind.nixlTerminalEventSubscriptionH
+    _released: bool
+
+    def __init__(
+        self,
+        channel: "nixl_terminal_event_channel",
+        native_handle: nixlBind.nixlTerminalEventSubscriptionH,
+        construction_token: object,
+    ) -> None:
+        """Create an agent-owned subscription wrapper.
+
+        :param channel: Owning terminal-event channel.
+        :param native_handle: Agent-owned native subscription handle.
+        :param construction_token: Module-private construction authority.
+        """
+        if construction_token is not _TERMINAL_SUBSCRIPTION_CONSTRUCTION_TOKEN:
+            raise TypeError(
+                "terminal-event subscriptions can only be created by nixl_agent"
+            )
+        self._channel = channel
+        self._native_handle = native_handle
+        self._released = False
+
+    def query(self) -> nixl_terminal_subscription_info:
+        """Return an immutable snapshot of the exact binding and lifecycle.
+
+        :returns: Current subscription information.
+        :raises RuntimeError: If release already consumed the public handle.
+        """
+        if self._released:
+            raise RuntimeError("terminal-event subscription has already been released")
+        return self._channel._owner.agent.queryTerminalEventSubscription(
+            self._native_handle
+        )
+
+    def release(self) -> nixlBind.nixl_status_t:
+        """Request cancellation or consume an already-terminal public handle.
+
+        :returns: ``NIXL_IN_PROG`` while exact transfer cancellation is pending,
+            or ``NIXL_SUCCESS`` once release consumes the public handle.
+        :raises RuntimeError: If release already consumed the public handle.
+        """
+        if self._released:
+            raise RuntimeError("terminal-event subscription has already been released")
+        status = self._channel._owner.agent.releaseTerminalEventSubscription(
+            self._native_handle
+        )
+        if status == nixlBind.NIXL_SUCCESS:
+            self._released = True
+            self._channel._forget(self)
+        return status
+
+    def __repr__(self) -> str:
+        """Return a diagnostic representation without dereferencing a stale handle.
+
+        :returns: Subscription representation.
+        """
+        return f"nixl_terminal_event_subscription(released={self._released})"
+
+
+class nixl_terminal_event_channel:
+    """One bounded, agent-scoped channel for autonomous native events."""
+
+    __slots__ = ("_native_handle", "_owner", "_subscriptions")
+
+    _native_handle: nixlBind.nixlTerminalEventChannelH
+    _owner: "nixl_agent"
+    _subscriptions: dict[int, nixl_terminal_event_subscription]
+
+    def __init__(
+        self,
+        owner: "nixl_agent",
+        native_handle: nixlBind.nixlTerminalEventChannelH,
+        construction_token: object,
+    ) -> None:
+        """Create the sole channel wrapper for one agent.
+
+        :param owner: Owning high-level NIXL agent.
+        :param native_handle: Agent-owned native channel handle.
+        :param construction_token: Module-private construction authority.
+        """
+        if construction_token is not _TERMINAL_CHANNEL_CONSTRUCTION_TOKEN:
+            raise TypeError("terminal-event channels can only be created by nixl_agent")
+        self._owner = owner
+        self._native_handle = native_handle
+        self._subscriptions = {}
+
+    def fileno(self) -> int:
+        """Return the borrowed poll descriptor.
+
+        The descriptor may be registered with a selector, but must not be read,
+        duplicated as ownership, or closed by the caller.
+
+        :returns: Borrowed nonblocking eventfd.
+        """
+        return int(
+            self._owner.agent.getTerminalEventChannelFd(self._native_handle)
+        )
+
+    def drain(self) -> nixl_terminal_event_batch:
+        """Drain all currently queued events without querying transfer handles.
+
+        :returns: Immutable event batch and post-drain inventory.
+        """
+        return self._owner.agent.drainTerminalEvents(self._native_handle)
+
+    def query_inventory(self) -> nixl_terminal_channel_inventory:
+        """Return immutable channel and native-producer inventory.
+
+        :returns: Current channel inventory and sticky fatal state.
+        """
+        return self._owner.agent.queryTerminalEventChannel(self._native_handle)
+
+    def close(self) -> nixlBind.nixl_status_t:
+        """Stop admission and close once all subscriptions are released.
+
+        :returns: ``NIXL_SUCCESS`` for a clean close.
+        :raises nixlBind.nixlNotAllowedError: If live subscriptions make the
+            close fail closed.
+        """
+        return self._owner.agent.closeTerminalEventChannel(self._native_handle)
+
+    def _retain(
+        self, native_handle: nixlBind.nixlTerminalEventSubscriptionH
+    ) -> nixl_terminal_event_subscription:
+        """Retain one public handle until explicit release succeeds.
+
+        :param native_handle: Agent-owned native subscription handle.
+        :returns: Canonical high-level subscription wrapper.
+        """
+        subscription = nixl_terminal_event_subscription(
+            self,
+            native_handle,
+            _TERMINAL_SUBSCRIPTION_CONSTRUCTION_TOKEN,
+        )
+        self._subscriptions[id(native_handle)] = subscription
+        return subscription
+
+    def _forget(self, subscription: nixl_terminal_event_subscription) -> None:
+        """Drop a wrapper only after native release consumed its handle.
+
+        :param subscription: Successfully released subscription.
+        """
+        key = id(subscription._native_handle)
+        retained = self._subscriptions.get(key)
+        if retained is not subscription:
+            raise RuntimeError("terminal-event subscription ownership mismatch")
+        del self._subscriptions[key]
+
+    def __repr__(self) -> str:
+        """Return a diagnostic channel representation.
+
+        :returns: Channel representation.
+        """
+        return (
+            "nixl_terminal_event_channel("
+            f"retained_subscriptions={len(self._subscriptions)})"
+        )
+
+
 # Opaque handle for backend can be just int, as it's not passed to the user
 nixl_backend_handle = int
 
@@ -292,6 +472,7 @@ class nixl_agent:
         self.name = agent_name
         self._leaked_xfer_handles: list[int] = []
         self._remote_agent_handles: dict[int, nixl_remote_agent_handle] = {}
+        self._terminal_event_channel: nixl_terminal_event_channel | None = None
         self.notifs: dict[nixl_remote_agent_handle, list[bytes]] = {}
         self.backends: dict[str, nixl_backend_handle] = {}
         self.backend_mems: dict[str, list[str]] = {}
@@ -923,6 +1104,86 @@ class nixl_agent:
             raise ValueError("transfer handle belongs to a different NIXL agent")
         if handle._released:
             raise ValueError("transfer handle has already been released")
+
+    def create_terminal_event_channel(
+        self, capacity: int
+    ) -> nixl_terminal_event_channel:
+        """Create this agent's sole bounded autonomous-event channel.
+
+        :param capacity: Positive maximum number of queued events.
+        :returns: Agent-owned terminal-event channel.
+        :raises RuntimeError: If this agent already created a channel.
+        """
+        if self._terminal_event_channel is not None:
+            raise RuntimeError("this NIXL agent already owns a terminal-event channel")
+        native_handle = self.agent.createTerminalEventChannel(capacity)
+        channel = nixl_terminal_event_channel(
+            self, native_handle, _TERMINAL_CHANNEL_CONSTRUCTION_TOKEN
+        )
+        self._terminal_event_channel = channel
+        return channel
+
+    def subscribe_xfer_terminal(
+        self,
+        channel: nixl_terminal_event_channel,
+        handle: nixl_xfer_handle,
+        owner_cookie: int,
+    ) -> nixl_terminal_event_subscription:
+        """Arm autonomous terminal delivery for the transfer's next generation.
+
+        :param channel: This agent's terminal-event channel.
+        :param handle: Transfer handle owned by this agent.
+        :param owner_cookie: Positive opaque owner correlation identity.
+        :returns: Retained exact-generation subscription.
+        """
+        self._validate_terminal_event_channel(channel)
+        self._validate_xfer_attestation_handle(handle)
+        native_handle = self.agent.subscribeXferTerminal(
+            channel._native_handle, handle._handle, owner_cookie
+        )
+        return channel._retain(native_handle)
+
+    def subscribe_remote_notification_state(
+        self,
+        channel: nixl_terminal_event_channel,
+        remote_agent: nixl_remote_agent_handle,
+        backend: str,
+        owner_cookie: int,
+    ) -> nixl_terminal_event_subscription:
+        """Subscribe to state transitions for one exact notification route.
+
+        :param channel: This agent's terminal-event channel.
+        :param remote_agent: Active remote-agent handle owned by this agent.
+        :param backend: Instantiated backend name for the route.
+        :param owner_cookie: Positive opaque owner correlation identity.
+        :returns: Retained exact-route capability subscription.
+        :raises ValueError: If the backend is not instantiated by this agent.
+        """
+        self._validate_terminal_event_channel(channel)
+        native_remote_agent = self._unwrap_remote_agent(remote_agent)
+        if backend not in self.backends:
+            raise ValueError(f"backend {backend!r} is not instantiated by this agent")
+        native_handle = self.agent.subscribeRemoteNotificationState(
+            channel._native_handle,
+            native_remote_agent,
+            self.backends[backend],
+            owner_cookie,
+        )
+        return channel._retain(native_handle)
+
+    def _validate_terminal_event_channel(
+        self, channel: nixl_terminal_event_channel
+    ) -> None:
+        """Validate the canonical channel wrapper for this agent.
+
+        :param channel: Channel wrapper to validate.
+        :raises TypeError: If the value is not a terminal-event channel.
+        :raises ValueError: If another agent owns the channel.
+        """
+        if not isinstance(channel, nixl_terminal_event_channel):
+            raise TypeError("channel must be a nixl_terminal_event_channel")
+        if channel._owner is not self or self._terminal_event_channel is not channel:
+            raise ValueError("terminal-event channel belongs to a different NIXL agent")
 
     """
     @brief  Releases a transfer handle, which internally frees the memory used for the handle.

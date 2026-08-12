@@ -99,6 +99,17 @@ public:
                  const nixl_opt_b_args_t *extra_args),
                 (const, override));
     MOCK_METHOD(nixl_status_t, checkXfer, (nixlBackendReqH * req), (const, override));
+    MOCK_METHOD(nixl_status_t,
+                queryXferAttestation,
+                (const nixlBackendReqH *req, nixl_xfer_attestation_t &attestation),
+                (const, override));
+    MOCK_METHOD(nixl_status_t,
+                subscribeXferTerminal,
+                (nixlBackendReqH *req,
+                 const nixlBackendTransferEventBinding &binding,
+                 const std::shared_ptr<nixlBackendTransferTransitionSink> &sink,
+                 std::unique_ptr<nixlBackendEventSubscription> &subscription),
+                (override));
     MOCK_METHOD(nixl_status_t, releaseReqH, (nixlBackendReqH * req), (const, override));
     MOCK_METHOD(nixl_status_t,
                 prepMemView,
@@ -131,6 +142,12 @@ public:
                 queryRemoteNotificationState,
                 (const nixlRemoteAgentBinding &binding),
                 (const, override));
+    MOCK_METHOD(nixl_status_t,
+                subscribeRemoteNotificationState,
+                (const nixlRemoteAgentBinding &binding,
+                 const std::shared_ptr<nixlBackendCapabilityTransitionSink> &sink,
+                 std::unique_ptr<nixlBackendEventSubscription> &subscription),
+                (override));
     MOCK_METHOD(nixl_status_t,
                 loadRemoteMD,
                 (const nixlBlobDesc &input,

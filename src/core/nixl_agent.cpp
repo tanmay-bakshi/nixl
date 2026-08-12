@@ -445,17 +445,24 @@ nixlAgent::~nixlAgent() {
             static_cast<void>(identity);
             terminal_subscriptions.push_back(subscription);
         }
-        data->terminalSubscriptions_.clear();
-        data->ownedTerminalSubscriptions_.clear();
     }
     for (const std::shared_ptr<nixlTerminalEventSubscriptionH> &subscription :
          terminal_subscriptions) {
-        const nixl_status_t status = subscription->requestCancellation();
-        if (status != NIXL_SUCCESS) {
-            NIXL_WARN << "Terminal subscription did not drain during agent destruction: "
-                      << status;
+        nixl_status_t status = subscription->requestCancellation();
+        if (status == NIXL_IN_PROG) {
+            status = subscription->drainCancellation();
         }
-        subscription->markTerminal();
+        if (status != NIXL_SUCCESS || subscription->snapshot().active) {
+            NIXL_ERROR << "Terminal subscription cancellation could not drain during agent "
+                          "destruction: "
+                       << status;
+            std::terminate();
+        }
+    }
+    {
+        NIXL_LOCK_GUARD(data->lock);
+        data->ownedTerminalSubscriptions_.clear();
+        data->terminalSubscriptions_.clear();
     }
 
     NIXL_LOCK_GUARD(data->lock);
@@ -1926,10 +1933,14 @@ nixlAgent::releaseTerminalEventSubscription(
         }
         subscription_identity = owned->second;
         retained = data->terminalSubscriptions_.at(subscription_identity);
+        if (!retained->claimPublicRelease()) {
+            return NIXL_ERR_NOT_ALLOWED;
+        }
     }
 
     const nixl_status_t status = retained->requestCancellation();
     if (status != NIXL_SUCCESS) {
+        retained->restorePublicRelease();
         return status;
     }
 

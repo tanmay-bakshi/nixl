@@ -19,9 +19,13 @@
 #include <gmock/gmock.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <random>
 #include <regex>
+#include <thread>
 
 #include "common.h"
 #include "nixl.h"
@@ -34,6 +38,124 @@ namespace agent {
     static constexpr const char *local_agent_name = "LocalAgent";
     static constexpr const char *remote_agent_name = "RemoteAgent";
     static constexpr const char *nonexisting_plugin = "NonExistingPlugin";
+
+    struct delayedCancellationState {
+        std::atomic<int> cancelCalls = 0;
+        std::atomic<int> drainCalls = 0;
+        std::atomic<int> terminalPublications = 0;
+        std::atomic<int> destructions = 0;
+        std::atomic<size_t> retainedSubscriptionsDuringDrain = 0;
+        std::atomic<bool> drainCompleted = false;
+        std::atomic<bool> destructionObservedExactDrain = false;
+        nixlAgent *owner = nullptr;
+        nixlTerminalEventChannelH *channel = nullptr;
+    };
+
+    class delayedCapabilitySubscription final : public nixlBackendEventSubscription {
+    public:
+        delayedCapabilitySubscription(
+            const nixlRemoteAgentBinding &binding,
+            std::shared_ptr<nixlBackendCapabilityTransitionSink> sink,
+            std::shared_ptr<delayedCancellationState> state)
+            : binding_(binding),
+              sink_(std::move(sink)),
+              state_(std::move(state)) {}
+
+        ~delayedCapabilitySubscription() override {
+            if (publisher_.joinable()) {
+                publisher_.join();
+            }
+            state_->destructionObservedExactDrain =
+                state_->cancelCalls == 1 && state_->drainCalls == 1 &&
+                state_->terminalPublications == 1 && state_->drainCompleted;
+            ++state_->destructions;
+        }
+
+        nixl_status_t
+        cancel() noexcept override {
+            ++state_->cancelCalls;
+            const std::lock_guard lock(mutex_);
+            if (!publisher_.joinable()) {
+                publisher_ = std::thread([this]() {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    sink_->publish({
+                        .remoteHandleIdentity = binding_.authority.handleIdentity,
+                        .remoteHandleGeneration = binding_.authority.generation,
+                        .state = nixl_backend_capability_state_t::RETIRED,
+                        .capabilityEpoch = 1,
+                    });
+                    ++state_->terminalPublications;
+                });
+            }
+            return NIXL_IN_PROG;
+        }
+
+        nixl_status_t
+        drainCancellation() noexcept override {
+            ++state_->drainCalls;
+            if (publisher_.joinable()) {
+                publisher_.join();
+            }
+            size_t subscription_count = 0;
+            if (state_->owner == nullptr || state_->channel == nullptr ||
+                state_->owner->getTerminalEventSubscriptionCount(
+                    state_->channel, subscription_count) != NIXL_SUCCESS) {
+                return NIXL_ERR_BACKEND;
+            }
+            state_->retainedSubscriptionsDuringDrain = subscription_count;
+            state_->drainCompleted = true;
+            return NIXL_SUCCESS;
+        }
+
+    private:
+        const nixlRemoteAgentBinding binding_;
+        const std::shared_ptr<nixlBackendCapabilityTransitionSink> sink_;
+        const std::shared_ptr<delayedCancellationState> state_;
+        std::mutex mutex_;
+        std::thread publisher_;
+    };
+
+    struct blockingCancellationState {
+        std::mutex mutex;
+        std::condition_variable condition;
+        bool cancelEntered = false;
+        bool allowCompletion = false;
+        std::atomic<int> cancelCalls = 0;
+    };
+
+    class blockingCapabilitySubscription final : public nixlBackendEventSubscription {
+    public:
+        blockingCapabilitySubscription(
+            const nixlRemoteAgentBinding &binding,
+            std::shared_ptr<nixlBackendCapabilityTransitionSink> sink,
+            std::shared_ptr<blockingCancellationState> state)
+            : binding_(binding),
+              sink_(std::move(sink)),
+              state_(std::move(state)) {}
+
+        nixl_status_t
+        cancel() noexcept override {
+            ++state_->cancelCalls;
+            {
+                std::unique_lock lock(state_->mutex);
+                state_->cancelEntered = true;
+                state_->condition.notify_all();
+                state_->condition.wait(lock, [this]() { return state_->allowCompletion; });
+            }
+            sink_->publish({
+                .remoteHandleIdentity = binding_.authority.handleIdentity,
+                .remoteHandleGeneration = binding_.authority.generation,
+                .state = nixl_backend_capability_state_t::RETIRED,
+                .capabilityEpoch = 1,
+            });
+            return NIXL_SUCCESS;
+        }
+
+    private:
+        const nixlRemoteAgentBinding binding_;
+        const std::shared_ptr<nixlBackendCapabilityTransitionSink> sink_;
+        const std::shared_ptr<blockingCancellationState> state_;
+    };
 
     /* Generates a random number in [0,255] (byte range). */
     unsigned char
@@ -208,6 +330,122 @@ namespace agent {
             agent_ = agent_helper_->getAgent();
         }
     };
+
+    TEST_F(dualAgentBridgeFixture,
+           TerminalSubscriptionDestructionDrainsExactCancellationTest) {
+        auto &backend = local_agent_helper_->getGMockEngine();
+        ON_CALL(backend, supportsAuthenticatedNotif())
+            .WillByDefault(testing::Return(true));
+        const auto state = std::make_shared<delayedCancellationState>();
+        ON_CALL(backend, subscribeRemoteNotificationState(testing::_, testing::_, testing::_))
+            .WillByDefault(
+                [state](const nixlRemoteAgentBinding &binding,
+                        const std::shared_ptr<nixlBackendCapabilityTransitionSink> &sink,
+                        std::unique_ptr<nixlBackendEventSubscription> &subscription) {
+                    subscription = std::make_unique<delayedCapabilitySubscription>(
+                        binding, sink, state);
+                    return NIXL_SUCCESS;
+                });
+
+        nixl_b_params_t local_params, remote_params;
+        nixlBackendH *local_backend = nullptr;
+        nixlBackendH *remote_backend = nullptr;
+        ASSERT_EQ(local_agent_helper_->createBackendWithGMock(local_params, local_backend),
+                  NIXL_SUCCESS);
+        ASSERT_EQ(remote_agent_helper_->createBackendWithGMock(remote_params, remote_backend),
+                  NIXL_SUCCESS);
+
+        nixlRemoteAgentH *remote_handle = nullptr;
+        ASSERT_EQ(local_agent_helper_->getAndLoadRemoteMd(remote_agent_, remote_handle),
+                  NIXL_SUCCESS);
+        nixlTerminalEventChannelH *channel = nullptr;
+        ASSERT_EQ(local_agent_->createTerminalEventChannel(4, channel), NIXL_SUCCESS);
+        nixlTerminalEventSubscriptionH *subscription = nullptr;
+        ASSERT_EQ(local_agent_->subscribeRemoteNotificationState(
+                      channel, remote_handle, local_backend, 7, subscription),
+                  NIXL_SUCCESS);
+        state->owner = local_agent_;
+        state->channel = channel;
+
+        local_agent_helper_.reset();
+        local_agent_ = nullptr;
+
+        EXPECT_EQ(state->cancelCalls, 1);
+        EXPECT_EQ(state->drainCalls, 1);
+        EXPECT_EQ(state->terminalPublications, 1);
+        EXPECT_EQ(state->retainedSubscriptionsDuringDrain, 1U);
+        EXPECT_TRUE(state->drainCompleted);
+        EXPECT_EQ(state->destructions, 1);
+        EXPECT_TRUE(state->destructionObservedExactDrain);
+    }
+
+    TEST_F(dualAgentBridgeFixture,
+           TerminalSubscriptionReleaseIsTakeOnceAndInvalidatesIdentityTest) {
+        auto &backend = local_agent_helper_->getGMockEngine();
+        ON_CALL(backend, supportsAuthenticatedNotif())
+            .WillByDefault(testing::Return(true));
+        const auto state = std::make_shared<blockingCancellationState>();
+        ON_CALL(backend, subscribeRemoteNotificationState(testing::_, testing::_, testing::_))
+            .WillByDefault(
+                [state](const nixlRemoteAgentBinding &binding,
+                        const std::shared_ptr<nixlBackendCapabilityTransitionSink> &sink,
+                        std::unique_ptr<nixlBackendEventSubscription> &subscription) {
+                    subscription = std::make_unique<blockingCapabilitySubscription>(
+                        binding, sink, state);
+                    return NIXL_SUCCESS;
+                });
+
+        nixl_b_params_t local_params, remote_params;
+        nixlBackendH *local_backend = nullptr;
+        nixlBackendH *remote_backend = nullptr;
+        ASSERT_EQ(local_agent_helper_->createBackendWithGMock(local_params, local_backend),
+                  NIXL_SUCCESS);
+        ASSERT_EQ(remote_agent_helper_->createBackendWithGMock(remote_params, remote_backend),
+                  NIXL_SUCCESS);
+
+        nixlRemoteAgentH *remote_handle = nullptr;
+        ASSERT_EQ(local_agent_helper_->getAndLoadRemoteMd(remote_agent_, remote_handle),
+                  NIXL_SUCCESS);
+        nixlTerminalEventChannelH *channel = nullptr;
+        ASSERT_EQ(local_agent_->createTerminalEventChannel(4, channel), NIXL_SUCCESS);
+        nixlTerminalEventSubscriptionH *subscription = nullptr;
+        ASSERT_EQ(local_agent_->subscribeRemoteNotificationState(
+                      channel, remote_handle, local_backend, 7, subscription),
+                  NIXL_SUCCESS);
+
+        nixl_status_t winning_status = NIXL_ERR_UNKNOWN;
+        std::thread winner([&]() {
+            winning_status =
+                local_agent_->releaseTerminalEventSubscription(subscription);
+        });
+        {
+            std::unique_lock lock(state->mutex);
+            state->condition.wait(lock, [state]() { return state->cancelEntered; });
+        }
+
+        EXPECT_EQ(local_agent_->releaseTerminalEventSubscription(subscription),
+                  NIXL_ERR_NOT_ALLOWED);
+        {
+            const std::lock_guard lock(state->mutex);
+            state->allowCompletion = true;
+        }
+        state->condition.notify_all();
+        winner.join();
+
+        EXPECT_EQ(winning_status, NIXL_SUCCESS);
+        EXPECT_EQ(state->cancelCalls, 1);
+        nixl_terminal_subscription_info_t info;
+        EXPECT_EQ(local_agent_->queryTerminalEventSubscription(subscription, info),
+                  NIXL_ERR_INVALID_PARAM);
+        EXPECT_EQ(local_agent_->releaseTerminalEventSubscription(subscription),
+                  NIXL_ERR_INVALID_PARAM);
+        size_t subscription_count = 1;
+        EXPECT_EQ(local_agent_->getTerminalEventSubscriptionCount(
+                      channel, subscription_count),
+                  NIXL_SUCCESS);
+        EXPECT_EQ(subscription_count, 0U);
+        EXPECT_EQ(local_agent_->closeTerminalEventChannel(channel), NIXL_SUCCESS);
+    }
 
     TEST_F(singleAgentSessionFixture, GetNonExistingPluginTest) {
         nixl_mem_list_t mem;

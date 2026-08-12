@@ -264,6 +264,13 @@ namespace {
         EXPECT_THROW(static_cast<void>(terminalEventChannel(0)), std::invalid_argument);
     }
 
+    TEST(TerminalEventChannel, RejectsUnboundedCapacityBeforeAllocatingStorage) {
+        EXPECT_THROW(
+            static_cast<void>(
+                terminalEventChannel(terminal_event_channel_max_capacity + 1)),
+            std::invalid_argument);
+    }
+
     TEST(TerminalEventChannel, RejectsInexactSubscriptionBindings) {
         terminalEventChannel channel(1);
         EXPECT_THROW(static_cast<void>(channel.subscribe(transferBinding(0, 1, 1))),

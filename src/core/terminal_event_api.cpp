@@ -332,6 +332,44 @@ nixlTerminalEventSubscriptionH::backendInventory() const noexcept {
     return inventory;
 }
 
+nixl_status_t
+nixlTerminalEventSubscriptionH::drainCancellation() noexcept {
+    nixlBackendEventSubscription *backend_subscription = nullptr;
+    {
+        const std::lock_guard lock(mutex_);
+        if (!info_.active) {
+            return NIXL_SUCCESS;
+        }
+        if (backendSubscription_ == nullptr) {
+            return NIXL_ERR_BACKEND;
+        }
+        backend_subscription = backendSubscription_.get();
+    }
+
+    const nixl_status_t status = backend_subscription->drainCancellation();
+    if (status != NIXL_SUCCESS) {
+        return status;
+    }
+    const std::lock_guard lock(mutex_);
+    return info_.active ? NIXL_ERR_BACKEND : NIXL_SUCCESS;
+}
+
+bool
+nixlTerminalEventSubscriptionH::claimPublicRelease() noexcept {
+    const std::lock_guard lock(mutex_);
+    if (publicReleaseClaimed_) {
+        return false;
+    }
+    publicReleaseClaimed_ = true;
+    return true;
+}
+
+void
+nixlTerminalEventSubscriptionH::restorePublicRelease() noexcept {
+    const std::lock_guard lock(mutex_);
+    publicReleaseClaimed_ = false;
+}
+
 nixl_terminal_subscription_info_t
 nixlTerminalEventSubscriptionH::snapshot() const noexcept {
     const std::lock_guard lock(mutex_);
