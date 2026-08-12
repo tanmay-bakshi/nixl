@@ -253,10 +253,7 @@ agentConfig() {
 [[nodiscard]] nixl_b_params_t
 backendParameters(const std::string &transport, const std::string &engine) {
     nixl_b_params_t parameters;
-    parameters["ucx_error_handling_mode"] = "peer";
-    if (transport == "self") {
-        parameters["engine_config"] = "UNIFIED_MODE=y";
-    }
+    parameters["ucx_error_handling_mode"] = transport == "self" ? "none" : "peer";
     if (engine == "shared") {
         parameters["num_workers"] = "2";
         parameters["num_threads"] = "0";
@@ -576,7 +573,13 @@ run(int argc, char **argv) {
     const options_t options = parseOptions(argc, argv);
     const std::string suffix = std::to_string(static_cast<unsigned long long>(getpid()));
     nixlAgent source_agent("qualification-source-" + suffix, agentConfig());
-    nixlAgent destination_agent("qualification-destination-" + suffix, agentConfig());
+    std::unique_ptr<nixlAgent> remote_agent;
+    nixlAgent *destination_agent = &source_agent;
+    if (options.transport == "tcp") {
+        remote_agent =
+            std::make_unique<nixlAgent>("qualification-destination-" + suffix, agentConfig());
+        destination_agent = remote_agent.get();
+    }
 
     nixlBackendH *source_backend = nullptr;
     nixlBackendH *destination_backend = nullptr;
@@ -584,9 +587,13 @@ run(int argc, char **argv) {
     requireStatus(source_agent.createBackend("UCX", parameters, source_backend),
                   NIXL_SUCCESS,
                   "create source UCX backend");
-    requireStatus(destination_agent.createBackend("UCX", parameters, destination_backend),
-                  NIXL_SUCCESS,
-                  "create destination UCX backend");
+    if (destination_agent == &source_agent) {
+        destination_backend = source_backend;
+    } else {
+        requireStatus(destination_agent->createBackend("UCX", parameters, destination_backend),
+                      NIXL_SUCCESS,
+                      "create destination UCX backend");
+    }
     require(source_backend != nullptr && destination_backend != nullptr,
             "UCX backend handle is null");
 
@@ -611,11 +618,11 @@ run(int argc, char **argv) {
         source_buffers.push_back(
             std::make_unique<registered_buffers_t>(source_agent, source_backend, spec, true));
         destination_buffers.push_back(std::make_unique<registered_buffers_t>(
-            destination_agent, destination_backend, spec, false));
+            *destination_agent, destination_backend, spec, false));
     }
 
     nixl_blob_t destination_metadata;
-    requireStatus(destination_agent.getLocalMD(destination_metadata),
+    requireStatus(destination_agent->getLocalMD(destination_metadata),
                   NIXL_SUCCESS,
                   "get destination metadata");
     nixlRemoteAgentH *destination_handle = nullptr;
