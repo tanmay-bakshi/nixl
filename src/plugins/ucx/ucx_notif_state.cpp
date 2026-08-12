@@ -125,8 +125,14 @@ public:
         callbacksDrained_.wait(lock, [this] { return callbacksInFlight_ == 0; });
     }
 
+    [[nodiscard]] std::size_t
+    inFlightCount() const noexcept {
+        const std::lock_guard lock(mutex_);
+        return callbacksInFlight_;
+    }
+
 private:
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     std::condition_variable callbacksDrained_;
     std::shared_ptr<notif_route_transition_sink_t> sink_;
     std::deque<notif_route_transition_t> pending_;
@@ -486,6 +492,25 @@ notif_capability_state_t::unsubscribeRemoteNotificationState(
         routeSubscriptions_.erase(known);
     }
     return notif_route_subscription_status_t::SUCCESS;
+}
+
+notif_route_subscription_inventory_t
+notif_capability_state_t::querySubscriptionInventory(
+    const notif_route_subscription_t &subscription) const noexcept {
+    std::shared_ptr<route_delivery_state_t> delivery;
+    {
+        const std::lock_guard lock(mutex_);
+        const auto known = routeSubscriptions_.find(subscription.route);
+        if (known == routeSubscriptions_.end() ||
+            known->second.generation != subscription.generation) {
+            return {};
+        }
+        delivery = known->second.delivery;
+    }
+    return {
+        .retainedSubscriptions = 1,
+        .inFlightDeliveries = delivery->inFlightCount(),
+    };
 }
 
 notif_wire_envelope_t

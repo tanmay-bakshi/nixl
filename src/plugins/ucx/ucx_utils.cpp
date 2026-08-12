@@ -182,6 +182,9 @@ nixlUcxEp::err_cb(ucp_ep_h ucp_ep, ucs_status_t status) {
         if (UCS_PTR_IS_PTR(request)) {
             ucp_request_free(request);
         }
+        if (failureHandler_) {
+            failureHandler_();
+        }
         return;
     }
     NIXL_FATAL << "Invalid endpoint state: " << state;
@@ -234,9 +237,11 @@ nixlUcxEp::closeImpl(ucp_ep_close_flags_t flags) {
 nixlUcxEp::nixlUcxEp(ucp_worker_h worker,
                      uint64_t worker_identity,
                      const void *addr,
-                     ucp_err_handling_mode_t err_handling_mode)
+                     ucp_err_handling_mode_t err_handling_mode,
+                     failure_handler_t failure_handler)
     : workerIdentity_(worker_identity),
-      identity_(allocateIdentity(next_endpoint_identity)) {
+      identity_(allocateIdentity(next_endpoint_identity)),
+      failureHandler_(std::move(failure_handler)) {
     ucp_ep_params_t ep_params;
     ucp_worker_attr_t worker_attr = {
         .field_mask = UCP_WORKER_ATTR_FIELD_MAX_INFO_STRING,
@@ -284,7 +289,11 @@ nixlUcxEp::disconnect_nb() {
  * Active message handling
  * =========================================== */
 
-using nixl_ucx_am_cb_ctx_t = std::pair<void *, nixlUcxEp::am_deleter_t>;
+struct nixl_ucx_am_cb_ctx_t {
+    void *buffer = nullptr;
+    nixlUcxEp::am_deleter_t deleter;
+    nixl::ucx::ucx_callback_slot_t *terminalSlot = nullptr;
+};
 using nixl_ucx_am_cb_ctx_ptr_t = std::unique_ptr<nixl_ucx_am_cb_ctx_t>;
 
 void
@@ -294,7 +303,15 @@ nixlUcxEp::sendAmCallback(void *request, ucs_status_t status, void *user_data) {
                    << ucs_status_string(status) << ")";
     }
     auto ctx = static_cast<nixl_ucx_am_cb_ctx_t *>(user_data);
-    ctx->second(request, ctx->first);
+    if (ctx->deleter) {
+        ctx->deleter(request, ctx->buffer);
+    }
+    if (ctx->terminalSlot != nullptr) {
+        ctx->terminalSlot->recordCallback(
+            request,
+            nixl::ucx::ucsToNixlStatus(status),
+            nixl::ucx::terminalProgressTimestampNs());
+    }
     delete ctx;
 }
 
@@ -306,7 +323,8 @@ nixlUcxEp::sendAm(nixl::ucx::am_cb_op_t msg_id,
                   size_t len,
                   uint32_t flags,
                   nixlUcxReq *req,
-                  const am_deleter_t &deleter) {
+                  const am_deleter_t &deleter,
+                  nixl::ucx::ucx_callback_slot_t *terminal_slot) {
     const nixl_status_t status = checkTxState();
     if (status != NIXL_SUCCESS) {
         return status;
@@ -318,11 +336,19 @@ nixlUcxEp::sendAm(nixl::ucx::am_cb_op_t msg_id,
     param.flags = flags;
 
     nixl_ucx_am_cb_ctx_ptr_t ctx;
-    if (deleter) {
-        ctx = std::make_unique<nixl_ucx_am_cb_ctx_t>(buffer, deleter);
+    if (deleter || terminal_slot != nullptr) {
+        ctx = std::make_unique<nixl_ucx_am_cb_ctx_t>(
+            nixl_ucx_am_cb_ctx_t{
+                .buffer = buffer,
+                .deleter = deleter,
+                .terminalSlot = terminal_slot,
+            });
         param.op_attr_mask |= UCP_OP_ATTR_FIELD_CALLBACK | UCP_OP_ATTR_FIELD_USER_DATA;
         param.cb.send = sendAmCallback;
         param.user_data = ctx.get();
+    }
+    if (terminal_slot != nullptr) {
+        param.flags |= UCP_OP_ATTR_FLAG_NO_IMM_CMPL;
     }
 
     const ucs_status_ptr_t request =
@@ -352,7 +378,8 @@ nixlUcxEp::read(uint64_t raddr,
                 size_t size,
                 nixlUcxReq &req,
                 std::string &request_info,
-                std::vector<nixl_xfer_attestation_transport_t> &selected_transports) {
+                std::vector<nixl_xfer_attestation_transport_t> &selected_transports,
+                nixl::ucx::ucx_callback_slot_t *terminal_slot) {
     nixl_status_t status = checkTxState();
     if (status != NIXL_SUCCESS) {
         return status;
@@ -363,12 +390,20 @@ nixlUcxEp::read(uint64_t raddr,
             UCP_OP_ATTR_FLAG_NO_IMM_CMPL,
         .memh = mem.memh,
     };
+    if (terminal_slot != nullptr) {
+        param.op_attr_mask |= UCP_OP_ATTR_FIELD_CALLBACK | UCP_OP_ATTR_FIELD_USER_DATA;
+        param.cb.send = nixl::ucx::ucx_callback_slot_t::ucpCompletion;
+        param.user_data = terminal_slot;
+    }
 
     const ucs_status_ptr_t request = ucp_get_nbx(eph, laddr, size, raddr, rkey.get(), &param);
     if (UCS_PTR_IS_PTR(request)) {
         req = static_cast<nixlUcxReq>(request);
         if (queryRequestEvidence(
                 req, requestInfoSize_, request_info, selected_transports) != NIXL_SUCCESS) {
+            if (terminal_slot != nullptr) {
+                return NIXL_IN_PROG;
+            }
             ucp_request_free(request);
             req = nullptr;
             return NIXL_ERR_BACKEND;
@@ -387,7 +422,8 @@ nixlUcxEp::write(void *laddr,
                  size_t size,
                  nixlUcxReq &req,
                  std::string &request_info,
-                 std::vector<nixl_xfer_attestation_transport_t> &selected_transports) {
+                 std::vector<nixl_xfer_attestation_transport_t> &selected_transports,
+                 nixl::ucx::ucx_callback_slot_t *terminal_slot) {
     nixl_status_t status = checkTxState();
     if (status != NIXL_SUCCESS) {
         return status;
@@ -398,12 +434,20 @@ nixlUcxEp::write(void *laddr,
             UCP_OP_ATTR_FLAG_NO_IMM_CMPL,
         .memh = mem.memh,
     };
+    if (terminal_slot != nullptr) {
+        param.op_attr_mask |= UCP_OP_ATTR_FIELD_CALLBACK | UCP_OP_ATTR_FIELD_USER_DATA;
+        param.cb.send = nixl::ucx::ucx_callback_slot_t::ucpCompletion;
+        param.user_data = terminal_slot;
+    }
 
     const ucs_status_ptr_t request = ucp_put_nbx(eph, laddr, size, raddr, rkey.get(), &param);
     if (UCS_PTR_IS_PTR(request)) {
         req = static_cast<nixlUcxReq>(request);
         if (queryRequestEvidence(
                 req, requestInfoSize_, request_info, selected_transports) != NIXL_SUCCESS) {
+            if (terminal_slot != nullptr) {
+                return NIXL_IN_PROG;
+            }
             ucp_request_free(request);
             req = nullptr;
             return NIXL_ERR_BACKEND;
@@ -466,11 +510,19 @@ nixlUcxEp::estimateCost(size_t size,
 }
 
 nixl_status_t
-nixlUcxEp::flushEp(nixlUcxReq &req) {
-    ucp_request_param_t param;
+nixlUcxEp::flushEp(nixlUcxReq &req,
+                    nixl::ucx::ucx_callback_slot_t *terminal_slot) {
+    ucp_request_param_t param = {};
     ucs_status_ptr_t request;
 
-    param.op_attr_mask = 0;
+    if (terminal_slot != nullptr) {
+        param.op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK |
+            UCP_OP_ATTR_FIELD_USER_DATA |
+            UCP_OP_ATTR_FIELD_FLAGS;
+        param.cb.send = nixl::ucx::ucx_callback_slot_t::ucpCompletion;
+        param.user_data = terminal_slot;
+        param.flags = UCP_OP_ATTR_FLAG_NO_IMM_CMPL;
+    }
     request = ucp_ep_flush_nbx(eph, &param);
 
     if (UCS_PTR_IS_PTR(request)) {
@@ -673,10 +725,17 @@ nixlUcxWorker::epAddr() {
 }
 
 std::unique_ptr<nixlUcxEp>
-nixlUcxWorker::connect(const void *addr, std::size_t size) {
+nixlUcxWorker::connect(const void *addr,
+                       std::size_t size,
+                       nixlUcxEp::failure_handler_t failure_handler) {
+    static_cast<void>(size);
     try {
         return std::make_unique<nixlUcxEp>(
-            worker.get(), identity_, addr, err_handling_mode_);
+            worker.get(),
+            identity_,
+            addr,
+            err_handling_mode_,
+            std::move(failure_handler));
     }
     catch (const std::exception &e) {
         NIXL_ERROR << "UCX endpoint create failed: " << e.what();
@@ -874,6 +933,15 @@ nixlUcxWorker::drainContinuationsOnOwner() {
 }
 
 nixl_status_t
+nixlUcxWorker::enqueueContinuation(
+    nixl::ucx::ucx_worker_continuation_queue_t::continuation_t continuation) {
+    if (!hasProgressOwner_) {
+        return NIXL_ERR_NOT_SUPPORTED;
+    }
+    return continuations_->enqueue(std::move(continuation));
+}
+
+nixl_status_t
 nixlUcxWorker::closeContinuations() {
     if (continuations_ == nullptr) {
         return NIXL_SUCCESS;
@@ -881,21 +949,50 @@ nixlUcxWorker::closeContinuations() {
     return continuations_->close();
 }
 
+bool
+nixlUcxWorker::terminalLifecycleDrained() const noexcept {
+    return activeTerminalCallbacks_.load(std::memory_order_acquire) == 0 &&
+        continuations_->producerCount() == 0 && continuations_->size() == 0;
+}
+
 nixl_status_t
 nixlUcxWorker::makeTerminalCallbackSlot(
     std::shared_ptr<nixl::ucx::terminal_submission_state_t> state,
     nixl::ucx::ucx_callback_kind_t kind,
-    std::shared_ptr<nixl::ucx::ucx_callback_slot_t> &slot) {
+    std::shared_ptr<nixl::ucx::ucx_callback_slot_t> &slot,
+    nixl::ucx::ucx_callback_slot_t::owner_before_completion_t
+        owner_before_completion,
+    nixl::ucx::ucx_callback_slot_t::owner_after_completion_t
+        owner_after_completion) {
     if (!hasProgressOwner_) {
         return NIXL_ERR_NOT_SUPPORTED;
     }
     if (state == nullptr || slot != nullptr) {
         return NIXL_ERR_INVALID_PARAM;
     }
+    const nixl_status_t producer_status = continuations_->registerProducer();
+    if (producer_status != NIXL_SUCCESS) {
+        return producer_status;
+    }
+    activeTerminalCallbacks_.fetch_add(1, std::memory_order_release);
     slot = nixl::ucx::ucx_callback_slot_t::create(
         std::move(state),
         kind,
         continuations_,
-        [this](void *request) { reqRelease(request); });
+        [this](void *request) { reqRelease(request); },
+        std::move(owner_before_completion),
+        [this, owner_after_completion = std::move(owner_after_completion)]() {
+            const nixl_status_t retire_status = continuations_->retireProducer();
+            const std::size_t previous =
+                activeTerminalCallbacks_.fetch_sub(1, std::memory_order_acq_rel);
+            if (previous == 0 ||
+                (retire_status != NIXL_SUCCESS &&
+                 retire_status != continuations_->fatalStatus())) {
+                (void)continuations_->fail(NIXL_ERR_BACKEND);
+            }
+            if (owner_after_completion) {
+                owner_after_completion();
+            }
+        });
     return NIXL_SUCCESS;
 }

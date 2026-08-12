@@ -77,6 +77,7 @@ class nixlUcxConnection : public nixlBackendConnMD {
         const uint64_t identity_;
         const nixl::ucx::connection_metadata_t metadata_;
         std::vector<std::unique_ptr<nixlUcxEp>> eps;
+        std::atomic<bool> failurePublished_{false};
 
     public:
         nixlUcxConnection(uint64_t identity, nixl::ucx::connection_metadata_t metadata)
@@ -94,6 +95,13 @@ class nixlUcxConnection : public nixlBackendConnMD {
         [[nodiscard]] const nixl::ucx::connection_metadata_t &
         getMetadata() const noexcept {
             return metadata_;
+        }
+
+        [[nodiscard]] bool
+        claimFailurePublication() noexcept {
+            bool expected = false;
+            return failurePublished_.compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel);
         }
 
     friend class nixlUcxEngine;
@@ -194,6 +202,19 @@ public:
     retireRemoteAgent(const nixlRemoteAgentBinding &binding) override;
     nixl_status_t
     queryRemoteNotificationState(const nixlRemoteAgentBinding &binding) const override;
+
+    nixl_status_t
+    subscribeXferTerminal(
+        nixlBackendReqH *handle,
+        const nixlBackendTransferEventBinding &binding,
+        const std::shared_ptr<nixlBackendTransferTransitionSink> &sink,
+        std::unique_ptr<nixlBackendEventSubscription> &subscription) override;
+
+    nixl_status_t
+    subscribeRemoteNotificationState(
+        const nixlRemoteAgentBinding &binding,
+        const std::shared_ptr<nixlBackendCapabilityTransitionSink> &sink,
+        std::unique_ptr<nixlBackendEventSubscription> &subscription) override;
 
     nixl_status_t
     registerMem(const nixlBlobDesc &mem, const nixl_mem_t &nixl_mem, nixlBackendMD *&out) override;
@@ -355,7 +376,8 @@ private:
     nixl_status_t
     notifSendPriv(std::vector<std::uint8_t> &&frame,
                   const std::unique_ptr<nixlUcxEp> &ep,
-                  nixlUcxReq *req = nullptr) const;
+                  nixlUcxReq *req = nullptr,
+                  nixl::ucx::ucx_callback_slot_t *terminal_slot = nullptr) const;
 
     nixl_status_t
     sendControlFrame(const nixl::ucx::notif_wire_envelope_t &envelope,
@@ -376,6 +398,9 @@ private:
 
     [[nodiscard]] std::optional<exactRouteRecord>
     getExactRoute(uint64_t handle_identity, uint64_t generation) const;
+
+    void
+    failExactRoutesForConnection(uint64_t connection_identity) noexcept;
 
     ucx_connection_ptr_t
     getConnection(const std::string &remote_agent) const;

@@ -21,6 +21,8 @@ extern "C" {
 
 namespace nixl::ucx {
 
+enum class ucx_callback_kind_t;
+
 enum class terminal_submission_phase_t {
     POSTING,
     DATA_FLUSH,
@@ -34,6 +36,7 @@ struct terminal_submission_result_t {
     std::uint64_t generation = 0;
     nixl_status_t status = NIXL_ERR_BACKEND;
     std::uint64_t nativeTimestampNs = 0;
+    nixl_xfer_terminal_progress_t diagnostics;
 };
 
 class terminal_submission_sink_t {
@@ -62,6 +65,12 @@ public:
     enqueue(continuation_t continuation);
     [[nodiscard]] nixl_status_t
     fail(nixl_status_t status);
+    [[nodiscard]] nixl_status_t
+    registerProducer();
+    [[nodiscard]] nixl_status_t
+    retireProducer();
+    [[nodiscard]] std::size_t
+    producerCount() const;
     [[nodiscard]] std::size_t
     drain();
     [[nodiscard]] nixl_status_t
@@ -79,6 +88,8 @@ private:
     const wake_t wake_;
     mutable std::mutex mutex_;
     std::deque<continuation_t> queue_;
+    std::deque<continuation_t> fatalDrainQueue_;
+    std::size_t registeredProducers_ = 0;
     nixl_status_t fatalStatus_ = NIXL_SUCCESS;
     bool closed_ = false;
 };
@@ -97,8 +108,8 @@ public:
     terminal_submission_state_t(std::uint64_t owner_cookie,
                                 std::uint64_t handle_identity,
                                 std::uint64_t generation,
-                                std::size_t expected_chunks,
-                                std::size_t expected_flushes,
+                                std::size_t minimum_chunks,
+                                std::size_t minimum_flushes,
                                 bool has_notification,
                                 std::shared_ptr<terminal_submission_sink_t> sink);
 
@@ -106,6 +117,8 @@ public:
     terminal_submission_state_t &
     operator=(const terminal_submission_state_t &) = delete;
 
+    [[nodiscard]] nixl_status_t
+    registerChunk();
     [[nodiscard]] nixl_status_t
     registerFlush();
     [[nodiscard]] nixl_status_t
@@ -126,6 +139,20 @@ public:
     phase() const;
     [[nodiscard]] bool
     isTerminal() const;
+
+    void
+    recordPostObservation(ucx_callback_kind_t kind,
+                          nixl_status_t status,
+                          bool callback_before_poster);
+    void
+    recordCallbackObservation(ucx_callback_kind_t kind,
+                              bool before_poster,
+                              std::uint64_t timestamp_ns);
+    void
+    recordPeakContinuationDepth(std::size_t depth);
+    void
+    recordTerminalInventory(std::size_t active_callback_slots,
+                            std::size_t continuation_depth);
 
 private:
     struct transition_t {
@@ -148,13 +175,14 @@ private:
     const std::uint64_t ownerCookie_;
     const std::uint64_t handleIdentity_;
     const std::uint64_t generation_;
-    const std::size_t expectedChunks_;
-    const std::size_t expectedFlushes_;
+    const std::size_t minimumChunks_;
+    const std::size_t minimumFlushes_;
     const bool hasNotification_;
     const std::shared_ptr<terminal_submission_sink_t> sink_;
 
     mutable std::mutex mutex_;
     terminal_submission_phase_t phase_ = terminal_submission_phase_t::POSTING;
+    std::size_t registeredChunks_ = 0;
     std::size_t registeredFlushes_ = 0;
     std::size_t completedFlushes_ = 0;
     std::size_t completedChunks_ = 0;
@@ -162,6 +190,7 @@ private:
     bool notificationStarted_ = false;
     bool notificationCompleted_ = false;
     bool published_ = false;
+    nixl_xfer_terminal_progress_t diagnostics_;
     std::optional<notification_post_t> notificationPost_;
 };
 
@@ -182,12 +211,16 @@ class ucx_callback_slot_t final :
     public std::enable_shared_from_this<ucx_callback_slot_t> {
 public:
     using request_release_t = std::function<void(void *)>;
+    using owner_before_completion_t = std::function<nixl_status_t(nixl_status_t)>;
+    using owner_after_completion_t = std::function<void()>;
 
     [[nodiscard]] static std::shared_ptr<ucx_callback_slot_t>
     create(std::shared_ptr<terminal_submission_state_t> state,
            ucx_callback_kind_t kind,
            std::shared_ptr<ucx_worker_continuation_queue_t> continuations,
-           request_release_t request_release);
+           request_release_t request_release,
+           owner_before_completion_t owner_before_completion = {},
+           owner_after_completion_t owner_after_completion = {});
 
     ucx_callback_slot_t(const ucx_callback_slot_t &) = delete;
     ucx_callback_slot_t &
@@ -206,12 +239,18 @@ public:
               std::uint64_t timestamp_ns) noexcept;
     [[nodiscard]] bool
     isDelivered() const noexcept;
+    [[nodiscard]] bool
+    isScheduled() const noexcept;
+    [[nodiscard]] void *
+    requestForCancellation() const noexcept;
 
 private:
     ucx_callback_slot_t(std::shared_ptr<terminal_submission_state_t> state,
                         ucx_callback_kind_t kind,
                         std::shared_ptr<ucx_worker_continuation_queue_t> continuations,
-                        request_release_t request_release);
+                        request_release_t request_release,
+                        owner_before_completion_t owner_before_completion,
+                        owner_after_completion_t owner_after_completion);
 
     [[nodiscard]] nixl_status_t
     scheduleLocked() noexcept;
@@ -222,6 +261,8 @@ private:
     const ucx_callback_kind_t kind_;
     const std::shared_ptr<ucx_worker_continuation_queue_t> continuations_;
     const request_release_t requestRelease_;
+    const owner_before_completion_t ownerBeforeCompletion_;
+    const owner_after_completion_t ownerAfterCompletion_;
     mutable std::mutex mutex_;
     bool callbackArrived_ = false;
     bool posterArmed_ = false;

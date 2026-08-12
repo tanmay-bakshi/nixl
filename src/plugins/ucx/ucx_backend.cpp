@@ -122,6 +122,25 @@ notifStateToNixl(nixl::ucx::notif_state_status_t status) noexcept {
     return NIXL_ERR_UNKNOWN;
 }
 
+[[nodiscard]] nixl_status_t
+notifSubscriptionToNixl(
+    nixl::ucx::notif_route_subscription_status_t status) noexcept {
+    using enum nixl::ucx::notif_route_subscription_status_t;
+    switch (status) {
+    case SUCCESS:
+        return NIXL_SUCCESS;
+    case INVALID_ARGUMENT:
+        return NIXL_ERR_INVALID_PARAM;
+    case UNKNOWN_ROUTE:
+    case UNKNOWN_SUBSCRIPTION:
+        return NIXL_ERR_NOT_FOUND;
+    case DUPLICATE_SUBSCRIPTION:
+    case GENERATION_EXHAUSTED:
+        return NIXL_ERR_NOT_ALLOWED;
+    }
+    return NIXL_ERR_UNKNOWN;
+}
+
 } // namespace
 
 nixl_status_t
@@ -197,6 +216,430 @@ nixlUcxNotificationQueue::poison() {
     queuedBytes_ = 0;
 }
 
+class nixlUcxTerminalArm final :
+    public nixl::ucx::terminal_submission_sink_t,
+    public std::enable_shared_from_this<nixlUcxTerminalArm> {
+public:
+    nixlUcxTerminalArm(
+        nixlBackendTransferEventBinding binding,
+        std::shared_ptr<nixlBackendTransferTransitionSink> sink,
+        std::shared_ptr<nixlUcxAttestationState> attestation,
+        std::vector<nixlUcxWorker *> workers)
+        : binding_(binding),
+          sink_(std::move(sink)),
+          attestation_(std::move(attestation)),
+          workers_(std::move(workers)) {}
+
+    [[nodiscard]] nixl_status_t
+    begin(bool has_notification) {
+        const std::lock_guard lock(mutex_);
+        if (terminal_ || publishing_ || state_ != nullptr ||
+            attestation_->getGeneration() != binding_.generation) {
+            return NIXL_ERR_NOT_ALLOWED;
+        }
+        state_ = std::make_shared<nixl::ucx::terminal_submission_state_t>(
+            binding_.handleIdentity,
+            binding_.handleIdentity,
+            binding_.generation,
+            1,
+            1,
+            has_notification,
+            shared_from_this());
+        return NIXL_SUCCESS;
+    }
+
+    [[nodiscard]] nixl_status_t
+    makeSlot(
+        nixlUcxWorker *worker,
+        nixl::ucx::ucx_callback_kind_t kind,
+        nixl::ucx::ucx_callback_slot_t::owner_before_completion_t before,
+        std::shared_ptr<nixl::ucx::ucx_callback_slot_t> &slot) {
+        std::shared_ptr<nixl::ucx::terminal_submission_state_t> state;
+        {
+            const std::lock_guard lock(mutex_);
+            if (terminal_ || publishing_ || state_ == nullptr || worker == nullptr ||
+                !worker->hasProgressOwner()) {
+                return NIXL_ERR_NOT_ALLOWED;
+            }
+            state = state_;
+        }
+        const nixl_status_t register_status =
+            kind == nixl::ucx::ucx_callback_kind_t::DATA_CHUNK ?
+            state->registerChunk() :
+            (kind == nixl::ucx::ucx_callback_kind_t::ENDPOINT_FLUSH ?
+                 state->registerFlush() : NIXL_SUCCESS);
+        if (register_status != NIXL_SUCCESS) {
+            return register_status;
+        }
+
+        const std::weak_ptr<nixlUcxTerminalArm> weak_self = shared_from_this();
+        const nixl_status_t slot_status = worker->makeTerminalCallbackSlot(
+            state,
+            kind,
+            slot,
+            std::move(before),
+            [weak_self]() {
+                if (const std::shared_ptr<nixlUcxTerminalArm> self = weak_self.lock();
+                    self != nullptr) {
+                    self->notifySlotDelivered();
+                }
+            });
+        if (slot_status != NIXL_SUCCESS) {
+            return slot_status;
+        }
+        {
+            const std::lock_guard lock(mutex_);
+            slots_.push_back({worker, slot});
+            ++activeSlots_;
+        }
+        return NIXL_SUCCESS;
+    }
+
+    [[nodiscard]] nixl_status_t
+    seal(nixl::ucx::terminal_submission_state_t::notification_post_t notification_post) {
+        std::shared_ptr<nixl::ucx::terminal_submission_state_t> state;
+        {
+            const std::lock_guard lock(mutex_);
+            if (terminal_ || state_ == nullptr) {
+                return NIXL_ERR_NOT_ALLOWED;
+            }
+            state = state_;
+        }
+        return state->sealPosting(
+            std::move(notification_post), nixl::ucx::terminalProgressTimestampNs());
+    }
+
+    [[nodiscard]] nixl_status_t
+    cancel() noexcept {
+        const nixl_status_t status = fail(NIXL_ERR_CANCELED);
+        if (status == NIXL_IN_PROG) {
+            std::unique_lock lock(mutex_);
+            delivered_.wait(lock, [this]() { return terminal_; });
+            return terminalStatus_ == NIXL_ERR_CANCELED ? NIXL_SUCCESS : terminalStatus_;
+        }
+        if (status != NIXL_ERR_CANCELED && status != NIXL_SUCCESS) {
+            return status;
+        }
+        std::unique_lock lock(mutex_);
+        delivered_.wait(lock, [this]() { return terminal_; });
+        return terminalStatus_ == NIXL_ERR_CANCELED ? NIXL_SUCCESS : terminalStatus_;
+    }
+
+    [[nodiscard]] nixl_status_t
+    fail(nixl_status_t failure_status) noexcept {
+        if (failure_status >= NIXL_SUCCESS) {
+            return NIXL_ERR_INVALID_PARAM;
+        }
+        std::shared_ptr<nixl::ucx::terminal_submission_state_t> state;
+        std::vector<slot_record_t> slots;
+        {
+            const std::lock_guard lock(mutex_);
+            if (terminal_) {
+                return NIXL_SUCCESS;
+            }
+            if (publishing_) {
+                return NIXL_IN_PROG;
+            }
+            state = state_;
+            slots = slots_;
+        }
+        if (state == nullptr) {
+            nixl::ucx::terminal_submission_result_t result{
+                .ownerCookie = binding_.handleIdentity,
+                .handleIdentity = binding_.handleIdentity,
+                .generation = binding_.generation,
+                .status = failure_status,
+                .nativeTimestampNs = nixl::ucx::terminalProgressTimestampNs(),
+            };
+            result.diagnostics.autonomous = true;
+            result.diagnostics.terminalStatus = failure_status;
+            return publishTerminal(result);
+        }
+
+        std::unordered_map<
+            nixlUcxWorker *,
+            std::vector<std::shared_ptr<nixl::ucx::ucx_callback_slot_t>>>
+            cancellations;
+        for (const slot_record_t &record : slots) {
+            if (record.slot->requestForCancellation() != nullptr) {
+                cancellations[record.worker].push_back(record.slot);
+            }
+        }
+        for (auto &[worker, pending_slots] : cancellations) {
+            const nixl_status_t status = worker->enqueueContinuation(
+                [worker, pending_slots = std::move(pending_slots)]() {
+                    for (const auto &slot : pending_slots) {
+                        if (void *request = slot->requestForCancellation();
+                            request != nullptr) {
+                            worker->reqCancel(request);
+                        }
+                    }
+                    return NIXL_SUCCESS;
+                });
+            if (status != NIXL_SUCCESS) {
+                return status;
+            }
+        }
+        const nixl_status_t cancel_status = state->cancel(
+            failure_status, nixl::ucx::terminalProgressTimestampNs());
+        if (cancel_status != NIXL_SUCCESS && cancel_status != failure_status) {
+            return cancel_status;
+        }
+        return failure_status;
+    }
+
+    [[nodiscard]] bool
+    isTerminal() const noexcept {
+        const std::lock_guard lock(mutex_);
+        return terminal_;
+    }
+
+    [[nodiscard]] nixl_status_t
+    status() const noexcept {
+        const std::lock_guard lock(mutex_);
+        return terminal_ ? terminalStatus_ : NIXL_IN_PROG;
+    }
+
+    [[nodiscard]] const nixlBackendTransferEventBinding &
+    binding() const noexcept {
+        return binding_;
+    }
+
+    void
+    inventory(nixlBackendEventSubscriptionInventory &inventory) const noexcept {
+        const std::lock_guard lock(mutex_);
+        std::size_t queued = 0;
+        for (const slot_record_t &record : slots_) {
+            if (record.slot->isScheduled()) {
+                ++queued;
+            }
+        }
+        inventory = {
+            .backendProducers = terminal_ ? 0U : 1U,
+            .activeCallbackSlots = activeSlots_,
+            .queuedOwnerContinuations = queued,
+        };
+    }
+
+    nixl_status_t
+    publishTerminal(
+        const nixl::ucx::terminal_submission_result_t &result) noexcept override {
+        std::optional<nixl::ucx::terminal_submission_result_t> ready;
+        {
+            const std::lock_guard lock(mutex_);
+            if (terminal_ || publishing_ || pendingTerminal_.has_value()) {
+                return NIXL_ERR_NOT_ALLOWED;
+            }
+            pendingTerminal_ = result;
+            if (activeSlots_ == 0) {
+                publishing_ = true;
+                ready = std::move(pendingTerminal_);
+                pendingTerminal_.reset();
+            }
+        }
+        if (!ready.has_value()) {
+            return NIXL_SUCCESS;
+        }
+        return finalizeTerminal(std::move(ready).value());
+    }
+
+private:
+    struct slot_record_t {
+        nixlUcxWorker *worker = nullptr;
+        std::shared_ptr<nixl::ucx::ucx_callback_slot_t> slot;
+    };
+
+    [[nodiscard]] nixl_status_t
+    finalizeTerminal(nixl::ucx::terminal_submission_result_t completed) noexcept {
+        completed.diagnostics.activeCallbackSlotsAtTerminal = 0;
+        completed.diagnostics.continuationDepthAtTerminal = 0;
+        completed.diagnostics.terminalPublishTimestampNs =
+            nixl::ucx::terminalProgressTimestampNs();
+        nixl_status_t status = completed.status;
+        const nixl_xfer_attestation_t snapshot = attestation_->snapshot();
+        if (snapshot.generation == binding_.generation) {
+            if (status != NIXL_SUCCESS) {
+                attestation_->fail(binding_.generation,
+                                   status,
+                                   "autonomous terminal failure");
+            }
+            const nixl_status_t evidence_status = attestation_->recordTerminalProgress(
+                binding_.generation, completed.diagnostics);
+            if (evidence_status != NIXL_SUCCESS && status == NIXL_SUCCESS) {
+                status = evidence_status;
+                attestation_->fail(binding_.generation,
+                                   status,
+                                   "terminal progress evidence failed");
+            }
+        }
+        sink_->publish({
+            .binding = binding_,
+            .status = status,
+            .nativeTimestampNs = completed.nativeTimestampNs,
+        });
+        {
+            const std::lock_guard lock(mutex_);
+            terminal_ = true;
+            terminalStatus_ = status;
+            publishing_ = false;
+            state_.reset();
+            slots_.clear();
+        }
+        delivered_.notify_all();
+        return status == NIXL_SUCCESS ? NIXL_SUCCESS : status;
+    }
+
+    void
+    notifySlotDelivered() noexcept {
+        std::optional<nixl::ucx::terminal_submission_result_t> ready;
+        {
+            const std::lock_guard lock(mutex_);
+            if (activeSlots_ == 0) {
+                return;
+            }
+            --activeSlots_;
+            if (activeSlots_ == 0 && pendingTerminal_.has_value() && !publishing_) {
+                publishing_ = true;
+                ready = std::move(pendingTerminal_);
+                pendingTerminal_.reset();
+            }
+        }
+        if (ready.has_value()) {
+            static_cast<void>(finalizeTerminal(std::move(ready).value()));
+        }
+    }
+
+    const nixlBackendTransferEventBinding binding_;
+    const std::shared_ptr<nixlBackendTransferTransitionSink> sink_;
+    const std::shared_ptr<nixlUcxAttestationState> attestation_;
+    const std::vector<nixlUcxWorker *> workers_;
+    mutable std::mutex mutex_;
+    std::condition_variable delivered_;
+    std::shared_ptr<nixl::ucx::terminal_submission_state_t> state_;
+    std::vector<slot_record_t> slots_;
+    std::optional<nixl::ucx::terminal_submission_result_t> pendingTerminal_;
+    std::size_t activeSlots_ = 0;
+    nixl_status_t terminalStatus_ = NIXL_IN_PROG;
+    bool publishing_ = false;
+    bool terminal_ = false;
+};
+
+class nixlUcxTerminalSubscription final : public nixlBackendEventSubscription {
+public:
+    explicit nixlUcxTerminalSubscription(std::shared_ptr<nixlUcxTerminalArm> arm)
+        : arm_(std::move(arm)) {}
+
+    nixl_status_t
+    cancel() noexcept override {
+        return arm_->cancel();
+    }
+
+    void
+    queryInventory(nixlBackendEventSubscriptionInventory &inventory) const noexcept override {
+        arm_->inventory(inventory);
+    }
+
+    nixl_status_t
+    drainCancellation() noexcept override {
+        return arm_->cancel();
+    }
+
+private:
+    const std::shared_ptr<nixlUcxTerminalArm> arm_;
+};
+
+class nixlUcxCapabilitySink final :
+    public nixl::ucx::notif_route_transition_sink_t {
+public:
+    explicit nixlUcxCapabilitySink(
+        std::shared_ptr<nixlBackendCapabilityTransitionSink> sink)
+        : sink_(std::move(sink)) {}
+
+    void
+    publish(const nixl::ucx::notif_route_transition_t &transition) noexcept override {
+        nixl_backend_capability_state_t state =
+            nixl_backend_capability_state_t::FAILED;
+        switch (transition.state) {
+        case nixl::ucx::notif_route_transition_state_t::READY:
+            state = nixl_backend_capability_state_t::READY;
+            break;
+        case nixl::ucx::notif_route_transition_state_t::FAILED:
+            state = nixl_backend_capability_state_t::FAILED;
+            break;
+        case nixl::ucx::notif_route_transition_state_t::RETIRED:
+            state = nixl_backend_capability_state_t::RETIRED;
+            break;
+        }
+        sink_->publish({
+            .remoteHandleIdentity = transition.route.handleIdentity,
+            .remoteHandleGeneration = transition.route.handleGeneration,
+            .state = state,
+            .capabilityEpoch = transition.capabilityEpoch,
+            .nativeTimestampNs = transition.nativeTimestampNs,
+        });
+    }
+
+private:
+    const std::shared_ptr<nixlBackendCapabilityTransitionSink> sink_;
+};
+
+class nixlUcxCapabilitySubscription final : public nixlBackendEventSubscription {
+public:
+    nixlUcxCapabilitySubscription(
+        nixl::ucx::notif_capability_state_t &state,
+        nixl::ucx::notif_route_subscription_t subscription,
+        std::shared_ptr<nixlUcxCapabilitySink> sink)
+        : state_(state),
+          subscription_(std::move(subscription)),
+          sink_(std::move(sink)) {}
+
+    ~nixlUcxCapabilitySubscription() override {
+        {
+            const std::lock_guard lock(mutex_);
+            if (canceled_) {
+                return;
+            }
+        }
+        const nixl_status_t status = cancel();
+        if (status != NIXL_SUCCESS) {
+            NIXL_FATAL << "Exact-route capability subscription destruction failed to drain: "
+                       << status;
+            std::terminate();
+        }
+    }
+
+    nixl_status_t
+    cancel() noexcept override {
+        const std::lock_guard lock(mutex_);
+        if (canceled_) {
+            return NIXL_SUCCESS;
+        }
+        const nixl_status_t status = notifSubscriptionToNixl(
+            state_.unsubscribeRemoteNotificationState(subscription_));
+        if (status == NIXL_SUCCESS) {
+            canceled_ = true;
+        }
+        return status;
+    }
+
+    void
+    queryInventory(nixlBackendEventSubscriptionInventory &inventory) const noexcept override {
+        const nixl::ucx::notif_route_subscription_inventory_t native_inventory =
+            state_.querySubscriptionInventory(subscription_);
+        inventory = {
+            .backendProducers = native_inventory.retainedSubscriptions,
+            .activeCallbackSlots = native_inventory.inFlightDeliveries,
+        };
+    }
+
+private:
+    nixl::ucx::notif_capability_state_t &state_;
+    const nixl::ucx::notif_route_subscription_t subscription_;
+    const std::shared_ptr<nixlUcxCapabilitySink> sink_;
+    mutable std::mutex mutex_;
+    bool canceled_ = false;
+};
+
 class nixlUcxBackendReqH : public nixlBackendReqH {
 private:
     enum class pending_kind_t {
@@ -217,6 +660,9 @@ private:
     nixlUcxWorker *worker_;
     size_t workerId_;
     std::shared_ptr<nixlUcxAttestationState> attestation_;
+    mutable std::mutex terminalMutex_;
+    std::shared_ptr<nixlUcxTerminalArm> armedTerminal_;
+    std::shared_ptr<nixlUcxTerminalArm> activeTerminal_;
 
     [[nodiscard]] nixl_status_t
     checkConnection(const nixl_status_t status = NIXL_SUCCESS) const {
@@ -280,11 +726,105 @@ public:
     }
 
     [[nodiscard]] nixl_status_t
-    beginSubmission() {
+    beginSubmission(bool has_notification) {
         if (!requests_.empty() || notif.has_value()) {
             return NIXL_ERR_REPOST_ACTIVE;
         }
-        return attestation_->beginSubmission();
+        std::shared_ptr<nixlUcxTerminalArm> armed;
+        {
+            const std::lock_guard lock(terminalMutex_);
+            if (activeTerminal_ != nullptr && !activeTerminal_->isTerminal()) {
+                return NIXL_ERR_REPOST_ACTIVE;
+            }
+            activeTerminal_.reset();
+            if (armedTerminal_ != nullptr &&
+                armedTerminal_->binding().generation != attestation_->getGeneration() + 1) {
+                return NIXL_ERR_NOT_ALLOWED;
+            }
+            armed = armedTerminal_;
+        }
+
+        const nixl_status_t begin_status = attestation_->beginSubmission();
+        if (begin_status != NIXL_SUCCESS) {
+            return begin_status;
+        }
+        if (armed == nullptr) {
+            return NIXL_SUCCESS;
+        }
+        const nixl_status_t arm_status = armed->begin(has_notification);
+        if (arm_status != NIXL_SUCCESS) {
+            attestation_->fail(attestation_->getGeneration(),
+                               arm_status,
+                               "terminal subscription activation failed");
+            return arm_status;
+        }
+        {
+            const std::lock_guard lock(terminalMutex_);
+            if (armedTerminal_ != armed) {
+                attestation_->fail(attestation_->getGeneration(),
+                                   NIXL_ERR_BACKEND,
+                                   "terminal subscription ownership changed during activation");
+                return NIXL_ERR_BACKEND;
+            }
+            armedTerminal_.reset();
+            activeTerminal_ = std::move(armed);
+        }
+        return NIXL_SUCCESS;
+    }
+
+    [[nodiscard]] nixl_status_t
+    armTerminal(const nixlBackendTransferEventBinding &binding,
+                const std::shared_ptr<nixlBackendTransferTransitionSink> &sink,
+                const std::vector<nixlUcxWorker *> &workers,
+                std::unique_ptr<nixlBackendEventSubscription> &subscription) {
+        subscription.reset();
+        const nixl_xfer_attestation_t attestation = attestation_->snapshot();
+        if (sink == nullptr || binding.handleIdentity != attestation.handleIdentity ||
+            binding.generation != attestation.generation + 1 || workers.empty()) {
+            return NIXL_ERR_INVALID_PARAM;
+        }
+        for (nixlUcxWorker *worker : workers) {
+            if (worker == nullptr || !worker->hasProgressOwner()) {
+                return NIXL_ERR_NOT_SUPPORTED;
+            }
+        }
+        const auto arm = std::make_shared<nixlUcxTerminalArm>(
+            binding, sink, attestation_, workers);
+        {
+            const std::lock_guard lock(terminalMutex_);
+            if (armedTerminal_ != nullptr ||
+                (activeTerminal_ != nullptr && !activeTerminal_->isTerminal())) {
+                return NIXL_ERR_NOT_ALLOWED;
+            }
+            activeTerminal_ = nullptr;
+            armedTerminal_ = arm;
+        }
+        subscription = std::make_unique<nixlUcxTerminalSubscription>(arm);
+        return NIXL_SUCCESS;
+    }
+
+    [[nodiscard]] std::shared_ptr<nixlUcxTerminalArm>
+    getActiveTerminal() const noexcept {
+        const std::lock_guard lock(terminalMutex_);
+        return activeTerminal_;
+    }
+
+    void
+    setActiveTerminal(const std::shared_ptr<nixlUcxTerminalArm> &terminal) noexcept {
+        const std::lock_guard lock(terminalMutex_);
+        activeTerminal_ = terminal;
+    }
+
+    [[nodiscard]] bool
+    hasAutonomousTerminal() const noexcept {
+        return getActiveTerminal() != nullptr;
+    }
+
+    [[nodiscard]] bool
+    terminalLifecycleDrained() const noexcept {
+        const std::lock_guard lock(terminalMutex_);
+        return armedTerminal_ == nullptr &&
+            (activeTerminal_ == nullptr || activeTerminal_->isTerminal());
     }
 
     [[nodiscard]] nixl_status_t
@@ -373,6 +913,11 @@ public:
         return connections_;
     }
 
+    void
+    trackConnection(const ucx_connection_ptr_t &connection) {
+        connections_.insert(connection);
+    }
+
     [[nodiscard]] virtual bool
     isComposite() const noexcept {
         return false;
@@ -403,6 +948,10 @@ public:
 
     [[nodiscard]] virtual nixl_status_t
     status() {
+        const std::shared_ptr<nixlUcxTerminalArm> terminal = getActiveTerminal();
+        if (terminal != nullptr) {
+            return terminal->status();
+        }
         if (requests_.empty()) {
             connections_.clear();
             const nixl_xfer_attestation_t attestation = attestation_->snapshot();
@@ -430,8 +979,11 @@ public:
                 nixl::ucx::ucsToNixlStatus(ucp_request_check_status(pending.request));
             if (ret == NIXL_SUCCESS) [[likely]] {
                 if (pending.kind == pending_kind_t::ENDPOINT_FLUSH) {
-                    attestation_->completeFlush(
+                    const nixl_status_t flush_status = attestation_->completeFlush(
                         pending.generation, pending.endpointIdentity);
+                    if (flush_status != NIXL_SUCCESS && out_ret == NIXL_SUCCESS) {
+                        out_ret = flush_status;
+                    }
                 }
                 worker_->reqRelease(pending.request);
             } else if (ret == NIXL_IN_PROG) {
@@ -551,6 +1103,14 @@ public:
         return thread && thread->engine_ == engine;
     }
 
+    [[nodiscard]] bool
+    terminalLifecycleDrained() const noexcept {
+        return std::all_of(
+            workers_.begin(), workers_.end(), [](const nixlUcxWorker *worker) {
+                return worker->terminalLifecycleDrained();
+            });
+    }
+
     friend std::ostream &
     operator<<(std::ostream &os, const nixlUcxThread &thread) {
         return os << "thread " << &thread << "{engine: " << thread.engine_ << ", worker_ids: ["
@@ -668,6 +1228,10 @@ nixlUcxThreadEngine::nixlUcxThreadEngine(const nixlBackendInitParams &init_param
 }
 
 nixlUcxThreadEngine::~nixlUcxThreadEngine() {
+    if (!thread_->terminalLifecycleDrained()) {
+        NIXL_FATAL << "UCX shared progress owner stopped with live terminal callback state";
+        std::terminate();
+    }
     thread_->join();
 }
 
@@ -715,11 +1279,13 @@ public:
     startXfer(const std::shared_ptr<nixlUcxBackendSharedState> &shared_state,
               nixlUcxWorker *worker,
               size_t worker_id,
-              const std::shared_ptr<nixlUcxAttestationState> &attestation) {
+              const std::shared_ptr<nixlUcxAttestationState> &attestation,
+              const std::shared_ptr<nixlUcxTerminalArm> &terminal) {
         NIXL_ASSERT(sharedState_.get() == nullptr);
         sharedState_ = shared_state;
         setWorker(worker, worker_id);
         setAttestationState(attestation);
+        setActiveTerminal(terminal);
     }
 
     void
@@ -746,7 +1312,7 @@ private:
 struct nixlUcxBackendSharedState {
     std::atomic<nixl_status_t> status;
     std::atomic<size_t> pendingReqs;
-    std::vector<nixlUcxChunkBackendReqH> chunks;
+    std::vector<std::unique_ptr<nixlUcxChunkBackendReqH>> chunks;
 
     nixlUcxBackendSharedState() : status(NIXL_SUCCESS), pendingReqs(0) {}
 
@@ -795,7 +1361,11 @@ public:
         : nixlUcxBackendReqH(worker, worker_id),
           sharedState_(std::make_shared<nixlUcxBackendSharedState>()),
           chunkSize_(chunk_size) {
-        sharedState_->chunks.resize(num_chunks);
+        sharedState_->chunks.reserve(num_chunks);
+        for (size_t index = 0; index < num_chunks; ++index) {
+            sharedState_->chunks.push_back(
+                std::make_unique<nixlUcxChunkBackendReqH>());
+        }
     }
 
     [[nodiscard]] size_t
@@ -817,8 +1387,9 @@ public:
 
     [[nodiscard]] nixlUcxChunkBackendReqH *
     startChunk(size_t idx, nixlUcxWorker *worker, size_t worker_id) {
-        nixlUcxChunkBackendReqH *chunk = &sharedState_->chunks[idx];
-        chunk->startXfer(sharedState_, worker, worker_id, getAttestationState());
+        nixlUcxChunkBackendReqH *chunk = sharedState_->chunks[idx].get();
+        chunk->startXfer(
+            sharedState_, worker, worker_id, getAttestationState(), getActiveTerminal());
         return chunk;
     }
 
@@ -895,14 +1466,16 @@ protected:
         NIXL_DEBUG << "dedicated " << *this << " running";
 
         while (!io_.stopped()) {
-            if (!requests_.empty()) {
+            nixlUcxWorker *const worker = getWorkers()[0];
+            if (!requests_.empty() || worker->activeTerminalCallbackCount() != 0) {
                 io_.poll_one();
             } else {
                 NIXL_TRACE << "dedicated " << *this << " waiting for requests";
                 io_.run_one();
             }
 
-            NIXL_ASSERT(getWorkers()[0]->drainContinuationsOnOwner() == NIXL_SUCCESS);
+            worker->progressLoop();
+            NIXL_ASSERT(worker->drainContinuationsOnOwner() == NIXL_SUCCESS);
             if (requests_.empty()) {
                 continue;
             }
@@ -968,6 +1541,16 @@ nixlUcxThreadPoolEngine::nixlUcxThreadPoolEngine(const nixlBackendInitParams &in
 }
 
 nixlUcxThreadPoolEngine::~nixlUcxThreadPoolEngine() {
+    if (sharedThread_ && !sharedThread_->terminalLifecycleDrained()) {
+        NIXL_FATAL << "UCX shared progress owner stopped with live terminal callback state";
+        std::terminate();
+    }
+    for (const auto &thread : dedicatedThreads_) {
+        if (!thread->terminalLifecycleDrained()) {
+            NIXL_FATAL << "UCX dedicated progress owner stopped with live terminal callback state";
+            std::terminate();
+        }
+    }
     if (sharedThread_) {
         sharedThread_->join();
     }
@@ -1050,6 +1633,8 @@ nixlUcxThreadPoolEngine::sendXferRange(const nixl_xfer_op_t &operation,
             if (ret != NIXL_SUCCESS) {
                 status.store(ret);
                 chunk_handle->complete(ret);
+            } else if (chunk_handle->hasAutonomousTerminal()) {
+                chunk_handle->complete(NIXL_SUCCESS);
             } else {
                 NIXL_TRACE << "dedicated " << *thread << " sent " << *chunk_handle;
                 thread->addRequest(chunk_handle);
@@ -1432,6 +2017,39 @@ nixlUcxEngine::queryRemoteNotificationState(
     return NIXL_ERR_UNKNOWN;
 }
 
+nixl_status_t
+nixlUcxEngine::subscribeRemoteNotificationState(
+    const nixlRemoteAgentBinding &binding,
+    const std::shared_ptr<nixlBackendCapabilityTransitionSink> &sink,
+    std::unique_ptr<nixlBackendEventSubscription> &subscription) {
+    subscription.reset();
+    if (sink == nullptr) {
+        return NIXL_ERR_INVALID_PARAM;
+    }
+    for (const std::unique_ptr<nixlUcxWorker> &worker : getWorkers()) {
+        if (!worker->hasProgressOwner()) {
+            return NIXL_ERR_NOT_SUPPORTED;
+        }
+    }
+    nixl::ucx::notif_route_key_t route;
+    ucx_connection_ptr_t connection;
+    const nixl_status_t route_status = makeRoute(binding, route, connection);
+    if (route_status != NIXL_SUCCESS) {
+        return route_status;
+    }
+    const auto adapter = std::make_shared<nixlUcxCapabilitySink>(sink);
+    nixl::ucx::notif_route_subscription_t native_subscription;
+    const nixl_status_t subscribe_status = notifSubscriptionToNixl(
+        notifState_->subscribeRemoteNotificationState(
+            route, adapter, native_subscription));
+    if (subscribe_status != NIXL_SUCCESS) {
+        return subscribe_status;
+    }
+    subscription = std::make_unique<nixlUcxCapabilitySubscription>(
+        *notifState_, native_subscription, adapter);
+    return NIXL_SUCCESS;
+}
+
 nixl_status_t nixlUcxEngine::loadRemoteConnInfo (const std::string &remote_agent,
                                                  const std::string &remote_conn_info)
 {
@@ -1454,8 +2072,24 @@ nixl_status_t nixlUcxEngine::loadRemoteConnInfo (const std::string &remote_agent
     for (size_t worker_id = 0; worker_id < uws.size(); ++worker_id) {
         const auto &remote_worker =
             conn->metadata_.workers[worker_id % conn->metadata_.workers.size()];
+        nixlUcxWorker *const worker = uws[worker_id].get();
+        const std::weak_ptr<nixlUcxConnection> weak_connection = conn;
         std::unique_ptr<nixlUcxEp> result = uws[worker_id]->connect(
-            remote_worker.endpointAddress.data(), remote_worker.endpointAddress.size());
+            remote_worker.endpointAddress.data(),
+            remote_worker.endpointAddress.size(),
+            [this, worker, weak_connection]() {
+                const std::shared_ptr<nixlUcxConnection> connection =
+                    weak_connection.lock();
+                if (connection == nullptr || !connection->claimFailurePublication()) {
+                    return;
+                }
+                const uint64_t connection_identity = connection->getIdentity();
+                static_cast<void>(worker->enqueueContinuation(
+                    [this, connection_identity]() {
+                        failExactRoutesForConnection(connection_identity);
+                        return NIXL_SUCCESS;
+                    }));
+            });
         if (!result) {
             return NIXL_ERR_BACKEND;
         }
@@ -1739,6 +2373,8 @@ nixlUcxEngine::sendXferRangeBatch(nixlUcxEp &ep,
     batchResult result = {NIXL_SUCCESS, 0, nullptr};
     const auto int_handle = static_cast<nixlUcxBackendReqH *>(handle);
     std::vector<nixl_xfer_attestation_transport_t> endpoint_transports;
+    const std::shared_ptr<nixlUcxTerminalArm> terminal =
+        int_handle->getActiveTerminal();
 
     for (size_t i = start_idx; i < end_idx; ++i) {
         void *laddr = (void *)local[i].addr;
@@ -1757,6 +2393,18 @@ nixlUcxEngine::sendXferRangeBatch(nixlUcxEp &ep,
         nixlUcxReq req = nullptr;
         std::string request_info;
         std::vector<nixl_xfer_attestation_transport_t> selected_transports;
+        std::shared_ptr<nixl::ucx::ucx_callback_slot_t> terminal_slot;
+        if (terminal != nullptr) {
+            const nixl_status_t slot_status = terminal->makeSlot(
+                int_handle->getWorker(),
+                nixl::ucx::ucx_callback_kind_t::DATA_CHUNK,
+                {},
+                terminal_slot);
+            if (slot_status != NIXL_SUCCESS) {
+                result.status = slot_status;
+                break;
+            }
+        }
         const nixl_status_t ret = operation == NIXL_READ ?
             ep.read(raddr,
                     rmd->getRkey(worker_id),
@@ -1765,7 +2413,8 @@ nixlUcxEngine::sendXferRangeBatch(nixlUcxEp &ep,
                     lsize,
                     req,
                     request_info,
-                    selected_transports) :
+                    selected_transports,
+                    terminal_slot.get()) :
             ep.write(laddr,
                      lmd->mem,
                      raddr,
@@ -1773,13 +2422,21 @@ nixlUcxEngine::sendXferRangeBatch(nixlUcxEp &ep,
                      lsize,
                      req,
                      request_info,
-                     selected_transports);
+                     selected_transports,
+                     terminal_slot.get());
 
         if (ret == NIXL_IN_PROG) {
             if (endpoint_transports.empty()) {
                 result.status = ep.queryTransports(endpoint_transports);
                 if (result.status != NIXL_SUCCESS) {
-                    ucp_request_free(req);
+                    if (terminal_slot == nullptr) {
+                        ucp_request_free(req);
+                    } else {
+                        static_cast<void>(terminal_slot->armPoster(
+                            req,
+                            ret,
+                            nixl::ucx::terminalProgressTimestampNs()));
+                    }
                     if (result.req != nullptr) {
                         ucp_request_free(result.req);
                     }
@@ -1790,7 +2447,14 @@ nixlUcxEngine::sendXferRangeBatch(nixlUcxEp &ep,
             const nixl_status_t evidence_status = int_handle->recordSegment(
                 i, ep, endpoint_transports, selected_transports, request_info);
             if (evidence_status != NIXL_SUCCESS) {
-                ucp_request_free(req);
+                if (terminal_slot == nullptr) {
+                    ucp_request_free(req);
+                } else {
+                    static_cast<void>(terminal_slot->armPoster(
+                        req,
+                        ret,
+                        nixl::ucx::terminalProgressTimestampNs()));
+                }
                 if (result.req != nullptr) {
                     ucp_request_free(result.req);
                 }
@@ -1798,11 +2462,46 @@ nixlUcxEngine::sendXferRangeBatch(nixlUcxEp &ep,
                 result.req = nullptr;
                 break;
             }
-            if (result.req != nullptr) [[likely]] {
+            if (terminal_slot != nullptr) {
+                const nixl_status_t arm_status = terminal_slot->armPoster(
+                    req, ret, nixl::ucx::terminalProgressTimestampNs());
+                if (arm_status != NIXL_SUCCESS) {
+                    result.status = arm_status;
+                    break;
+                }
+                int_handle->trackConnection(rmd->conn);
+            } else if (result.req != nullptr) [[likely]] {
                 ucp_request_free(result.req);
             }
-            result.req = req;
+            if (terminal_slot == nullptr) {
+                result.req = req;
+            }
+        } else if (ret == NIXL_SUCCESS && terminal_slot != nullptr) {
+            if (endpoint_transports.empty()) {
+                result.status = ep.queryTransports(endpoint_transports);
+            }
+            if (result.status == NIXL_SUCCESS) {
+                selected_transports = endpoint_transports;
+                request_info = "immediate UCX completion";
+                result.status = int_handle->recordSegment(
+                    i, ep, endpoint_transports, selected_transports, request_info);
+            }
+            const nixl_status_t arm_status = terminal_slot->armPoster(
+                nullptr,
+                result.status == NIXL_SUCCESS ? NIXL_SUCCESS : result.status,
+                nixl::ucx::terminalProgressTimestampNs());
+            if (result.status == NIXL_SUCCESS && arm_status != NIXL_SUCCESS) {
+                result.status = arm_status;
+            }
+            if (result.status != NIXL_SUCCESS) {
+                break;
+            }
+            int_handle->trackConnection(rmd->conn);
         } else if (ret != NIXL_SUCCESS) {
+            if (terminal_slot != nullptr) {
+                static_cast<void>(terminal_slot->armPoster(
+                    nullptr, ret, nixl::ucx::terminalProgressTimestampNs()));
+            }
             result.status = ret;
             if (result.req != nullptr) {
                 ucp_request_free(result.req);
@@ -1812,7 +2511,9 @@ nixlUcxEngine::sendXferRangeBatch(nixlUcxEp &ep,
         }
     }
 
-    if (result.status == NIXL_SUCCESS && result.req) {
+    if (terminal != nullptr) {
+        result.req = nullptr;
+    } else if (result.status == NIXL_SUCCESS && result.req) {
         result.status = NIXL_IN_PROG;
     }
     return result;
@@ -1828,6 +2529,8 @@ nixlUcxEngine::sendXferRange(const nixl_xfer_op_t &operation,
                              size_t end_idx) const {
     const auto int_handle = static_cast<nixlUcxBackendReqH *>(handle);
     const size_t worker_id = int_handle->getWorkerId();
+    const std::shared_ptr<nixlUcxTerminalArm> terminal =
+        int_handle->getActiveTerminal();
 
     if (operation != NIXL_WRITE && operation != NIXL_READ) {
         return NIXL_ERR_INVALID_PARAM;
@@ -1844,6 +2547,26 @@ nixlUcxEngine::sendXferRange(const nixl_xfer_op_t &operation,
         const batchResult result =
             sendXferRangeBatch(
                 *ep, operation, local, remote, handle, worker_id, i, end_idx);
+
+        if (result.status == NIXL_SUCCESS && result.size == 0) {
+            const nixl_status_t no_progress_status = NIXL_ERR_BACKEND;
+            int_handle->getAttestationState()->fail(
+                int_handle->getAttestationState()->getGeneration(),
+                no_progress_status,
+                "UCX transfer submission made no progress");
+            if (terminal != nullptr) {
+                static_cast<void>(terminal->fail(no_progress_status));
+            }
+            return no_progress_status;
+        }
+
+        if (terminal != nullptr) {
+            if (result.status != NIXL_SUCCESS) {
+                return result.status;
+            }
+            i += result.size;
+            continue;
+        }
 
         /* Append a single pending request for the entire EP batch */
         const nixl_status_t ret = int_handle->append(
@@ -1872,10 +2595,42 @@ nixlUcxEngine::sendXferRange(const nixl_xfer_op_t &operation,
     for (auto &conn : int_handle->getConnections()) {
         nixlUcxReq req = nullptr;
         auto &ep = conn->getEp(worker_id);
-        const nixl_status_t ret = ep->flushEp(req);
+        std::shared_ptr<nixl::ucx::ucx_callback_slot_t> terminal_slot;
+        if (terminal != nullptr) {
+            const uint64_t generation = int_handle->getAttestationState()->getGeneration();
+            const uint64_t endpoint_identity = ep->getIdentity();
+            const nixl_status_t slot_status = terminal->makeSlot(
+                int_handle->getWorker(),
+                nixl::ucx::ucx_callback_kind_t::ENDPOINT_FLUSH,
+                [attestation = int_handle->getAttestationState(),
+                 generation,
+                 endpoint_identity](nixl_status_t callback_status) {
+                    if (callback_status != NIXL_SUCCESS) {
+                        return callback_status;
+                    }
+                    return attestation->completeFlush(generation, endpoint_identity);
+                },
+                terminal_slot);
+            if (slot_status != NIXL_SUCCESS) {
+                return slot_status;
+            }
+        }
+        const nixl_status_t ret = ep->flushEp(req, terminal_slot.get());
         const nixl_status_t evidence_status = int_handle->recordFlush(*ep, ret);
         if (evidence_status != NIXL_SUCCESS) {
+            if (terminal_slot != nullptr) {
+                static_cast<void>(terminal_slot->armPoster(
+                    req, ret, nixl::ucx::terminalProgressTimestampNs()));
+            }
             return evidence_status;
+        }
+        if (terminal_slot != nullptr) {
+            const nixl_status_t arm_status = terminal_slot->armPoster(
+                req, ret, nixl::ucx::terminalProgressTimestampNs());
+            if (arm_status != NIXL_SUCCESS) {
+                return arm_status;
+            }
+            continue;
         }
         const nixl_status_t append_status = int_handle->append(
             ret,
@@ -1935,7 +2690,8 @@ nixlUcxEngine::postXfer(const nixl_xfer_op_t &operation,
         }
     }
 
-    ret = int_handle->beginSubmission();
+    const bool has_notification = opt_args != nullptr && opt_args->hasNotif;
+    ret = int_handle->beginSubmission(has_notification);
     if (ret != NIXL_SUCCESS) {
         return ret;
     }
@@ -1946,12 +2702,79 @@ nixlUcxEngine::postXfer(const nixl_xfer_op_t &operation,
             int_handle->getAttestationState()->getGeneration(),
             ret,
             "UCX transfer submission failed");
+        if (const std::shared_ptr<nixlUcxTerminalArm> terminal =
+                int_handle->getActiveTerminal();
+            terminal != nullptr) {
+            static_cast<void>(terminal->fail(ret));
+        }
         return ret;
     }
 
     ret = int_handle->finishSubmission();
     if (ret != NIXL_SUCCESS) {
+        if (const std::shared_ptr<nixlUcxTerminalArm> terminal =
+                int_handle->getActiveTerminal();
+            terminal != nullptr) {
+            static_cast<void>(terminal->fail(ret));
+        }
         return ret;
+    }
+
+    const std::shared_ptr<nixlUcxTerminalArm> terminal =
+        int_handle->getActiveTerminal();
+    if (terminal != nullptr) {
+        nixl::ucx::terminal_submission_state_t::notification_post_t notification_post;
+        if (has_notification) {
+            nixlUcxWorker *const notification_worker = int_handle->getWorker();
+            const size_t notification_worker_id = int_handle->getWorkerId();
+            notification_post =
+                [this,
+                 terminal,
+                 notification_worker,
+                 notification_worker_id,
+                 notification_connection,
+                 frame = std::move(notification_frame)]() mutable {
+                    const nixl_status_t enqueue_status =
+                        notification_worker->enqueueContinuation(
+                        [this,
+                         terminal,
+                         notification_worker,
+                         notification_worker_id,
+                         notification_connection,
+                         frame = std::move(frame)]() mutable {
+                            std::shared_ptr<nixl::ucx::ucx_callback_slot_t> slot;
+                            nixl_status_t status = terminal->makeSlot(
+                                notification_worker,
+                                nixl::ucx::ucx_callback_kind_t::NOTIFICATION,
+                                {},
+                                slot);
+                            if (status != NIXL_SUCCESS) {
+                                return status;
+                            }
+                            nixlUcxReq request = nullptr;
+                            status = notifSendPriv(
+                                std::move(frame),
+                                notification_connection->getEp(notification_worker_id),
+                                &request,
+                                slot.get());
+                            const nixl_status_t arm_status = slot->armPoster(
+                                request,
+                                status,
+                                nixl::ucx::terminalProgressTimestampNs());
+                            if (arm_status != NIXL_SUCCESS) {
+                                return arm_status;
+                            }
+                            return NIXL_SUCCESS;
+                        });
+                    return enqueue_status == NIXL_SUCCESS ? NIXL_IN_PROG : enqueue_status;
+                };
+        }
+        ret = terminal->seal(std::move(notification_post));
+        if (ret != NIXL_SUCCESS) {
+            static_cast<void>(terminal->fail(ret));
+            return ret;
+        }
+        return terminal->status();
     }
 
     ret = int_handle->status();
@@ -2033,9 +2856,31 @@ nixlUcxEngine::takeXferCompletionAttestation(
     return int_handle->takeCompletionAttestation(attestation);
 }
 
+nixl_status_t
+nixlUcxEngine::subscribeXferTerminal(
+    nixlBackendReqH *handle,
+    const nixlBackendTransferEventBinding &binding,
+    const std::shared_ptr<nixlBackendTransferTransitionSink> &sink,
+    std::unique_ptr<nixlBackendEventSubscription> &subscription) {
+    subscription.reset();
+    if (handle == nullptr) {
+        return NIXL_ERR_INVALID_PARAM;
+    }
+    std::vector<nixlUcxWorker *> workers;
+    workers.reserve(getWorkers().size());
+    for (const std::unique_ptr<nixlUcxWorker> &worker : getWorkers()) {
+        workers.push_back(worker.get());
+    }
+    return static_cast<nixlUcxBackendReqH *>(handle)->armTerminal(
+        binding, sink, workers, subscription);
+}
+
 nixl_status_t nixlUcxEngine::releaseReqH(nixlBackendReqH* handle) const
 {
     const auto int_handle = static_cast<nixlUcxBackendReqH *>(handle);
+    if (!int_handle->terminalLifecycleDrained()) {
+        return NIXL_ERR_REPOST_ACTIVE;
+    }
     int_handle->release();
 
     /* TODO: return to a pool instead. */
@@ -2067,7 +2912,8 @@ nixlUcxEngine::progressLoop() {
 nixl_status_t
 nixlUcxEngine::notifSendPriv(std::vector<std::uint8_t> &&frame,
                              const std::unique_ptr<nixlUcxEp> &ep,
-                             nixlUcxReq *req) const {
+                             nixlUcxReq *req,
+                             nixl::ucx::ucx_callback_slot_t *terminal_slot) const {
     if (ep == nullptr || frame.empty() ||
         frame.size() > nixl::ucx::notif_wire_max_frame_size) {
         return NIXL_ERR_INVALID_PARAM;
@@ -2078,9 +2924,9 @@ nixlUcxEngine::notifSendPriv(std::vector<std::uint8_t> &&frame,
     }
 
     auto *buffer = new std::vector<std::uint8_t>(std::move(frame));
-    auto deleter = [buffer, req](void *completed_request, void *) {
+    auto deleter = [buffer, req, terminal_slot](void *completed_request, void *) {
         delete buffer;
-        if ((req == nullptr) && (completed_request != nullptr)) {
+        if (req == nullptr && terminal_slot == nullptr && completed_request != nullptr) {
             /* Caller is not interested in the request, free it */
             ucp_request_free(completed_request);
         }
@@ -2093,7 +2939,8 @@ nixlUcxEngine::notifSendPriv(std::vector<std::uint8_t> &&frame,
                       buffer->size(),
                       UCP_AM_SEND_FLAG_EAGER,
                       req,
-                      deleter);
+                      deleter,
+                      terminal_slot);
 }
 
 nixl_status_t
@@ -2147,6 +2994,30 @@ nixlUcxEngine::getExactRoute(uint64_t handle_identity,
         return std::nullopt;
     }
     return route->second;
+}
+
+void
+nixlUcxEngine::failExactRoutesForConnection(uint64_t connection_identity) noexcept {
+    std::vector<nixl::ucx::notif_route_key_t> routes;
+    {
+        const std::lock_guard lock(exactRouteMutex_);
+        for (const auto &[identity, record] : exactRoutes_) {
+            static_cast<void>(identity);
+            if (record.connectionIdentity == connection_identity) {
+                routes.push_back(record.route);
+            }
+        }
+    }
+    for (const nixl::ucx::notif_route_key_t &route : routes) {
+        const nixl::ucx::notif_state_status_t status =
+            notifState_->failRemoteAgent(route);
+        if (status != nixl::ucx::notif_state_status_t::SUCCESS &&
+            status != nixl::ucx::notif_state_status_t::ROUTE_FAILED &&
+            status != nixl::ucx::notif_state_status_t::ROUTE_RETIRED) {
+            NIXL_WARN << "Failed to publish exact-route endpoint failure for handle "
+                      << route.handleIdentity << ": " << static_cast<int>(status);
+        }
+    }
 }
 
 nixl_status_t

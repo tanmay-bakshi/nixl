@@ -116,6 +116,11 @@ struct notif_route_subscription_t {
     std::uint64_t generation = 0;
 };
 
+struct notif_route_subscription_inventory_t {
+    std::size_t retainedSubscriptions = 0;
+    std::size_t inFlightDeliveries = 0;
+};
+
 enum class notif_route_subscription_status_t {
     SUCCESS,
     INVALID_ARGUMENT,
@@ -187,6 +192,9 @@ public:
      */
     [[nodiscard]] notif_route_subscription_status_t
     unsubscribeRemoteNotificationState(const notif_route_subscription_t &subscription) noexcept;
+
+    [[nodiscard]] notif_route_subscription_inventory_t
+    querySubscriptionInventory(const notif_route_subscription_t &subscription) const noexcept;
 
     [[nodiscard]] notif_state_status_t
     makeOffer(const notif_route_key_t &route,

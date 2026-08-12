@@ -643,6 +643,21 @@ makeEvidenceDigest(const nixl_xfer_attestation_t &attestation, std::string &dige
         appendUint64(input, endpoint_identity);
     }
     appendUint64(input, attestation.segments.size());
+    appendUint64(input, attestation.terminalProgress.autonomous ? 1 : 0);
+    appendUint64(input, attestation.terminalProgress.dataCallbacks);
+    appendUint64(input, attestation.terminalProgress.endpointFlushCallbacks);
+    appendUint64(input, attestation.terminalProgress.notificationCallbacks);
+    appendUint64(input, attestation.terminalProgress.asynchronousRequests);
+    appendUint64(input, attestation.terminalProgress.immediateCompletions);
+    appendUint64(input, attestation.terminalProgress.callbacksBeforePosterReturn);
+    appendUint64(input, attestation.terminalProgress.peakContinuationDepth);
+    appendUint64(input, attestation.terminalProgress.activeCallbackSlotsAtTerminal);
+    appendUint64(input, attestation.terminalProgress.continuationDepthAtTerminal);
+    appendUint64(input, attestation.terminalProgress.lastDataCallbackTimestampNs);
+    appendUint64(input, attestation.terminalProgress.lastFlushCallbackTimestampNs);
+    appendUint64(input, attestation.terminalProgress.notificationCallbackTimestampNs);
+    appendUint64(input, attestation.terminalProgress.terminalPublishTimestampNs);
+    appendUint64(input, static_cast<uint64_t>(attestation.terminalProgress.terminalStatus));
 
     for (const auto &segment : attestation.segments) {
         appendUint64(input, segment.index);
@@ -804,6 +819,7 @@ nixlUcxAttestationState::prepare(nixl_xfer_op_t operation,
     attestation_.completionClaimed = false;
     attestation_.endpoints.clear();
     attestation_.runtimeArtifacts = baseRuntimeArtifacts_;
+    attestation_.terminalProgress = {};
     attestation_.evidenceDigest.clear();
     attestation_.error.clear();
     return NIXL_SUCCESS;
@@ -838,6 +854,7 @@ nixlUcxAttestationState::beginSubmission() {
     attestation_.completionClaimed = false;
     attestation_.endpoints.clear();
     attestation_.runtimeArtifacts = baseRuntimeArtifacts_;
+    attestation_.terminalProgress = {};
     attestation_.evidenceDigest.clear();
     attestation_.error.clear();
     for (auto &segment : attestation_.segments) {
@@ -1014,36 +1031,37 @@ nixlUcxAttestationState::finishSubmission() {
     return NIXL_SUCCESS;
 }
 
-void
+nixl_status_t
 nixlUcxAttestationState::completeFlush(uint64_t generation, uint64_t endpoint_identity) {
     const std::lock_guard<std::mutex> lock(mutex_);
     if (attestation_.state == nixl_xfer_attestation_state_t::FAILED) {
-        return;
+        return attestation_.status;
     }
     if (generation != attestation_.generation) {
         (void)failLocked(NIXL_ERR_BACKEND, "stale endpoint flush completion");
-        return;
+        return attestation_.status;
     }
     if (attestation_.state != nixl_xfer_attestation_state_t::POSTING &&
         attestation_.state != nixl_xfer_attestation_state_t::IN_PROGRESS) {
         (void)failLocked(NIXL_ERR_BACKEND, "endpoint flush completed outside an active submission");
-        return;
+        return attestation_.status;
     }
 
     auto *endpoint = findEndpointLocked(endpoint_identity);
     if (endpoint == nullptr || !endpoint->flushPosted) {
         (void)failLocked(NIXL_ERR_BACKEND, "unknown endpoint flush completion");
-        return;
+        return attestation_.status;
     }
     if (endpoint->remoteFlushed) {
         (void)failLocked(NIXL_ERR_BACKEND, "endpoint flush completed more than once");
-        return;
+        return attestation_.status;
     }
 
     endpoint->remoteFlushed = true;
     if (attestation_.submissionSealed && allRemoteFlushedLocked()) {
-        (void)sealCompletionLocked();
+        return sealCompletionLocked();
     }
+    return NIXL_SUCCESS;
 }
 
 void
@@ -1059,6 +1077,26 @@ nixlUcxAttestationState::fail(uint64_t generation,
         return;
     }
     (void)failLocked(status, error);
+}
+
+nixl_status_t
+nixlUcxAttestationState::recordTerminalProgress(
+    uint64_t generation,
+    const nixl_xfer_terminal_progress_t &progress) {
+    const std::lock_guard<std::mutex> lock(mutex_);
+    if (generation != attestation_.generation ||
+        attestation_.completionClaimed) {
+        return NIXL_ERR_NOT_ALLOWED;
+    }
+    attestation_.terminalProgress = progress;
+    if (attestation_.state == nixl_xfer_attestation_state_t::FAILED) {
+        return makeEvidenceDigest(attestation_, attestation_.evidenceDigest);
+    }
+    if (attestation_.state != nixl_xfer_attestation_state_t::REMOTE_FLUSHED ||
+        !attestation_.submissionSealed) {
+        return NIXL_ERR_NOT_ALLOWED;
+    }
+    return makeEvidenceDigest(attestation_, attestation_.evidenceDigest);
 }
 
 uint64_t

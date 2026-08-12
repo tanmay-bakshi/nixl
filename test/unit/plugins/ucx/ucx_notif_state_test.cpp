@@ -652,6 +652,10 @@ testCapabilitySubscriptionCancellationDrainsInFlightDelivery() {
         return state.acceptOffer(remote_offer, local_worker, acceptance);
     });
     sink->waitUntilEntered();
+    const notif_route_subscription_inventory_t in_flight =
+        state.querySubscriptionInventory(subscription);
+    require(in_flight.retainedSubscriptions == 1 && in_flight.inFlightDeliveries == 1,
+            "active route delivery was absent from subscription inventory");
 
     require(state.retireRemoteAgent(route) == notif_state_status_t::SUCCESS,
             "retirement could not queue behind an active callback");
@@ -723,9 +727,51 @@ testCapabilityEndpointFailureTransition() {
     require(state.failRemoteAgent(route) == notif_state_status_t::SUCCESS &&
                 sink->transitions().size() == 2,
             "idempotent endpoint failure published a duplicate transition");
+    const notif_route_subscription_inventory_t before_unsubscribe =
+        state.querySubscriptionInventory(subscription);
+    require(before_unsubscribe.retainedSubscriptions == 1 &&
+                before_unsubscribe.inFlightDeliveries == 0,
+            "terminal FAILED route lost its retained subscription inventory");
     require(state.unsubscribeRemoteNotificationState(subscription) ==
                 notif_route_subscription_status_t::SUCCESS,
             "endpoint-failure subscription cancellation failed");
+    const notif_route_subscription_inventory_t after_unsubscribe =
+        state.querySubscriptionInventory(subscription);
+    require(after_unsubscribe.retainedSubscriptions == 0 &&
+                after_unsubscribe.inFlightDeliveries == 0,
+            "terminal FAILED route subscription survived cancellation");
+}
+
+void
+testRetiredCapabilitySubscriptionInventoryDrains() {
+    const notif_wire_uuid_t local_agent = makeUuid(241);
+    const notif_wire_uuid_t local_backend = makeUuid(242);
+    const notif_wire_uuid_t local_worker = makeUuid(243);
+    const notif_wire_uuid_t remote_agent = makeUuid(244);
+    const notif_wire_uuid_t remote_backend = makeUuid(245);
+    const notif_wire_uuid_t remote_worker = makeUuid(246);
+    notif_capability_state_t state(local_agent, local_backend, {local_worker});
+    const notif_route_key_t route = makeRoute(1001, 8, remote_agent, remote_backend);
+    bind(state, makeBinding(route, 10001, {{remote_worker, 14001}}));
+
+    const auto sink = std::make_shared<querying_transition_sink_t>(state, route);
+    notif_route_subscription_t subscription;
+    require(state.subscribeRemoteNotificationState(route, sink, subscription) ==
+                notif_route_subscription_status_t::SUCCESS,
+            "retirement inventory subscription failed");
+    require(state.retireRemoteAgent(route) == notif_state_status_t::SUCCESS &&
+                sink->transitions().size() == 1 &&
+                sink->transitions()[0].state == notif_route_transition_state_t::RETIRED,
+            "retirement inventory route did not publish RETIRED");
+    require(state.querySubscriptionInventory(subscription).retainedSubscriptions == 1,
+            "terminal RETIRED route lost its retained subscription inventory");
+    require(state.unsubscribeRemoteNotificationState(subscription) ==
+                notif_route_subscription_status_t::SUCCESS,
+            "terminal RETIRED subscription cancellation failed");
+    const notif_route_subscription_inventory_t inventory =
+        state.querySubscriptionInventory(subscription);
+    require(inventory.retainedSubscriptions == 0 && inventory.inFlightDeliveries == 0,
+            "terminal RETIRED route subscription survived cancellation");
 }
 
 } // namespace
@@ -741,6 +787,7 @@ main() {
         testCapabilitySubscriptionSnapshotAndCancellation();
         testCapabilitySubscriptionCancellationDrainsInFlightDelivery();
         testCapabilityEndpointFailureTransition();
+        testRetiredCapabilitySubscriptionInventoryDrains();
     }
     catch (const std::exception &error) {
         std::cerr << "ucx_notif_state_test failed: " << error.what() << '\n';
