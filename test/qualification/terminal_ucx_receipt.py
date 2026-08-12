@@ -495,6 +495,24 @@ def _validate_faults(faults: object, transport: str) -> None:
         isinstance(shutdown, dict) and shutdown.get("cancel_status") == "NIXL_SUCCESS",
         "shutdown cancel failed",
     )
+    if transport == "tcp":
+        _require(
+            shutdown.get("posted_in_flight") is True,
+            "shutdown cancellation never reached an in-flight native transfer",
+        )
+        pre_cancel_inventory = (
+            shutdown.get("backend_producers_before_cancel"),
+            shutdown.get("active_callback_slots_before_cancel"),
+            shutdown.get("queued_owner_continuations_before_cancel"),
+        )
+        _require(
+            all(
+                isinstance(value, int) and not isinstance(value, bool) and value >= 0
+                for value in pre_cancel_inventory
+            )
+            and sum(pre_cancel_inventory) > 0,
+            "shutdown cancellation exposed no in-flight native inventory",
+        )
     _require(shutdown.get("drained") is True, "shutdown left native work undrained")
     if transport == "self":
         _validate_not_applicable(faults.get("remote_failure"), "self remote failure")

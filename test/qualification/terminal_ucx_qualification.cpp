@@ -97,6 +97,10 @@ struct queue_overflow_result_t {
 
 struct shutdown_result_t : terminal_fault_result_t {
     nixl_status_t cancelStatus = NIXL_ERR_BACKEND;
+    std::size_t backendProducersBeforeCancel = 0;
+    std::size_t activeCallbackSlotsBeforeCancel = 0;
+    std::size_t queuedOwnerContinuationsBeforeCancel = 0;
+    bool postedInFlight = false;
     bool drained = false;
 };
 
@@ -1226,7 +1230,14 @@ writeCoordinate(const options_t &options,
            << ",\"owner_woken\":" << (shutdown_cancellation.ownerWoken ? "true" : "false")
            << ",\"cancel_status\":";
     writeString(output, nixlEnumStrings::statusStr(shutdown_cancellation.cancelStatus));
-    output << ",\"drained\":" << (shutdown_cancellation.drained ? "true" : "false")
+    output << ",\"posted_in_flight\":" << (shutdown_cancellation.postedInFlight ? "true" : "false")
+           << ",\"backend_producers_before_cancel\":"
+           << shutdown_cancellation.backendProducersBeforeCancel
+           << ",\"active_callback_slots_before_cancel\":"
+           << shutdown_cancellation.activeCallbackSlotsBeforeCancel
+           << ",\"queued_owner_continuations_before_cancel\":"
+           << shutdown_cancellation.queuedOwnerContinuationsBeforeCancel
+           << ",\"drained\":" << (shutdown_cancellation.drained ? "true" : "false")
            << "},\"remote_failure\":";
     if (self_transport) {
         writeNotApplicable(output);
@@ -1378,6 +1389,13 @@ run(int argc, char **argv) {
             .terminalEventCount = tcp_shutdown_cancellation->transfer.terminalEventCount,
             .ownerWoken = tcp_shutdown_cancellation->transfer.ownerWoken,
             .cancelStatus = tcp_shutdown_cancellation->cancelStatus,
+            .backendProducersBeforeCancel =
+                tcp_shutdown_cancellation->inventoryBeforeCancellation.backendProducers,
+            .activeCallbackSlotsBeforeCancel =
+                tcp_shutdown_cancellation->inventoryBeforeCancellation.activeCallbackSlots,
+            .queuedOwnerContinuationsBeforeCancel =
+                tcp_shutdown_cancellation->inventoryBeforeCancellation.queuedOwnerContinuations,
+            .postedInFlight = tcp_shutdown_cancellation->postedInFlight,
             .drained = tcp_shutdown_cancellation->drained,
         };
     }

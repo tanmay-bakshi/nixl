@@ -181,7 +181,16 @@ def _faults(transport: str) -> dict[str, object]:
     """
     cancellation = _terminal_fault("NIXL_ERR_CANCELED")
     shutdown = dict(cancellation)
-    shutdown.update({"cancel_status": "NIXL_SUCCESS", "drained": True})
+    shutdown.update(
+        {
+            "cancel_status": "NIXL_SUCCESS",
+            "posted_in_flight": transport == "tcp",
+            "backend_producers_before_cancel": 1 if transport == "tcp" else 0,
+            "active_callback_slots_before_cancel": 2 if transport == "tcp" else 0,
+            "queued_owner_continuations_before_cancel": 0,
+            "drained": True,
+        }
+    )
     faults: dict[str, object] = {
         "transfer_cancellation": cancellation,
         "queue_overflow": {
@@ -398,6 +407,10 @@ def test_validate_receipt_accepts_transport_aware_matrix() -> None:
         (("cases", 2, "remote_route_capability", "routes", 1, "states"), ["READY"]),
         (("cases", 2, "remote_route_capability", "routes", 2, "handle_identity"), 502),
         (("cases", 2, "faults", "remote_failure", "owner_woken"), False),
+        (
+            ("cases", 2, "faults", "shutdown_cancellation_drain", "posted_in_flight"),
+            False,
+        ),
         (("cases", 2, "shutdown", "active_callback_slots"), 1),
         (("runtime_artifacts", 0, "build_id"), "not-hex"),
     ],
