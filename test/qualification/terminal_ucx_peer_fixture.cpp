@@ -979,12 +979,18 @@ runTcpShutdownCancellationFixture(const std::string &engine) {
                 pre_cancel_inventory.queuedOwnerContinuations > 0,
             "shutdown-cancellation transfer exposed no native in-flight inventory");
 
-    const nixl_status_t cancel_status = adapter.release(transfer_subscription);
-    requireStatus(cancel_status, NIXL_SUCCESS, "cancel posted shutdown-cancellation transfer");
+    nixl_status_t cancel_status = adapter.release(transfer_subscription);
+    require(cancel_status == NIXL_SUCCESS || cancel_status == NIXL_IN_PROG,
+            "cancel posted shutdown-cancellation transfer failed");
     const observed_event_t transfer =
         inbox.take(nixl_terminal_event_kind_t::TRANSFER, transfer_cookie);
     requireStatus(
         transfer.event.transferStatus, NIXL_ERR_CANCELED, "shutdown-cancellation terminal status");
+    if (cancel_status == NIXL_IN_PROG) {
+        cancel_status = adapter.release(transfer_subscription);
+    }
+    requireStatus(
+        cancel_status, NIXL_SUCCESS, "release terminal shutdown-cancellation subscription");
     requireStatus(source.agent.releaseXferReq(request),
                   NIXL_SUCCESS,
                   "release shutdown-cancellation request");
