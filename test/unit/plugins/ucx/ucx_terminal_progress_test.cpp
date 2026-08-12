@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -403,6 +404,30 @@ testContinuationOverflowAndShutdown() {
 }
 
 void
+testOwnerEnqueueDrainsToQuiescenceWithoutReentrantWake() {
+    std::size_t wake_count = 0;
+    auto queue = makeQueue(8, wake_count);
+    require(queue->bindOwnerThread(std::this_thread::get_id()) == NIXL_SUCCESS,
+            "continuation owner binding failed");
+
+    std::vector<int> order;
+    require(queue->enqueue([&]() {
+                order.push_back(1);
+                return queue->enqueue([&]() {
+                    order.push_back(2);
+                    return NIXL_SUCCESS;
+                });
+            }) == NIXL_SUCCESS,
+            "owner continuation enqueue failed");
+    require(wake_count == 0,
+            "owner-thread enqueue re-entered UCX worker signalling");
+    require(queue->drain() == 2 && order == std::vector<int>({1, 2}),
+            "owner drain stranded a continuation scheduled by its predecessor");
+    require(queue->size() == 0 && queue->fatalStatus() == NIXL_SUCCESS,
+            "quiescent owner drain left native work or a fatal state");
+}
+
+void
 testOverflowDrainsCallbackOwnership() {
     std::size_t wake_count = 0;
     auto queue = makeQueue(1, wake_count);
@@ -501,6 +526,7 @@ main() {
         testNotificationFailure();
         testCompositeFolding();
         testContinuationOverflowAndShutdown();
+        testOwnerEnqueueDrainsToQuiescenceWithoutReentrantWake();
         testOverflowDrainsCallbackOwnership();
         testNoProgressOwnerIsUnsupported();
     }

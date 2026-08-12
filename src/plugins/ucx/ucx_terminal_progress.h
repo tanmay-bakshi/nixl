@@ -12,6 +12,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <thread>
 
 extern "C" {
 #include <ucp/api/ucp.h>
@@ -74,6 +75,10 @@ public:
     [[nodiscard]] std::size_t
     drain();
     [[nodiscard]] nixl_status_t
+    bindOwnerThread(std::thread::id owner_thread);
+    [[nodiscard]] bool
+    isOwnerThread() const noexcept;
+    [[nodiscard]] nixl_status_t
     close();
     [[nodiscard]] nixl_status_t
     fatalStatus() const;
@@ -90,6 +95,7 @@ private:
     std::deque<continuation_t> queue_;
     std::deque<continuation_t> fatalDrainQueue_;
     std::size_t registeredProducers_ = 0;
+    std::thread::id ownerThread_;
     nixl_status_t fatalStatus_ = NIXL_SUCCESS;
     bool closed_ = false;
 };

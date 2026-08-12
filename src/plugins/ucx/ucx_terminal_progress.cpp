@@ -51,6 +51,9 @@ ucx_worker_continuation_queue_t::enqueue(continuation_t continuation) {
     if (fatalStatus() != NIXL_SUCCESS) {
         return fail(NIXL_ERR_BACKEND);
     }
+    if (isOwnerThread()) {
+        return NIXL_SUCCESS;
+    }
     if (!wake_) {
         const std::lock_guard lock(mutex_);
         return failLocked(NIXL_ERR_NOT_SUPPORTED);
@@ -95,7 +98,7 @@ ucx_worker_continuation_queue_t::fail(nixl_status_t status) {
         const std::lock_guard lock(mutex_);
         (void)failLocked(status);
     }
-    if (wake_) {
+    if (wake_ && !isOwnerThread()) {
         const nixl_status_t wake_status = wake_();
         if (wake_status != NIXL_SUCCESS) {
             const std::lock_guard lock(mutex_);
@@ -107,22 +110,48 @@ ucx_worker_continuation_queue_t::fail(nixl_status_t status) {
 
 std::size_t
 ucx_worker_continuation_queue_t::drain() {
-    std::deque<continuation_t> ready;
-    {
-        const std::lock_guard lock(mutex_);
-        ready.swap(queue_);
-        ready.insert(ready.end(),
-                     std::make_move_iterator(fatalDrainQueue_.begin()),
-                     std::make_move_iterator(fatalDrainQueue_.end()));
-        fatalDrainQueue_.clear();
-    }
-    for (continuation_t &continuation : ready) {
-        const nixl_status_t status = continuation();
-        if (status != NIXL_SUCCESS) {
-            (void)fail(status);
+    std::size_t drained = 0;
+    while (true) {
+        std::deque<continuation_t> ready;
+        {
+            const std::lock_guard lock(mutex_);
+            ready.swap(queue_);
+            ready.insert(ready.end(),
+                         std::make_move_iterator(fatalDrainQueue_.begin()),
+                         std::make_move_iterator(fatalDrainQueue_.end()));
+            fatalDrainQueue_.clear();
+        }
+        if (ready.empty()) {
+            return drained;
+        }
+        drained += ready.size();
+        for (continuation_t &continuation : ready) {
+            const nixl_status_t status = continuation();
+            if (status != NIXL_SUCCESS) {
+                (void)fail(status);
+            }
         }
     }
-    return ready.size();
+}
+
+nixl_status_t
+ucx_worker_continuation_queue_t::bindOwnerThread(std::thread::id owner_thread) {
+    if (owner_thread == std::thread::id()) {
+        return NIXL_ERR_INVALID_PARAM;
+    }
+    const std::lock_guard lock(mutex_);
+    if (ownerThread_ != std::thread::id()) {
+        return ownerThread_ == owner_thread ? NIXL_SUCCESS : NIXL_ERR_NOT_ALLOWED;
+    }
+    ownerThread_ = owner_thread;
+    return NIXL_SUCCESS;
+}
+
+bool
+ucx_worker_continuation_queue_t::isOwnerThread() const noexcept {
+    const std::lock_guard lock(mutex_);
+    return ownerThread_ != std::thread::id() &&
+        ownerThread_ == std::this_thread::get_id();
 }
 
 nixl_status_t

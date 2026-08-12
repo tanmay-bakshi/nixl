@@ -918,8 +918,13 @@ nixlUcxWorker::claimProgressOwner() noexcept {
     if (hasProgressOwner_) {
         return NIXL_ERR_NOT_ALLOWED;
     }
+    const std::thread::id owner_thread = std::this_thread::get_id();
+    const nixl_status_t bind_status = continuations_->bindOwnerThread(owner_thread);
+    if (bind_status != NIXL_SUCCESS) {
+        return bind_status;
+    }
     hasProgressOwner_ = true;
-    progressOwnerThread_ = std::this_thread::get_id();
+    progressOwnerThread_ = owner_thread;
     return NIXL_SUCCESS;
 }
 
