@@ -41,10 +41,23 @@ public:
                       nixlTerminalEventSubscriptionH *&subscription);
 
     [[nodiscard]] nixl_status_t
+    subscribeCapability(const nixlRemoteAgentH *remote_agent,
+                        const nixlBackendH *backend,
+                        std::uint64_t owner_cookie,
+                        nixlTerminalEventSubscriptionH *&subscription);
+
+    [[nodiscard]] nixl_status_t
+    fileno(int &fd) const;
+
+    [[nodiscard]] nixl_status_t
     drain(nixl_terminal_event_batch_t &batch);
 
     [[nodiscard]] nixl_status_t
     release(nixlTerminalEventSubscriptionH *subscription);
+
+    [[nodiscard]] nixl_status_t
+    querySubscription(const nixlTerminalEventSubscriptionH *subscription,
+                      nixl_terminal_subscription_info_t &info) const;
 
     [[nodiscard]] nixl_status_t
     queryInventory(terminal_channel_inventory_t &inventory);

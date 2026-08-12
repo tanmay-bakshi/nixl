@@ -16,4 +16,6 @@
 subdir('nixl')
 subdir('unit')
 
+subdir('qualification')
+
 subdir('gtest')
