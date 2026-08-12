@@ -9,6 +9,8 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <vector>
 
 #include "backend/backend_aux.h"
 #include "nixl_types.h"
@@ -38,10 +40,14 @@ public:
     release() noexcept;
 
 private:
+    void
+    publishBound(const nixlBackendTransferTransition &transition) noexcept;
+
     const nixlBackendTransferEventBinding binding_;
     mutable std::mutex mutex_;
     std::shared_ptr<nixl::terminalEventChannel::subscription> channelSubscription_;
     terminal_callback_t terminalCallback_;
+    std::optional<nixlBackendTransferTransition> pendingTransition_;
     bool terminal_ = false;
     bool terminalCallbackDelivered_ = false;
 };
@@ -68,11 +74,15 @@ public:
     release() noexcept;
 
 private:
+    void
+    publishBound(const nixlBackendCapabilityTransition &transition) noexcept;
+
     const uint64_t remoteHandleIdentity_;
     const uint64_t remoteHandleGeneration_;
     mutable std::mutex mutex_;
     std::shared_ptr<nixl::terminalEventChannel::subscription> channelSubscription_;
     terminal_callback_t terminalCallback_;
+    std::vector<nixlBackendCapabilityTransition> pendingTransitions_;
     bool terminal_ = false;
     bool terminalCallbackDelivered_ = false;
     uint64_t lastCapabilityEpoch_ = 0;
