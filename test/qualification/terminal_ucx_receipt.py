@@ -23,6 +23,16 @@ _POPULATION_GEOMETRY = {
     "thread_pool_repost_generation_1": (8, _ARENA_BYTES),
     "thread_pool_repost_generation_2": (8, _ARENA_BYTES),
 }
+_NOTIFICATION_CALLBACK_CONTRACT = {
+    ("self", "small"): 0,
+    ("self", "large"): 0,
+    ("self", "thread_pool_repost_generation_1"): 0,
+    ("self", "thread_pool_repost_generation_2"): 0,
+    ("tcp", "small"): 1,
+    ("tcp", "large"): 1,
+    ("tcp", "thread_pool_repost_generation_1"): 0,
+    ("tcp", "thread_pool_repost_generation_2"): 0,
+}
 _COMMON_ENVIRONMENT = {
     "CUDA_VISIBLE_DEVICES": "",
     "NVIDIA_VISIBLE_DEVICES": "void",
@@ -192,9 +202,7 @@ def _validate_invocation(invocation: object) -> tuple[str, str, str]:
     )
     executable = str(argv[0])
     output_path = str(argv[6])
-    _require(
-        Path(executable).is_absolute(), "qualification executable is not absolute"
-    )
+    _require(Path(executable).is_absolute(), "qualification executable is not absolute")
     _require(
         argv[1:6] == ["--transport", transport, "--engine", engine, "--output"],
         "qualification argv differs from its coordinate",
@@ -302,12 +310,14 @@ def _validate_endpoint_flushes(endpoint_flushes: object) -> int:
 def _validate_terminal_progress(
     progress: object,
     transport: str,
+    population: str,
     endpoint_count: int,
 ) -> tuple[int, int]:
     """Validate native callback, flush, notification, and queue evidence.
 
     :param progress: Attested terminal-progress observation.
     :param transport: Observed UCX transport.
+    :param population: Frozen transfer-population name.
     :param endpoint_count: Number of distinct attested endpoint flushes.
     :returns: Before-return and after-return callback counts.
     :raises ValueError: If callback accounting or terminal ordering is unsound.
@@ -332,10 +342,15 @@ def _validate_terminal_progress(
     ):
         _require(_is_int(value), f"{name} count is invalid")
     _require(int(data_callbacks) > 0, "no data completion callback was observed")
-    expected_notifications = 0 if transport == "self" else 1
+    notification_contract_key = (transport, population)
+    _require(
+        notification_contract_key in _NOTIFICATION_CALLBACK_CONTRACT,
+        "population notification contract is missing",
+    )
+    expected_notifications = _NOTIFICATION_CALLBACK_CONTRACT[notification_contract_key]
     _require(
         int(notification_callbacks) == expected_notifications,
-        "notification callback count differs from transport authority",
+        "notification callback count differs from population contract",
     )
     callback_count = (
         int(data_callbacks) + int(flush_callbacks) + int(notification_callbacks)
@@ -404,17 +419,28 @@ def _validate_terminal_progress(
             int(flush_timestamp) >= int(data_timestamp),
             "flush preceded data completion",
         )
-        _require(
-            _is_int(notification_timestamp, 1), "notification timestamp is missing"
-        )
-        _require(
-            int(notification_timestamp) >= int(flush_timestamp),
-            "notification completed before endpoint flush",
-        )
-        _require(
-            int(terminal_timestamp) >= int(notification_timestamp),
-            "terminal publication preceded notification completion",
-        )
+        if expected_notifications == 0:
+            _require(
+                notification_timestamp == 0,
+                "notification timestamp exists without population authority",
+            )
+            _require(
+                int(terminal_timestamp) >= int(flush_timestamp),
+                "terminal publication preceded endpoint flush",
+            )
+        else:
+            _require(
+                _is_int(notification_timestamp, 1),
+                "notification timestamp is missing",
+            )
+            _require(
+                int(notification_timestamp) >= int(flush_timestamp),
+                "notification completed before endpoint flush",
+            )
+            _require(
+                int(terminal_timestamp) >= int(notification_timestamp),
+                "terminal publication preceded notification completion",
+            )
     _require(
         progress.get("terminal_status") == "NIXL_SUCCESS",
         "native terminal status failed",
@@ -425,7 +451,7 @@ def _validate_terminal_progress(
 def _validate_population(
     population: object, transport: str
 ) -> tuple[str, int, int, int, int]:
-    """Validate one small or large transfer population.
+    """Validate one transfer population.
 
     :param population: Population receipt.
     :param transport: Observed UCX transport.
@@ -502,7 +528,7 @@ def _validate_population(
     )
     endpoint_count = _validate_endpoint_flushes(population.get("endpoint_flushes"))
     before, after = _validate_terminal_progress(
-        population.get("terminal_progress"), transport, endpoint_count
+        population.get("terminal_progress"), transport, str(name), endpoint_count
     )
     return str(name), before, after, int(handle_identity), int(generation)
 

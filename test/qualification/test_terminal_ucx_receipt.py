@@ -17,6 +17,7 @@ _SELF_ANCHORS = [
     "ucx/src/ucp/core/ucp_ep.c:1098",
     "nixl/src/core/nixl_agent.cpp:2449",
 ]
+_TCP_NOTIFICATION_POPULATIONS = {"small", "large"}
 
 
 def _not_applicable() -> dict[str, object]:
@@ -66,7 +67,9 @@ def _terminal_progress(
     small = population == "small"
     data_callbacks = 1 if small else 4
     flush_callbacks = 0 if self_transport else endpoint_count
-    notification_callbacks = 0 if self_transport else 1
+    notification_callbacks = int(
+        transport == "tcp" and population in _TCP_NOTIFICATION_POPULATIONS
+    )
     callback_count = data_callbacks + flush_callbacks + notification_callbacks
     before_return = data_callbacks if self_transport else 0
     return {
@@ -84,7 +87,9 @@ def _terminal_progress(
         "continuation_depth_at_terminal": 0,
         "last_data_callback_timestamp_ns": 10,
         "last_flush_callback_timestamp_ns": 0 if self_transport else 11,
-        "notification_callback_timestamp_ns": 0 if self_transport else 12,
+        "notification_callback_timestamp_ns": (
+            12 if notification_callbacks == 1 else 0
+        ),
         "terminal_publish_timestamp_ns": 13,
         "terminal_status": "NIXL_SUCCESS",
     }
@@ -440,9 +445,158 @@ def _replace_path(
     target[path[-1]] = value  # type: ignore[index]
 
 
+def _completion_progress(
+    receipt: dict[str, object], case_index: int, population_index: int
+) -> dict[str, object]:
+    """Return one fixture population's terminal-progress record.
+
+    :param receipt: Mutable receipt fixture.
+    :param case_index: Coordinate index.
+    :param population_index: Completion-population index.
+    :returns: Mutable terminal-progress record.
+    """
+    cases = receipt.get("cases")
+    assert isinstance(cases, list)
+    case = cases[case_index]
+    assert isinstance(case, dict)
+    populations = case.get("completion_populations")
+    assert isinstance(populations, list)
+    population = populations[population_index]
+    assert isinstance(population, dict)
+    progress = population.get("terminal_progress")
+    assert isinstance(progress, dict)
+    return progress
+
+
 def test_validate_receipt_accepts_transport_aware_matrix() -> None:
     """Accept the exact frozen Stage-1 coverage split."""
     validate_receipt(_receipt())
+
+
+@pytest.mark.parametrize("population_index", [0, 1])
+def test_validate_receipt_requires_base_tcp_notification(
+    population_index: int,
+) -> None:
+    """Require authenticated notification completion for base TCP requests.
+
+    :param population_index: Small or large base-population index.
+    """
+    receipt = _receipt()
+    progress = _completion_progress(receipt, 3, population_index)
+    progress["notification_callbacks"] = 0
+    progress["notification_callback_timestamp_ns"] = 0
+    asynchronous_requests = progress.get("asynchronous_requests")
+    assert isinstance(asynchronous_requests, int)
+    progress["asynchronous_requests"] = asynchronous_requests - 1
+    with pytest.raises(
+        ValueError, match="notification callback count differs from population contract"
+    ):
+        validate_receipt(receipt)
+
+
+@pytest.mark.parametrize("population_index", [0, 1])
+def test_validate_receipt_requires_base_tcp_notification_after_flush(
+    population_index: int,
+) -> None:
+    """Require base TCP notification completion to follow endpoint flushes.
+
+    :param population_index: Small or large base-population index.
+    """
+    receipt = _receipt()
+    progress = _completion_progress(receipt, 3, population_index)
+    progress["notification_callback_timestamp_ns"] = 10
+    with pytest.raises(
+        ValueError, match="notification completed before endpoint flush"
+    ):
+        validate_receipt(receipt)
+
+
+@pytest.mark.parametrize("population_index", [2, 3])
+def test_validate_receipt_accepts_tcp_repost_without_notification(
+    population_index: int,
+) -> None:
+    """Accept a TCP repost generation whose request carries no notification.
+
+    :param population_index: First or second repost-generation index.
+    """
+    receipt = _receipt()
+    progress = _completion_progress(receipt, 3, population_index)
+    assert progress.get("notification_callbacks") == 0
+    assert progress.get("notification_callback_timestamp_ns") == 0
+    validate_receipt(receipt)
+
+
+@pytest.mark.parametrize("population_index", [2, 3])
+def test_validate_receipt_rejects_tcp_repost_notification(
+    population_index: int,
+) -> None:
+    """Reject notification authority fabricated for a no-notification repost.
+
+    :param population_index: First or second repost-generation index.
+    """
+    receipt = _receipt()
+    progress = _completion_progress(receipt, 3, population_index)
+    progress["notification_callbacks"] = 1
+    progress["notification_callback_timestamp_ns"] = 12
+    asynchronous_requests = progress.get("asynchronous_requests")
+    assert isinstance(asynchronous_requests, int)
+    progress["asynchronous_requests"] = asynchronous_requests + 1
+    with pytest.raises(
+        ValueError, match="notification callback count differs from population contract"
+    ):
+        validate_receipt(receipt)
+
+
+@pytest.mark.parametrize("population_index", [2, 3])
+def test_validate_receipt_rejects_tcp_repost_notification_timestamp(
+    population_index: int,
+) -> None:
+    """Reject a notification timestamp without repost notification authority.
+
+    :param population_index: First or second repost-generation index.
+    """
+    receipt = _receipt()
+    progress = _completion_progress(receipt, 3, population_index)
+    progress["notification_callback_timestamp_ns"] = 12
+    with pytest.raises(
+        ValueError, match="notification timestamp exists without population authority"
+    ):
+        validate_receipt(receipt)
+
+
+@pytest.mark.parametrize("population_index", [2, 3])
+def test_validate_receipt_requires_tcp_repost_all_endpoint_flushes(
+    population_index: int,
+) -> None:
+    """Require every attested TCP repost endpoint to report a flush callback.
+
+    :param population_index: First or second repost-generation index.
+    """
+    receipt = _receipt()
+    progress = _completion_progress(receipt, 3, population_index)
+    progress["endpoint_flush_callbacks"] = 1
+    progress["asynchronous_requests"] = 5
+    with pytest.raises(
+        ValueError, match="TCP flush callbacks differ from endpoint authority"
+    ):
+        validate_receipt(receipt)
+
+
+@pytest.mark.parametrize("population_index", [2, 3])
+def test_validate_receipt_requires_tcp_repost_terminal_after_flush(
+    population_index: int,
+) -> None:
+    """Require no-notification TCP repost terminality after all endpoint flushes.
+
+    :param population_index: First or second repost-generation index.
+    """
+    receipt = _receipt()
+    progress = _completion_progress(receipt, 3, population_index)
+    progress["terminal_publish_timestamp_ns"] = 10
+    with pytest.raises(
+        ValueError, match="terminal publication preceded endpoint flush"
+    ):
+        validate_receipt(receipt)
 
 
 @pytest.mark.parametrize(
