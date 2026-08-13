@@ -41,9 +41,13 @@ retains production progress on both agents and holds the destination's exact
 admission receipt after queue commit. Every endpoint must record remote-flush
 authority while the source remains nonterminal. Killing that peer must then
 produce notification failure after the last flush callback without discarding
-the established authority. TCP also
-proves remote failure and capability epoch advancement, endpoint failure, and
-retirement on three distinct route generations. FAILED and RETIRED are
+the established authority. TCP also proves remote failure and capability epoch
+advancement, endpoint failure, and retirement on three distinct route
+generations. The endpoint-failure fixture first establishes remote-flush
+authority on the route, then stops the peer, posts and verifies a live victim
+request, and kills the peer. This orders the fault after real destination data
+arrival without concurrently reading a buffer owned by UCX receive progress.
+FAILED and RETIRED are
 exercised by separate terminal subscriptions. `terminal_ucx_receipt.py` rejects
 hard-coded pass fields and the physically over-constrained predecessor schema.
 

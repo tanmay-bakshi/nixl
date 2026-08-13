@@ -47,6 +47,7 @@ struct tcp_endpoint_failure_observation_t {
     tcp_peer_terminal_observation_t transfer;
     tcp_peer_capability_observation_t capability;
     tcp_peer_channel_observation_t channel;
+    bool dataBoundaryRemoteFlushed = false;
     bool peerExitedBySignal = false;
 };
 

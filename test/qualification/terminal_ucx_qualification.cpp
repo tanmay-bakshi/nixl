@@ -1472,8 +1472,9 @@ run(int argc, char **argv) {
             .shutdownCancellation =
                 nixl::qualification::runTcpShutdownCancellationFixture(options.engine),
         };
-        require(fixtures.endpointFailure.peerExitedBySignal,
-                "endpoint-failure peer did not die independently");
+        require(fixtures.endpointFailure.dataBoundaryRemoteFlushed &&
+                    fixtures.endpointFailure.peerExitedBySignal,
+                "endpoint-failure peer did not die after a remote-flushed data boundary");
         require(fixtures.notificationFailure.peerExitedBySignal,
                 "notification-failure peer did not die independently");
         require(fixtures.shutdownCancellation.peerExitedBySignal,

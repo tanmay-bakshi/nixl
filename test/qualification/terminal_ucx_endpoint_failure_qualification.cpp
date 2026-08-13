@@ -35,6 +35,8 @@ validate(const nixl::qualification::tcp_endpoint_failure_observation_t &observat
     const auto &capability = observation.capability;
     const auto &channel = observation.channel;
     require(observation.peerExitedBySignal, "independent TCP peer did not exit through SIGKILL");
+    require(observation.dataBoundaryRemoteFlushed,
+            "independent TCP peer exited without a remote-flushed data boundary");
     require(transfer.terminalStatus == NIXL_ERR_REMOTE_DISCONNECT &&
                 transfer.terminalEventCount == 1 && transfer.ownerWoken,
             "endpoint failure did not publish one exact transfer terminal event");

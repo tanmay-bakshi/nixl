@@ -34,7 +34,6 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -47,11 +46,16 @@ namespace {
     constexpr int worker_socket_fd = 198;
     constexpr int event_timeout_ms = 30000;
     constexpr std::size_t endpoint_failure_bytes = 512U * 1024U * 1024U;
+    constexpr std::size_t endpoint_boundary_bytes = 1;
+    constexpr std::size_t endpoint_failure_capacity =
+        endpoint_failure_bytes + endpoint_boundary_bytes;
+    constexpr std::size_t endpoint_boundary_offset = endpoint_failure_bytes;
     constexpr std::size_t notification_failure_bytes = 64U * 1024U * 1024U;
     constexpr std::size_t notification_bytes = 60U * 1024U;
     constexpr std::size_t maximum_frame_bytes = 16U * 1024U * 1024U;
     constexpr std::uint64_t capability_cookie = 9001;
     constexpr std::uint64_t transfer_cookie = 9002;
+    constexpr std::uint64_t endpoint_boundary_cookie = 9003;
     constexpr std::uint64_t unequal_worker_cookie_base = 9100;
     constexpr std::uint64_t device_id = 0;
 
@@ -61,15 +65,13 @@ namespace {
         REMOTE_METADATA_LOADED = 3,
         SHUTDOWN = 4,
         ERROR = 5,
-        ARM_EXIT_AFTER_WRITE = 6,
-        EXIT_WATCH_ARMED = 7,
-        DRAIN_NOTIFICATIONS = 8,
-        NOTIFICATIONS_DRAINED = 9,
-        ARM_ADMISSION_RECEIPT_HOLD = 10,
-        ADMISSION_RECEIPT_HOLD_ARMED = 11,
-        ADMISSION_RECEIPT_HELD = 12,
-        RELEASE_ADMISSION_RECEIPT = 13,
-        ADMISSION_RECEIPT_RELEASED = 14,
+        DRAIN_NOTIFICATIONS = 6,
+        NOTIFICATIONS_DRAINED = 7,
+        ARM_ADMISSION_RECEIPT_HOLD = 8,
+        ADMISSION_RECEIPT_HOLD_ARMED = 9,
+        ADMISSION_RECEIPT_HELD = 10,
+        RELEASE_ADMISSION_RECEIPT = 11,
+        ADMISSION_RECEIPT_RELEASED = 12,
     };
 
     class peer_fixture_error final : public std::runtime_error {
@@ -271,30 +273,6 @@ namespace {
     }
 
     [[nodiscard]] std::string
-    encodeExitWatch(std::size_t offset, std::uint8_t expected) {
-        const std::array<std::uint64_t, 2> values = {
-            static_cast<std::uint64_t>(offset),
-            static_cast<std::uint64_t>(expected),
-        };
-        return std::string(reinterpret_cast<const char *>(values.data()), sizeof(values));
-    }
-
-    [[nodiscard]] std::pair<std::size_t, std::uint8_t>
-    decodeExitWatch(std::string_view payload) {
-        require(payload.size() == sizeof(std::uint64_t) * 2,
-                "peer exit-watch frame has an invalid length");
-        std::array<std::uint64_t, 2> values = {};
-        std::memcpy(values.data(), payload.data(), payload.size());
-        require(values[0] <= std::numeric_limits<std::size_t>::max() &&
-                    values[1] <= std::numeric_limits<std::uint8_t>::max(),
-                "peer exit-watch frame is invalid");
-        return {
-            static_cast<std::size_t>(values[0]),
-            static_cast<std::uint8_t>(values[1]),
-        };
-    }
-
-    [[nodiscard]] std::string
     encodeNotifications(const std::vector<std::string> &notifications) {
         std::size_t encoded_size = sizeof(std::uint64_t);
         for (const std::string &notification : notifications) {
@@ -418,34 +396,23 @@ namespace {
             return bytes_.size();
         }
 
-        [[nodiscard]] std::uint8_t
-        byteAt(std::size_t offset) const {
-            require(offset < bytes_.size(), "peer DRAM byte offset is out of range");
-            return bytes_[offset];
-        }
-
-        void
-        waitForByte(std::size_t offset, std::uint8_t expected) const {
-            require(offset < bytes_.size(), "peer exit-watch offset is out of range");
-            const volatile std::uint8_t *const observed = bytes_.data() + offset;
-            while (*observed != expected) {
-                std::this_thread::yield();
-            }
-        }
-
         [[nodiscard]] nixl_xfer_dlist_t
-        transferList(std::size_t size, std::size_t descriptor_count = 1) const {
-            require(size > 0 && size <= bytes_.size(), "peer transfer exceeds registered DRAM");
+        transferList(std::size_t size,
+                     std::size_t descriptor_count = 1,
+                     std::size_t offset = 0) const {
+            require(offset <= bytes_.size() && size > 0 && size <= bytes_.size() - offset,
+                    "peer transfer exceeds registered DRAM");
             require(descriptor_count > 0 && descriptor_count <= size,
                     "peer transfer descriptor geometry is invalid");
             nixl_xfer_dlist_t descriptors(DRAM_SEG);
             const std::size_t base_size = size / descriptor_count;
             const std::size_t remainder = size % descriptor_count;
-            std::size_t offset = 0;
+            std::size_t descriptor_offset = offset;
             for (std::size_t index = 0; index < descriptor_count; ++index) {
                 const std::size_t descriptor_size = base_size + (index < remainder ? 1U : 0U);
-                descriptors.addDesc(nixlBasicDesc(address() + offset, descriptor_size, device_id));
-                offset += descriptor_size;
+                descriptors.addDesc(
+                    nixlBasicDesc(address() + descriptor_offset, descriptor_size, device_id));
+                descriptor_offset += descriptor_size;
             }
             return descriptors;
         }
@@ -640,13 +607,6 @@ namespace {
             static_cast<void>(expect(frame_kind_t::REMOTE_METADATA_LOADED));
         }
 
-        void
-        armExitAfterWrite(std::size_t offset, std::uint8_t expected) {
-            sendFrame(
-                socket_, frame_kind_t::ARM_EXIT_AFTER_WRITE, encodeExitWatch(offset, expected));
-            static_cast<void>(expect(frame_kind_t::EXIT_WATCH_ARMED));
-        }
-
         [[nodiscard]] std::vector<std::string>
         drainNotifications() {
             sendFrame(socket_, frame_kind_t::DRAIN_NOTIFICATIONS);
@@ -688,20 +648,21 @@ namespace {
             return WIFEXITED(status) && WEXITSTATUS(status) == EXIT_SUCCESS;
         }
 
-        [[nodiscard]] bool
-        waitForExitSignal(int expected_signal) {
+        void
+        stopAndWait() const {
             require(pid_ > 0 && !waited_, "peer worker is not live");
+            if (::kill(pid_, SIGSTOP) != 0) {
+                throw peer_fixture_error("failed to stop TCP peer worker");
+            }
             int status = 0;
-            while (::waitpid(pid_, &status, 0) < 0) {
+            while (::waitpid(pid_, &status, WUNTRACED) < 0) {
                 if (errno == EINTR) {
                     continue;
                 }
-                throw peer_fixture_error("failed to reap self-terminated TCP peer worker");
+                throw peer_fixture_error("failed to observe stopped TCP peer worker");
             }
-            waited_ = true;
-            static_cast<void>(::close(socket_));
-            socket_ = -1;
-            return WIFSIGNALED(status) && WTERMSIG(status) == expected_signal;
+            require(WIFSTOPPED(status) && WSTOPSIG(status) == SIGSTOP,
+                    "TCP peer worker did not stop at the fault boundary");
         }
 
         [[nodiscard]] bool
@@ -867,18 +828,21 @@ namespace {
     [[nodiscard]] nixl_xfer_dlist_t
     remoteTransferList(const peer_hello_t &hello,
                        std::size_t size,
-                       std::size_t descriptor_count = 1) {
-        require(size > 0 && size <= hello.capacity, "fault transfer exceeds peer registration");
+                       std::size_t descriptor_count = 1,
+                       std::size_t offset = 0) {
+        require(offset <= hello.capacity && size > 0 && size <= hello.capacity - offset,
+                "fault transfer exceeds peer registration");
         require(descriptor_count > 0 && descriptor_count <= size,
                 "fault transfer descriptor geometry is invalid");
         nixl_xfer_dlist_t descriptors(DRAM_SEG);
         const std::size_t base_size = size / descriptor_count;
         const std::size_t remainder = size % descriptor_count;
-        std::size_t offset = 0;
+        std::size_t descriptor_offset = offset;
         for (std::size_t index = 0; index < descriptor_count; ++index) {
             const std::size_t descriptor_size = base_size + (index < remainder ? 1U : 0U);
-            descriptors.addDesc(nixlBasicDesc(hello.address + offset, descriptor_size, device_id));
-            offset += descriptor_size;
+            descriptors.addDesc(
+                nixlBasicDesc(hello.address + descriptor_offset, descriptor_size, device_id));
+            descriptor_offset += descriptor_size;
         }
         return descriptors;
     }
@@ -891,7 +855,8 @@ namespace {
                    bool attached_notification,
                    std::size_t descriptor_count = 1,
                    std::optional<std::size_t> worker_id = std::nullopt,
-                   std::string notification = std::string(notification_bytes, 'N')) {
+                   std::string notification = std::string(notification_bytes, 'N'),
+                   std::size_t memory_offset = 0) {
         nixl_opt_args_t arguments;
         arguments.backends = {source.backend};
         if (attached_notification) {
@@ -901,15 +866,15 @@ namespace {
             arguments.customParam = "worker_id=" + std::to_string(*worker_id);
         }
         nixlXferReqH *request = nullptr;
-        requireStatus(
-            source.agent.createXferReq(NIXL_WRITE,
-                                       source.memory->transferList(bytes, descriptor_count),
-                                       remoteTransferList(peer, bytes, descriptor_count),
-                                       remote,
-                                       request,
-                                       &arguments),
-            NIXL_SUCCESS,
-            "create peer fault transfer");
+        requireStatus(source.agent.createXferReq(
+                          NIXL_WRITE,
+                          source.memory->transferList(bytes, descriptor_count, memory_offset),
+                          remoteTransferList(peer, bytes, descriptor_count, memory_offset),
+                          remote,
+                          request,
+                          &arguments),
+                      NIXL_SUCCESS,
+                      "create peer fault transfer");
         require(request != nullptr, "peer fault transfer request is null");
         return request;
     }
@@ -1008,7 +973,7 @@ namespace {
                       NIXL_SUCCESS,
                       "create peer worker UCX backend");
         require(backend != nullptr, "peer worker UCX backend is null");
-        registered_dram_t memory(agent, backend, endpoint_failure_bytes);
+        registered_dram_t memory(agent, backend, endpoint_failure_capacity);
         nixl_blob_t metadata;
         requireStatus(agent.getLocalMD(metadata), NIXL_SUCCESS, "get peer worker metadata");
         sendFrame(
@@ -1077,19 +1042,6 @@ namespace {
                 sendFrame(fd, frame_kind_t::ADMISSION_RECEIPT_RELEASED);
                 continue;
             }
-            if (frame.kind == frame_kind_t::ARM_EXIT_AFTER_WRITE) {
-                const auto [offset, expected] = decodeExitWatch(frame.payload);
-                require(offset < memory.capacity(), "peer exit-watch exceeds registered DRAM");
-                sendFrame(fd, frame_kind_t::EXIT_WATCH_ARMED);
-                memory.waitForByte(offset, expected);
-                requireStatus(agent.invalidateRemoteMD(remote),
-                              NIXL_SUCCESS,
-                              "retire source route at data boundary");
-                if (::raise(SIGKILL) != 0) {
-                    throw peer_fixture_error("peer worker failed to exit at the data boundary");
-                }
-                throw peer_fixture_error("peer exit-watch survived SIGKILL");
-            }
             if (frame.kind == frame_kind_t::DRAIN_NOTIFICATIONS) {
                 nixl_remote_notifs_t notifications;
                 requireStatus(agent.getRemoteNotifs(notifications),
@@ -1152,7 +1104,7 @@ runTerminalUcxPeerWorker(int argc, char **argv) {
 tcp_endpoint_failure_observation_t
 runTcpEndpointFailureFixture(const std::string &engine) {
     peer_process_t peer(engine);
-    source_fixture_t source(engine, endpoint_failure_bytes);
+    source_fixture_t source(engine, endpoint_failure_capacity);
     nixlRemoteAgentH *remote = loadPeer(source, peer);
     terminal_ucx_api_adapter_t adapter(source.agent, 8);
     terminal_inbox_t inbox(adapter);
@@ -1160,8 +1112,48 @@ runTcpEndpointFailureFixture(const std::string &engine) {
     tcp_peer_capability_observation_t capability =
         makeCapabilityReady(source, peer, adapter, inbox, remote, capability_subscription);
 
-    nixlXferReqH *request =
-        createTransfer(source, peer.hello(), remote, endpoint_failure_bytes, false);
+    nixlXferReqH *boundary_request = createTransfer(source,
+                                                    peer.hello(),
+                                                    remote,
+                                                    endpoint_boundary_bytes,
+                                                    false,
+                                                    1,
+                                                    0,
+                                                    {},
+                                                    endpoint_boundary_offset);
+    nixlTerminalEventSubscriptionH *boundary_subscription = nullptr;
+    requireStatus(adapter.subscribeTransfer(
+                      boundary_request, endpoint_boundary_cookie, boundary_subscription),
+                  NIXL_SUCCESS,
+                  "subscribe endpoint remote-flush boundary");
+    require(boundary_subscription != nullptr,
+            "endpoint remote-flush boundary subscription is null");
+    const nixl_status_t boundary_post_status = source.agent.postXferReq(boundary_request);
+    require(boundary_post_status == NIXL_SUCCESS || boundary_post_status == NIXL_IN_PROG,
+            "endpoint remote-flush boundary failed during post");
+    const observed_event_t boundary =
+        inbox.take(nixl_terminal_event_kind_t::TRANSFER, endpoint_boundary_cookie);
+    requireStatus(boundary.event.transferStatus,
+                  NIXL_SUCCESS,
+                  "endpoint remote-flush boundary terminal status");
+    nixl_xfer_attestation_t boundary_attestation;
+    requireStatus(source.agent.queryXferAttestation(boundary_request, boundary_attestation),
+                  NIXL_SUCCESS,
+                  "query endpoint remote-flush boundary attestation");
+    const bool data_boundary_remote_flushed = attestationIsRemoteFlushed(boundary_attestation);
+    require(data_boundary_remote_flushed,
+            "endpoint peer exit lacked an established remote-flush data boundary");
+    requireStatus(adapter.release(boundary_subscription),
+                  NIXL_SUCCESS,
+                  "release endpoint remote-flush boundary subscription");
+    requireStatus(source.agent.releaseXferReq(boundary_request),
+                  NIXL_SUCCESS,
+                  "release endpoint remote-flush boundary request");
+
+    const std::optional<std::size_t> victim_worker =
+        engine == "shared" ? std::optional<std::size_t>(1) : std::nullopt;
+    nixlXferReqH *request = createTransfer(
+        source, peer.hello(), remote, endpoint_failure_bytes, false, 2, victim_worker);
     nixl_xfer_attestation_t prepared_attestation;
     requireStatus(source.agent.queryXferAttestation(request, prepared_attestation),
                   NIXL_SUCCESS,
@@ -1178,10 +1170,25 @@ runTcpEndpointFailureFixture(const std::string &engine) {
     require(transfer_info.active && transfer_info.identity == prepared_attestation.handleIdentity &&
                 transfer_info.generation == prepared_attestation.generation + 1,
             "endpoint-failure subscription changed transfer generation");
-    peer.armExitAfterWrite(0, source.memory->byteAt(0));
+
+    peer.stopAndWait();
     const nixl_status_t post_status = source.agent.postXferReq(request);
     require(post_status == NIXL_IN_PROG, "endpoint-failure transfer completed before peer death");
-    const bool peer_exited_by_signal = peer.waitForExitSignal(SIGKILL);
+
+    nixl_xfer_attestation_t live_attestation;
+    requireStatus(source.agent.queryXferAttestation(request, live_attestation),
+                  NIXL_SUCCESS,
+                  "query live endpoint-failure transfer at data boundary");
+    require(live_attestation.state == nixl_xfer_attestation_state_t::IN_PROGRESS,
+            "endpoint-failure transfer became terminal before the data boundary");
+    nixl_terminal_subscription_info_t live_transfer_info;
+    requireStatus(adapter.querySubscription(transfer_subscription, live_transfer_info),
+                  NIXL_SUCCESS,
+                  "query live endpoint-failure subscription at data boundary");
+    require(live_transfer_info.active,
+            "endpoint-failure subscription became terminal before peer death");
+
+    const bool peer_exited_by_signal = peer.killAndWait();
     require(peer_exited_by_signal, "TCP endpoint peer did not exit by SIGKILL");
 
     const observed_event_t transfer =
@@ -1241,6 +1248,7 @@ runTcpEndpointFailureFixture(const std::string &engine) {
             },
         .capability = std::move(capability),
         .channel = channel,
+        .dataBoundaryRemoteFlushed = data_boundary_remote_flushed,
         .peerExitedBySignal = peer_exited_by_signal,
     };
 }
