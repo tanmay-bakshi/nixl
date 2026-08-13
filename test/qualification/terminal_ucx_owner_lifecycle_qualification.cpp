@@ -21,6 +21,8 @@
 #include <fstream>
 #include <future>
 #include <iostream>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -45,6 +47,64 @@ public:
             params,
             nixlUcxThreadPoolEngine::qualification_constructor_failure_point_t::
                 AFTER_FIRST_DEDICATED_PROGRESS_OWNER_STARTED);
+    }
+};
+
+class nixlUcxConnectionRetirementQualification {
+public:
+    struct observation_t {
+        std::size_t successfulLookups = 0;
+        std::size_t detachedConnections = 0;
+        bool registryLockReleased = false;
+        bool connectionRetainedAfterDetach = false;
+        bool connectionReleasedAfterRetirement = false;
+    };
+
+    static observation_t
+    exercise(nixlUcxEngine &engine, const std::string &remote_agent) {
+        std::atomic<bool> stop_lookup = false;
+        std::atomic<std::size_t> successful_lookups = 0;
+        std::thread lookup([&]() {
+            while (!stop_lookup.load(std::memory_order_acquire)) {
+                if (engine.getConnection(remote_agent) != nullptr) {
+                    successful_lookups.fetch_add(1, std::memory_order_relaxed);
+                }
+                std::this_thread::yield();
+            }
+        });
+
+        const auto lookup_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (successful_lookups.load(std::memory_order_relaxed) == 0 &&
+               std::chrono::steady_clock::now() < lookup_deadline) {
+            std::this_thread::yield();
+        }
+
+        nixlUcxEngine::remote_connection_map_t retired_connections =
+            engine.detachRemoteConnections();
+        stop_lookup.store(true, std::memory_order_release);
+        lookup.join();
+
+        std::weak_ptr<nixlUcxConnection> retired_connection;
+        const auto retired = retired_connections.find(remote_agent);
+        if (retired != retired_connections.end()) {
+            retired_connection = retired->second;
+        }
+        const std::size_t detached_connection_count = retired_connections.size();
+        const bool connection_retained = !retired_connection.expired();
+        std::unique_lock registry_lock(engine.connectionMutex_, std::try_to_lock);
+        const bool registry_lock_released = registry_lock.owns_lock();
+        if (registry_lock_released) {
+            registry_lock.unlock();
+        }
+
+        retired_connections.clear();
+        return {
+            .successfulLookups = successful_lookups.load(std::memory_order_relaxed),
+            .detachedConnections = detached_connection_count,
+            .registryLockReleased = registry_lock_released,
+            .connectionRetainedAfterDetach = connection_retained,
+            .connectionReleasedAfterRetirement = retired_connection.expired(),
+        };
     }
 };
 
@@ -180,6 +240,37 @@ testPartialConstructionAfterFirstDedicatedOwnerStart() {
                 params);
         },
         "dedicated-owner constructor rollback");
+}
+
+void
+testConnectionRetirementOutsideRegistryLock() {
+    const std::string local_agent = "terminal-connection-retirement-qualification";
+    nixl_b_params_t custom_params = {
+        {"num_workers", "2"},
+        {"num_threads", "0"},
+        {"ucx_error_handling_mode", "peer"},
+    };
+    const nixlBackendInitParams params = {
+        .localAgent = local_agent,
+        .localAgentIncarnation = "00000000-0000-4000-8000-000000000124",
+        .type = "UCX",
+        .customParams = &custom_params,
+        .enableProgTh = true,
+        .pthrDelay = 1,
+        .syncMode = nixl_thread_sync_t::NIXL_THREAD_SYNC_RW,
+        .enableTelemetry_ = false,
+    };
+    std::unique_ptr<nixlUcxEngine> engine = nixlUcxEngine::create(params);
+    require(engine != nullptr, "connection-retirement engine construction failed");
+    require(engine->connect(local_agent) == NIXL_SUCCESS,
+            "connection-retirement fixture could not establish its UCX loopback");
+
+    const auto observation =
+        nixlUcxConnectionRetirementQualification::exercise(*engine, local_agent);
+    require(observation.successfulLookups > 0 && observation.detachedConnections == 1 &&
+                observation.registryLockReleased && observation.connectionRetainedAfterDetach &&
+                observation.connectionReleasedAfterRetirement,
+            "connection retirement destroyed a UCX endpoint under the registry lock");
 }
 
 [[nodiscard]] options_t
@@ -654,6 +745,7 @@ runCases() {
 
     testPartialConstructionAfterSharedOwnerStart();
     testPartialConstructionAfterFirstDedicatedOwnerStart();
+    testConnectionRetirementOutsideRegistryLock();
     testExactZeroNativeInventory();
     testNativeTransferDeadline();
 
@@ -694,6 +786,10 @@ runCases() {
         {
             .name =
                 "partial_construction_after_first_dedicated_owner_start_restores_threads_and_fds",
+            .inventory = local_inventory,
+        },
+        {
+            .name = "connection_retirement_destroys_ucx_endpoints_after_registry_unlock",
             .inventory = local_inventory,
         },
         {
