@@ -393,6 +393,8 @@ protected:
     std::atomic<nixlBackendAdmissionReceiptBarrier *> admissionReceiptBarrier_{nullptr};
 
 private:
+    using remote_connection_map_t = std::unordered_map<std::string, ucx_connection_ptr_t>;
+
     struct notifCallbackContext {
         nixlUcxEngine *engine;
         size_t workerId;
@@ -449,6 +451,13 @@ private:
     ucx_connection_ptr_t
     getConnection(uint64_t connection_identity) const;
 
+    [[nodiscard]] remote_connection_map_t
+    detachRemoteConnections() noexcept;
+
+    [[nodiscard]] ucx_connection_ptr_t
+    detachRemoteConnection(const std::string &remote_agent,
+                           const ucx_connection_ptr_t &expected_connection) noexcept;
+
     struct batchResult {
         nixl_status_t status;
         size_t size;
@@ -490,7 +499,9 @@ private:
 
     // Map of agent name to saved nixlUcxConnection info
     mutable std::mutex connectionMutex_;
-    std::unordered_map<std::string, ucx_connection_ptr_t> remoteConnMap;
+    remote_connection_map_t remoteConnMap;
+
+    friend class nixlUcxConnectionRetirementQualification;
 };
 
 class nixlUcxThread;

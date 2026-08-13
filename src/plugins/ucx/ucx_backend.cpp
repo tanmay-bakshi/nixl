@@ -2432,8 +2432,11 @@ nixlUcxEngine::~nixlUcxEngine() {
         NIXL_FATAL << "UCX base engine destruction observed live notification ingress state";
     }
     tlsSharedWorkerMap().erase(this);
-    const std::lock_guard lock(connectionMutex_);
-    remoteConnMap.clear();
+    remote_connection_map_t retired_connections = detachRemoteConnections();
+    // Endpoint teardown enters UCX. The connection registry lock must never be held while the
+    // retired map releases its final endpoint owners because notification callbacks acquire the
+    // same registry lock from inside UCX progress.
+    retired_connections.clear();
 }
 
 void
@@ -2535,13 +2538,10 @@ nixlUcxEngine::disconnect(const std::string &remote_agent) {
         failTerminalLifecycle(NIXL_ERR_BACKEND);
         NIXL_FATAL << "UCX connection destruction timed out with committed receipt authority";
     }
-    {
-        const std::lock_guard lock(connectionMutex_);
-        const auto it = remoteConnMap.find(remote_agent);
-        if (it == remoteConnMap.end() || it->second != connection) {
-            return NIXL_ERR_NOT_FOUND;
-        }
-        remoteConnMap.erase(it);
+    const ucx_connection_ptr_t retired_connection =
+        detachRemoteConnection(remote_agent, connection);
+    if (retired_connection == nullptr) {
+        return NIXL_ERR_NOT_FOUND;
     }
     if (ingressRegistry_->retireConnection(connection_identity) !=
         nixl::ucx::notif_ingress_status_t::SUCCESS) {
@@ -3770,6 +3770,32 @@ nixlUcxEngine::getConnection(uint64_t connection_identity) const {
         }
     }
     return nullptr;
+}
+
+nixlUcxEngine::remote_connection_map_t
+nixlUcxEngine::detachRemoteConnections() noexcept {
+    remote_connection_map_t retired_connections;
+    {
+        const std::lock_guard lock(connectionMutex_);
+        retired_connections.swap(remoteConnMap);
+    }
+    return retired_connections;
+}
+
+ucx_connection_ptr_t
+nixlUcxEngine::detachRemoteConnection(const std::string &remote_agent,
+                                      const ucx_connection_ptr_t &expected_connection) noexcept {
+    ucx_connection_ptr_t retired_connection;
+    {
+        const std::lock_guard lock(connectionMutex_);
+        const auto it = remoteConnMap.find(remote_agent);
+        if (it == remoteConnMap.end() || it->second != expected_connection) {
+            return nullptr;
+        }
+        retired_connection = std::move(it->second);
+        remoteConnMap.erase(it);
+    }
+    return retired_connection;
 }
 
 std::optional<nixlUcxEngine::exactRouteRecord>
