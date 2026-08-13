@@ -182,7 +182,7 @@ public:
 
     bool
     supportsAuthenticatedNotif() const override {
-        return true;
+        return authenticatedNotificationsEnabled_;
     }
 
     nixl_mem_list_t
@@ -495,6 +495,7 @@ private:
     nixl::ucx::connection_metadata_t localConnectionMetadata_;
     std::vector<notifCallbackContext> notifCallbackContexts_;
     nixl::ucx::notif_wire_uuid_t localAgentIncarnationUuid_;
+    const bool authenticatedNotificationsEnabled_;
     std::shared_ptr<nixl::ucx::notif_capability_state_t> notifState_;
     std::shared_ptr<nixl::ucx::notif_endpoint_failure_state_t> endpointFailureState_;
     std::unique_ptr<nixl::ucx::terminal_deadline_owner_t> terminalDeadlineOwner_;

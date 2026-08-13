@@ -262,6 +262,8 @@ testConnectionRetirementOutsideRegistryLock() {
     };
     std::unique_ptr<nixlUcxEngine> engine = nixlUcxEngine::create(params);
     require(engine != nullptr, "connection-retirement engine construction failed");
+    require(engine->supportsAuthenticatedNotif(),
+            "progress-owned UCX engine did not expose authenticated notifications");
     require(engine->connect(local_agent) == NIXL_SUCCESS,
             "connection-retirement fixture could not establish its UCX loopback");
 
@@ -271,6 +273,29 @@ testConnectionRetirementOutsideRegistryLock() {
                 observation.registryLockReleased && observation.connectionRetainedAfterDetach &&
                 observation.connectionReleasedAfterRetirement,
             "connection retirement destroyed a UCX endpoint under the registry lock");
+}
+
+void
+testAuthenticatedNotificationsRequireProgressOwner() {
+    nixl_b_params_t custom_params = {
+        {"num_workers", "1"},
+        {"num_threads", "0"},
+        {"ucx_error_handling_mode", "peer"},
+    };
+    const nixlBackendInitParams params = {
+        .localAgent = "terminal-manual-progress-qualification",
+        .localAgentIncarnation = "00000000-0000-4000-8000-000000000125",
+        .type = "UCX",
+        .customParams = &custom_params,
+        .enableProgTh = false,
+        .pthrDelay = 1,
+        .syncMode = nixl_thread_sync_t::NIXL_THREAD_SYNC_RW,
+        .enableTelemetry_ = false,
+    };
+    std::unique_ptr<nixlUcxEngine> engine = nixlUcxEngine::create(params);
+    require(engine != nullptr, "manual-progress UCX engine construction failed");
+    require(!engine->supportsAuthenticatedNotif(),
+            "manual-progress UCX engine exposed a protocol that requires an independent owner");
 }
 
 [[nodiscard]] options_t
@@ -746,6 +771,7 @@ runCases() {
     testPartialConstructionAfterSharedOwnerStart();
     testPartialConstructionAfterFirstDedicatedOwnerStart();
     testConnectionRetirementOutsideRegistryLock();
+    testAuthenticatedNotificationsRequireProgressOwner();
     testExactZeroNativeInventory();
     testNativeTransferDeadline();
 
@@ -790,6 +816,10 @@ runCases() {
         },
         {
             .name = "connection_retirement_destroys_ucx_endpoints_after_registry_unlock",
+            .inventory = local_inventory,
+        },
+        {
+            .name = "authenticated_notifications_require_independent_progress_owner",
             .inventory = local_inventory,
         },
         {

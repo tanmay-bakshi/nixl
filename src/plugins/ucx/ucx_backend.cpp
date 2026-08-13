@@ -2317,6 +2317,7 @@ nixlUcxEngine::create(const nixlBackendInitParams &init_params) {
 
 nixlUcxEngine::nixlUcxEngine(const nixlBackendInitParams &init_params)
     : nixlBackendEngine(&init_params),
+      authenticatedNotificationsEnabled_(init_params.enableProgTh),
       sharedWorkerIndex_(1) {
     std::vector<std::string> devs; /* Empty vector */
     nixl_b_params_t *custom_params = init_params.customParams;
@@ -2609,6 +2610,9 @@ nixlUcxEngine::makeRoute(const nixlRemoteAgentBinding &binding,
 
 nixl_status_t
 nixlUcxEngine::bindRemoteAgent(const nixlRemoteAgentBinding &binding) {
+    if (!supportsAuthenticatedNotif()) {
+        return NIXL_ERR_NOT_SUPPORTED;
+    }
     nixl::ucx::notif_route_key_t route;
     ucx_connection_ptr_t connection;
     const nixl_status_t route_status = makeRoute(binding, route, connection);
@@ -4037,6 +4041,9 @@ nixlUcxEngine::scheduleAdmissionReceipt(const nixl::ucx::notif_ingress_key_t &ke
         return NIXL_ERR_INVALID_PARAM;
     }
     nixlUcxWorker *const receipt_worker = getWorker(worker_id).get();
+    if (!receipt_worker->hasProgressOwner()) {
+        return NIXL_ERR_NOT_SUPPORTED;
+    }
     const std::shared_ptr<nixl::ucx::notif_ingress_registry_t> ingress = ingressRegistry_;
     return receipt_worker->getContinuationQueue()->enqueueProducer(
         [this, ingress, key, receipt_worker, receipt, connection_identity, worker_id]() noexcept {
@@ -4084,7 +4091,11 @@ nixlUcxEngine::scheduleOfferControlReply(
     if (worker_id >= getWorkers().size()) {
         return NIXL_ERR_INVALID_PARAM;
     }
-    return getWorker(worker_id)->getContinuationQueue()->enqueueProducer(
+    nixlUcxWorker *const reply_worker = getWorker(worker_id).get();
+    if (!reply_worker->hasProgressOwner()) {
+        return NIXL_ERR_NOT_SUPPORTED;
+    }
+    return reply_worker->getContinuationQueue()->enqueueProducer(
         [this, acknowledgement, local_offer, worker_id, connection_identity]() noexcept {
             const nixl_status_t acknowledgement_status =
                 sendControlFrame(acknowledgement, connection_identity, worker_id);
