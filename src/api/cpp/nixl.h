@@ -24,6 +24,7 @@
 #include "nixl_types.h"
 #include "nixl_params.h"
 #include "nixl_descriptors.h"
+#include <array>
 #include <chrono>
 #include <memory>
 
@@ -431,6 +432,20 @@ class nixlAgent {
                               nixlXferReqH *req_hndl,
                               uint64_t owner_cookie,
                               nixlTerminalEventSubscriptionH *&subscription);
+
+        /**
+         * @brief Arm direct delivery into an immutable terminal owner.
+         *
+         * The exact next transfer generation and 32-byte owner lifecycle binding are
+         * committed before a post. The qualified backend terminal callback submits
+         * directly through the producer ABI; no terminal-event channel is involved.
+         */
+        nixl_status_t
+        subscribeXferTerminalOwner(
+            nixlTerminalOwnerProducerH *producer,
+            nixlXferReqH *req_hndl,
+            const std::array<std::uint8_t, 32> &binding_digest,
+            nixlTerminalEventSubscriptionH *&subscription);
 
         /**
          * @brief Subscribe to capability transitions for an exact backend route.

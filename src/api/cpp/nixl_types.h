@@ -33,6 +33,7 @@ class nixlAgentData;
 class nixlRemoteAgentH;
 class nixlTerminalEventChannelH;
 class nixlTerminalEventSubscriptionH;
+class nixlTerminalOwnerProducerH;
 
 /*** NIXL memory type, operation and status enums ***/
 

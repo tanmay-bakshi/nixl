@@ -19,10 +19,22 @@
 class nixlBackendEngine;
 class nixlTerminalEventSubscriptionTestPeer;
 
-class nixlTerminalTransferAdapter final : public nixlBackendTransferTransitionSink {
+class nixlTerminalTransferAdapterBase : public nixlBackendTransferTransitionSink {
 public:
     using terminal_callback_t = std::function<void()>;
 
+    virtual void
+    bindTerminalCallback(terminal_callback_t terminal_callback) = 0;
+
+    [[nodiscard]] virtual bool
+    isTerminal() const noexcept = 0;
+
+    virtual void
+    release() noexcept = 0;
+};
+
+class nixlTerminalTransferAdapter final : public nixlTerminalTransferAdapterBase {
+public:
     nixlTerminalTransferAdapter(
         nixlBackendTransferEventBinding binding,
         std::shared_ptr<nixl::terminalEventChannel::subscription> channel_subscription);
@@ -108,7 +120,7 @@ private:
         nixlBackendEngine *backend,
         const nixlXferReqH *request,
         std::unique_ptr<nixlBackendEventSubscription> backend_subscription,
-        std::shared_ptr<nixlTerminalTransferAdapter> transfer_adapter);
+        std::shared_ptr<nixlTerminalTransferAdapterBase> transfer_adapter);
 
     nixlTerminalEventSubscriptionH(
         uint64_t owner_identity,
@@ -147,7 +159,7 @@ private:
     nixlBackendEngine *const backend_;
     const nixlXferReqH *const request_;
     std::unique_ptr<nixlBackendEventSubscription> backendSubscription_;
-    std::shared_ptr<nixlTerminalTransferAdapter> transferAdapter_;
+    std::shared_ptr<nixlTerminalTransferAdapterBase> transferAdapter_;
     std::shared_ptr<nixlTerminalCapabilityAdapter> capabilityAdapter_;
     bool cancellationRequested_ = false;
     bool publicReleaseClaimed_ = false;

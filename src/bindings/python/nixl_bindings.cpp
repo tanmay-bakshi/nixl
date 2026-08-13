@@ -23,10 +23,15 @@
 #include <functional>
 #include <tuple>
 #include <iostream>
+#include <array>
+#include <cstring>
+#include <mutex>
+#include <vector>
 
 #include "nixl.h"
 #include "agent_data.h"
 #include "serdes/serdes.h"
+#include "terminal_owner_producer.h"
 
 namespace py = pybind11;
 
@@ -181,6 +186,180 @@ public:
 private:
     nixl_terminal_subscription_info_t info_;
 };
+
+void
+throw_nixl_exception(const nixl_status_t &status);
+
+namespace {
+
+std::mutex abandonedTerminalOwnerCapsulesMutex;
+std::vector<std::pair<PyObject *, PyObject *>> abandonedTerminalOwnerCapsules;
+
+[[nodiscard]] nixl_terminal_owner_binding_digest_t
+terminalOwnerBindingFromPython(const py::bytes &value) {
+    const std::string bytes = value;
+    if (bytes.size() != NIXL_TERMINAL_OWNER_BINDING_DIGEST_BYTES) {
+        throw py::value_error("binding digest must contain exactly 32 bytes");
+    }
+    nixl_terminal_owner_binding_digest_t binding{};
+    std::memcpy(binding.data(), bytes.data(), binding.size());
+    return binding;
+}
+
+[[nodiscard]] py::bytes
+terminalOwnerBindingToPython(const nixl_terminal_owner_binding_digest_t &value) {
+    return py::bytes(reinterpret_cast<const char *>(value.data()), value.size());
+}
+
+class nixlTerminalOwnerProducerBinding final {
+public:
+    nixlTerminalOwnerProducerBinding(
+        const py::capsule &api_capsule,
+        const py::capsule &context_capsule)
+        : apiCapsule_(api_capsule.ptr()),
+          contextCapsule_(context_capsule.ptr()) {
+        const auto *api = static_cast<const sglang_terminal_owner_producer_api_v1 *>(
+            PyCapsule_GetPointer(
+                api_capsule.ptr(), SGLANG_TERMINAL_OWNER_PRODUCER_API_CAPSULE_NAME));
+        if (api == nullptr) {
+            throw py::error_already_set();
+        }
+        void *context = PyCapsule_GetPointer(
+            context_capsule.ptr(), SGLANG_TERMINAL_OWNER_PRODUCER_CONTEXT_CAPSULE_NAME);
+        if (context == nullptr) {
+            throw py::error_already_set();
+        }
+        producer_ = std::make_unique<nixlTerminalOwnerProducerH>(api, context);
+        Py_INCREF(apiCapsule_);
+        Py_INCREF(contextCapsule_);
+    }
+
+    nixlTerminalOwnerProducerBinding(const nixlTerminalOwnerProducerBinding &) = delete;
+    nixlTerminalOwnerProducerBinding &
+    operator=(const nixlTerminalOwnerProducerBinding &) = delete;
+
+    ~nixlTerminalOwnerProducerBinding() {
+        if (apiCapsule_ == nullptr || contextCapsule_ == nullptr) {
+            return;
+        }
+        const nixl_terminal_owner_producer_inventory_t inventory = producer_->inventory();
+        if (inventory.closed) {
+            Py_DECREF(apiCapsule_);
+            Py_DECREF(contextCapsule_);
+        } else {
+            // A backend callback may still dereference the owner context. Keeping
+            // both capsules for the process lifetime is safer than converting an
+            // explicit lifecycle failure into a use-after-free.
+            const std::lock_guard lock(abandonedTerminalOwnerCapsulesMutex);
+            abandonedTerminalOwnerCapsules.emplace_back(apiCapsule_, contextCapsule_);
+        }
+        apiCapsule_ = nullptr;
+        contextCapsule_ = nullptr;
+    }
+
+    [[nodiscard]] nixlTerminalOwnerProducerH *
+    native() const noexcept {
+        return producer_.get();
+    }
+
+    void
+    stopAdmission() noexcept {
+        producer_->stopAdmission();
+    }
+
+    [[nodiscard]] bool
+    join(double timeout_seconds) {
+        if (timeout_seconds <= 0.0) {
+            throw py::value_error("producer join timeout must be positive");
+        }
+        const auto timeout_ns = static_cast<std::uint64_t>(
+            timeout_seconds * static_cast<double>(1'000'000'000ULL));
+        nixl_status_t status;
+        {
+            py::gil_scoped_release release;
+            status = producer_->join(timeout_ns);
+        }
+        if (status == NIXL_IN_PROG) {
+            return false;
+        }
+        throw_nixl_exception(status);
+        return true;
+    }
+
+    void
+    close() {
+        if (apiCapsule_ == nullptr || contextCapsule_ == nullptr) {
+            return;
+        }
+        throw_nixl_exception(producer_->close());
+        Py_DECREF(apiCapsule_);
+        Py_DECREF(contextCapsule_);
+        apiCapsule_ = nullptr;
+        contextCapsule_ = nullptr;
+    }
+
+    [[nodiscard]] py::dict
+    inventory() const {
+        const nixl_terminal_owner_producer_inventory_t value = producer_->inventory();
+        py::dict result;
+        result["registering_count"] = value.registeringBindings;
+        result["submitted_count"] = value.submittedBindings;
+        result["active_callback_count"] = value.activeCallbacks;
+        result["active_registration_count"] = value.activeRegistrations;
+        result["total_subscriptions"] = value.totalSubscriptions;
+        result["total_delivered"] = value.totalDelivered;
+        result["successful_terminal_event_count"] = value.successfulTerminalEvents;
+        result["failure_terminal_event_count"] = value.failureTerminalEvents;
+        result["owner_submission_failure_count"] = value.ownerSubmissionFailures;
+        result["admission_open"] = value.admissionOpen;
+        result["retirement_requested"] = value.retirementRequested;
+        result["joined"] = value.joined;
+        result["closed"] = value.closed;
+        result["fatal_code"] = nixlTerminalOwnerProducerFatalName(value.fatal);
+        result["fatal_status"] = value.fatalStatus;
+        if (value.fatalHasBinding) {
+            result["fatal_binding"] = terminalOwnerBindingToPython(value.fatalBinding);
+        } else {
+            result["fatal_binding"] = py::none();
+        }
+        return result;
+    }
+
+private:
+    std::unique_ptr<nixlTerminalOwnerProducerH> producer_;
+    PyObject *apiCapsule_ = nullptr;
+    PyObject *contextCapsule_ = nullptr;
+};
+
+[[nodiscard]] py::dict
+terminalOwnerProducerAbi() {
+    py::dict offsets;
+    offsets["abi_version"] =
+        offsetof(sglang_terminal_owner_producer_event_v1, abi_version);
+    offsets["struct_size"] =
+        offsetof(sglang_terminal_owner_producer_event_v1, struct_size);
+    offsets["binding_digest"] =
+        offsetof(sglang_terminal_owner_producer_event_v1, binding_digest);
+    offsets["event_kind"] =
+        offsetof(sglang_terminal_owner_producer_event_v1, event_kind);
+    offsets["enqueued_ns"] =
+        offsetof(sglang_terminal_owner_producer_event_v1, enqueued_ns);
+    offsets["receipt_binding_digest"] =
+        offsetof(sglang_terminal_owner_producer_event_v1, receipt_binding_digest);
+    offsets["receipt_nonce"] =
+        offsetof(sglang_terminal_owner_producer_event_v1, receipt_nonce);
+    py::dict result;
+    result["abi_version"] = SGLANG_TERMINAL_OWNER_PRODUCER_ABI_VERSION;
+    result["api_struct_size"] = sizeof(sglang_terminal_owner_producer_api_v1);
+    result["event_struct_size"] = sizeof(sglang_terminal_owner_producer_event_v1);
+    result["required_flags"] = SGLANG_TERMINAL_OWNER_PRODUCER_REQUIRED_FLAGS;
+    result["event_offsets"] = std::move(offsets);
+    result["header_sha256"] =
+        "f8be2fe5e2f92a78f7cc51f133102f16ce9540fe0159b9d92c73ee855240b297";
+    return result;
+}
+
+} // namespace
 
 template<typename T>
 py::tuple
@@ -926,11 +1105,49 @@ PYBIND11_MODULE(_bindings, m) {
                std::unique_ptr<nixlTerminalEventSubscriptionH, py::nodelete>>(
         m, "nixlTerminalEventSubscriptionH");
 
+    py::class_<nixlTerminalOwnerProducerBinding>(m, "nixlTerminalOwnerProducerH")
+        .def("stopAdmission", &nixlTerminalOwnerProducerBinding::stopAdmission)
+        .def("join", &nixlTerminalOwnerProducerBinding::join, py::arg("timeout_seconds"))
+        .def("close", &nixlTerminalOwnerProducerBinding::close)
+        .def("inventory", &nixlTerminalOwnerProducerBinding::inventory);
+
+    m.def("terminalOwnerProducerAbi", &terminalOwnerProducerAbi);
+
     // note: pybind will automatically convert notif_map to python types:
     // so, a Dictionary of string: List<string>
 
     py::class_<nixlAgent>(m, "nixlAgent")
         .def(py::init<std::string, nixlAgentConfig>())
+        .def("createTerminalOwnerProducer",
+             [](nixlAgent &,
+                const py::capsule &producer_api,
+                const py::capsule &producer_context) {
+                 return std::make_unique<nixlTerminalOwnerProducerBinding>(
+                     producer_api, producer_context);
+             },
+             py::arg("producer_api"),
+             py::arg("producer_context"))
+        .def("subscribeXferTerminalOwner",
+             [](nixlAgent &agent,
+                nixlTerminalOwnerProducerBinding &producer,
+                uintptr_t request,
+                const py::bytes &binding_digest) {
+                 const nixl_terminal_owner_binding_digest_t binding =
+                     terminalOwnerBindingFromPython(binding_digest);
+                 nixlTerminalEventSubscriptionH *subscription = nullptr;
+                 nixl_status_t status;
+                 {
+                     py::gil_scoped_release release;
+                     status = agent.subscribeXferTerminalOwner(
+                         producer.native(),
+                         reinterpret_cast<nixlXferReqH *>(request),
+                         binding,
+                         subscription);
+                 }
+                 throw_nixl_exception(status);
+                 return subscription;
+             },
+             py::return_value_policy::reference_internal)
         .def("createTerminalEventChannel",
              [](nixlAgent &agent, size_t capacity) {
                  nixlTerminalEventChannelH *channel = nullptr;

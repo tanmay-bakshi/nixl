@@ -32,6 +32,9 @@ from ._api import (
     nixl_terminal_event_channel,
     nixl_terminal_event_kind_t,
     nixl_terminal_event_subscription,
+    nixl_terminal_owner_producer,
+    nixl_terminal_owner_producer_inventory,
+    nixl_terminal_owner_subscription,
     nixl_terminal_source_delivery,
     nixl_terminal_subscription_info,
     nixl_thread_sync_t,
@@ -39,6 +42,7 @@ from ._api import (
     nixl_xfer_attestation_transport,
     nixl_xfer_completion_receipt,
     nixl_xfer_handle,
+    terminal_owner_producer_abi,
 )
 
 __all__ = [
@@ -62,6 +66,9 @@ __all__ = [
     "nixl_terminal_event_channel",
     "nixl_terminal_event_kind_t",
     "nixl_terminal_event_subscription",
+    "nixl_terminal_owner_producer",
+    "nixl_terminal_owner_producer_inventory",
+    "nixl_terminal_owner_subscription",
     "nixl_terminal_source_delivery",
     "nixl_terminal_subscription_info",
     "nixl_thread_sync_t",
@@ -69,4 +76,5 @@ __all__ = [
     "nixl_xfer_attestation_transport",
     "nixl_xfer_completion_receipt",
     "nixl_xfer_handle",
+    "terminal_owner_producer_abi",
 ]

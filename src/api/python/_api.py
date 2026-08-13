@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import pickle
+from dataclasses import dataclass
 from enum import Enum
 from typing import Optional, Union
 
@@ -49,6 +50,8 @@ nixl_terminal_destination_phase_t = nixlBind.nixl_terminal_destination_phase_t
 _REMOTE_HANDLE_CONSTRUCTION_TOKEN = object()
 _TERMINAL_CHANNEL_CONSTRUCTION_TOKEN = object()
 _TERMINAL_SUBSCRIPTION_CONSTRUCTION_TOKEN = object()
+_TERMINAL_OWNER_PRODUCER_CONSTRUCTION_TOKEN = object()
+_TERMINAL_OWNER_SUBSCRIPTION_CONSTRUCTION_TOKEN = object()
 
 
 """
@@ -374,6 +377,271 @@ class nixl_terminal_event_channel:
             "nixl_terminal_event_channel("
             f"retained_subscriptions={len(self._subscriptions)})"
         )
+
+
+@dataclass(frozen=True, slots=True)
+class nixl_terminal_owner_producer_inventory:
+    """Complete direct NIXL-to-owner producer inventory.
+
+    :ivar registering_count: Exact bindings whose backend arm is returning.
+    :ivar submitted_count: Exact bindings awaiting terminal delivery.
+    :ivar active_callback_count: Qualified terminal callbacks still outstanding.
+    :ivar active_registration_count: Backend subscription calls still returning.
+    :ivar total_subscriptions: Successfully armed transfer generations.
+    :ivar total_delivered: Events admitted directly into the immutable owner.
+    :ivar successful_terminal_event_count: Admitted successful transfer events.
+    :ivar failure_terminal_event_count: Admitted local failure events.
+    :ivar owner_submission_failure_count: Native owner submission failures.
+    :ivar admission_open: Whether new exact bindings may be armed.
+    :ivar retirement_requested: Whether ordered producer retirement entered.
+    :ivar joined: Whether ordered retirement committed.
+    :ivar closed: Whether exact-zero closure completed.
+    :ivar fatal_code: Sticky first producer lifecycle failure.
+    :ivar fatal_status: Native errno or NIXL status for the first failure.
+    :ivar fatal_binding: Exact lifecycle binding associated with the failure.
+    """
+
+    registering_count: int
+    submitted_count: int
+    active_callback_count: int
+    active_registration_count: int
+    total_subscriptions: int
+    total_delivered: int
+    successful_terminal_event_count: int
+    failure_terminal_event_count: int
+    owner_submission_failure_count: int
+    admission_open: bool
+    retirement_requested: bool
+    joined: bool
+    closed: bool
+    fatal_code: str
+    fatal_status: int
+    fatal_binding: bytes | None
+
+    @classmethod
+    def from_native(
+        cls, value: dict[str, object]
+    ) -> "nixl_terminal_owner_producer_inventory":
+        """Parse one native producer inventory.
+
+        :param value: Native inventory mapping.
+        :returns: Validated typed inventory.
+        """
+
+        fatal_binding_value = value["fatal_binding"]
+        fatal_binding: bytes | None = None
+        if fatal_binding_value is not None:
+            if type(fatal_binding_value) is not bytes:
+                raise TypeError("fatal_binding must be bytes or None")
+            if len(fatal_binding_value) != 32:
+                raise ValueError("fatal_binding must contain 32 bytes")
+            fatal_binding = fatal_binding_value
+        return cls(
+            registering_count=int(value["registering_count"]),
+            submitted_count=int(value["submitted_count"]),
+            active_callback_count=int(value["active_callback_count"]),
+            active_registration_count=int(value["active_registration_count"]),
+            total_subscriptions=int(value["total_subscriptions"]),
+            total_delivered=int(value["total_delivered"]),
+            successful_terminal_event_count=int(
+                value["successful_terminal_event_count"]
+            ),
+            failure_terminal_event_count=int(value["failure_terminal_event_count"]),
+            owner_submission_failure_count=int(
+                value["owner_submission_failure_count"]
+            ),
+            admission_open=bool(value["admission_open"]),
+            retirement_requested=bool(value["retirement_requested"]),
+            joined=bool(value["joined"]),
+            closed=bool(value["closed"]),
+            fatal_code=str(value["fatal_code"]),
+            fatal_status=int(value["fatal_status"]),
+            fatal_binding=fatal_binding,
+        )
+
+    @property
+    def retained_count(self) -> int:
+        """Return every exact owner binding still retained.
+
+        :returns: Registering and submitted binding count.
+        """
+
+        return self.registering_count + self.submitted_count
+
+
+class nixl_terminal_owner_subscription:
+    """Retained direct-owner subscription for one exact transfer generation."""
+
+    __slots__ = ("_native_handle", "_producer", "_released")
+
+    _native_handle: nixlBind.nixlTerminalEventSubscriptionH
+    _producer: "nixl_terminal_owner_producer"
+    _released: bool
+
+    def __init__(
+        self,
+        producer: "nixl_terminal_owner_producer",
+        native_handle: nixlBind.nixlTerminalEventSubscriptionH,
+        construction_token: object,
+    ) -> None:
+        """Retain one agent-owned native subscription.
+
+        :param producer: Direct owner producer which armed the binding.
+        :param native_handle: Agent-owned native subscription handle.
+        :param construction_token: Module-private construction authority.
+        """
+
+        if construction_token is not _TERMINAL_OWNER_SUBSCRIPTION_CONSTRUCTION_TOKEN:
+            raise TypeError(
+                "terminal-owner subscriptions can only be created by nixl_agent"
+            )
+        self._producer = producer
+        self._native_handle = native_handle
+        self._released = False
+
+    def query(self) -> nixl_terminal_subscription_info:
+        """Return the exact transfer identity and active state.
+
+        :returns: Current immutable subscription snapshot.
+        """
+
+        if self._released:
+            raise RuntimeError("terminal-owner subscription has already been released")
+        return self._producer._owner.agent.queryTerminalEventSubscription(
+            self._native_handle
+        )
+
+    def release(self) -> nixlBind.nixl_status_t:
+        """Cancel or consume the exact terminal subscription.
+
+        :returns: ``NIXL_IN_PROG`` while cancellation is pending, otherwise
+            ``NIXL_SUCCESS`` after the public handle is consumed.
+        """
+
+        if self._released:
+            raise RuntimeError("terminal-owner subscription has already been released")
+        status = self._producer._owner.agent.releaseTerminalEventSubscription(
+            self._native_handle
+        )
+        if status == nixlBind.NIXL_SUCCESS:
+            self._released = True
+            self._producer._forget(self)
+        return status
+
+
+class nixl_terminal_owner_producer:
+    """Process-lifetime direct NIXL callback producer for one immutable owner."""
+
+    __slots__ = ("_native_handle", "_owner", "_subscriptions")
+
+    _native_handle: nixlBind.nixlTerminalOwnerProducerH
+    _owner: "nixl_agent"
+    _subscriptions: dict[int, nixl_terminal_owner_subscription]
+
+    def __init__(
+        self,
+        owner: "nixl_agent",
+        native_handle: nixlBind.nixlTerminalOwnerProducerH,
+        construction_token: object,
+    ) -> None:
+        """Bind one native producer to a NIXL agent.
+
+        :param owner: NIXL agent whose exact transfer generations are armed.
+        :param native_handle: Capsule-bound native producer.
+        :param construction_token: Module-private construction authority.
+        """
+
+        if construction_token is not _TERMINAL_OWNER_PRODUCER_CONSTRUCTION_TOKEN:
+            raise TypeError("terminal-owner producers can only be created by nixl_agent")
+        self._owner = owner
+        self._native_handle = native_handle
+        self._subscriptions = {}
+
+    def _retain(
+        self, native_handle: nixlBind.nixlTerminalEventSubscriptionH
+    ) -> nixl_terminal_owner_subscription:
+        """Retain one newly armed exact-generation subscription.
+
+        :param native_handle: Agent-owned native subscription.
+        :returns: Canonical Python lifetime wrapper.
+        """
+
+        subscription = nixl_terminal_owner_subscription(
+            self,
+            native_handle,
+            _TERMINAL_OWNER_SUBSCRIPTION_CONSTRUCTION_TOKEN,
+        )
+        identity = id(native_handle)
+        if identity in self._subscriptions:
+            raise RuntimeError("native terminal-owner subscription identity collision")
+        self._subscriptions[identity] = subscription
+        return subscription
+
+    def _forget(self, subscription: nixl_terminal_owner_subscription) -> None:
+        """Forget one publicly consumed subscription.
+
+        :param subscription: Consumed canonical wrapper.
+        """
+
+        identity = id(subscription._native_handle)
+        if self._subscriptions.get(identity) is not subscription:
+            raise RuntimeError("terminal-owner subscription retention mismatch")
+        del self._subscriptions[identity]
+
+    def stop_admission(self) -> None:
+        """Permanently stop new transfer-generation bindings."""
+
+        self._native_handle.stopAdmission()
+
+    def join(self, timeout_seconds: float) -> bool:
+        """Join callbacks and ordered producer retirement.
+
+        :param timeout_seconds: Positive native wait bound.
+        :returns: Whether ordered retirement committed within the bound.
+        """
+
+        if type(timeout_seconds) is not float or timeout_seconds <= 0.0:
+            raise ValueError("timeout_seconds must be a positive float")
+        return bool(self._native_handle.join(timeout_seconds))
+
+    def close(self) -> None:
+        """Close after exact-zero subscriptions and ordered retirement."""
+
+        if len(self._subscriptions) != 0:
+            raise RuntimeError("terminal-owner producer retains public subscriptions")
+        self._native_handle.close()
+
+    def inventory(self) -> nixl_terminal_owner_producer_inventory:
+        """Return complete binding, callback, and retirement inventory.
+
+        :returns: Typed producer inventory.
+        """
+
+        return nixl_terminal_owner_producer_inventory.from_native(
+            self._native_handle.inventory()
+        )
+
+
+def terminal_owner_producer_abi() -> dict[str, object]:
+    """Return the independently compiled owner-producer ABI layout.
+
+    :returns: ABI version, flags, structure sizes, offsets, and header digest.
+    """
+
+    value = nixlBind.terminalOwnerProducerAbi()
+    if type(value) is not dict:
+        raise TypeError("terminal-owner producer ABI must be a dictionary")
+    offsets = value["event_offsets"]
+    if type(offsets) is not dict:
+        raise TypeError("terminal-owner producer ABI offsets must be a dictionary")
+    return {
+        "abi_version": int(value["abi_version"]),
+        "api_struct_size": int(value["api_struct_size"]),
+        "event_struct_size": int(value["event_struct_size"]),
+        "required_flags": int(value["required_flags"]),
+        "event_offsets": {str(key): int(item) for key, item in offsets.items()},
+        "header_sha256": str(value["header_sha256"]),
+    }
 
 
 # Opaque handle for backend can be just int, as it's not passed to the user
@@ -1111,6 +1379,55 @@ class nixl_agent:
             raise ValueError("transfer handle belongs to a different NIXL agent")
         if handle._released:
             raise ValueError("transfer handle has already been released")
+
+    def create_terminal_owner_producer(
+        self,
+        producer_api: object,
+        producer_context: object,
+    ) -> nixl_terminal_owner_producer:
+        """Bind the immutable owner's native producer ABI to this NIXL agent.
+
+        :param producer_api: Named capsule containing the versioned producer API.
+        :param producer_context: Named capsule containing one registered producer.
+        :returns: Process-lifetime direct terminal producer.
+        """
+
+        native_handle = self.agent.createTerminalOwnerProducer(
+            producer_api, producer_context
+        )
+        return nixl_terminal_owner_producer(
+            self,
+            native_handle,
+            _TERMINAL_OWNER_PRODUCER_CONSTRUCTION_TOKEN,
+        )
+
+    def subscribe_xfer_terminal_owner(
+        self,
+        producer: nixl_terminal_owner_producer,
+        handle: nixl_xfer_handle,
+        binding_digest: bytes,
+    ) -> nixl_terminal_owner_subscription:
+        """Arm direct owner delivery for one exact next transfer generation.
+
+        :param producer: Capsule-bound direct owner producer for this agent.
+        :param handle: Transfer request owned by this agent.
+        :param binding_digest: Exact 32-byte immutable lifecycle binding.
+        :returns: Retained exact-generation subscription.
+        """
+
+        if type(producer) is not nixl_terminal_owner_producer:
+            raise TypeError("producer must be a nixl_terminal_owner_producer")
+        if producer._owner is not self:
+            raise ValueError("terminal-owner producer belongs to a different NIXL agent")
+        self._validate_xfer_attestation_handle(handle)
+        if type(binding_digest) is not bytes or len(binding_digest) != 32:
+            raise ValueError("binding_digest must contain 32 bytes")
+        native_handle = self.agent.subscribeXferTerminalOwner(
+            producer._native_handle,
+            handle._handle,
+            binding_digest,
+        )
+        return producer._retain(native_handle)
 
     def create_terminal_event_channel(
         self, capacity: int

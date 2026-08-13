@@ -36,6 +36,7 @@
 #include "common/uuid_v4.h"
 #include "telemetry.h"
 #include "telemetry_event.h"
+#include "terminal_owner_producer.h"
 
 namespace {
 
@@ -1885,6 +1886,106 @@ nixlAgent::subscribeXferTerminal(
         .ownerCookie = owner_cookie,
         .identity = binding.handleIdentity,
         .generation = binding.generation,
+        .active = true,
+    };
+    auto handle = std::shared_ptr<nixlTerminalEventSubscriptionH>(
+        new nixlTerminalEventSubscriptionH(
+            data->identity_,
+            subscription_identity,
+            info,
+            req_hndl->engine,
+            req_hndl,
+            std::move(backend_subscription),
+            adapter));
+    subscription = handle.get();
+    data->ownedTerminalSubscriptions_.emplace(subscription, subscription_identity);
+    data->terminalSubscriptions_.emplace(subscription_identity, handle);
+    adapter->bindTerminalCallback([weak_handle = std::weak_ptr(handle)]() noexcept {
+        if (const std::shared_ptr<nixlTerminalEventSubscriptionH> retained =
+                weak_handle.lock();
+            retained != nullptr) {
+            retained->markTerminal();
+        }
+    });
+    return NIXL_SUCCESS;
+}
+
+nixl_status_t
+nixlAgent::subscribeXferTerminalOwner(
+    nixlTerminalOwnerProducerH *producer,
+    nixlXferReqH *req_hndl,
+    const std::array<std::uint8_t, 32> &binding_digest,
+    nixlTerminalEventSubscriptionH *&subscription) {
+    subscription = nullptr;
+    if (producer == nullptr || req_hndl == nullptr) {
+        return NIXL_ERR_INVALID_PARAM;
+    }
+
+    NIXL_LOCK_GUARD(data->lock);
+    if (data->ownedXferHandles_.count(req_hndl) == 0 ||
+        producer->bindAgent(data->identity_) != NIXL_SUCCESS) {
+        return NIXL_ERR_INVALID_PARAM;
+    }
+    const nixl_status_t handle_status = validateXferRemoteHandleLocked(req_hndl);
+    if (handle_status != NIXL_SUCCESS) {
+        return handle_status;
+    }
+
+    nixl_xfer_attestation_t attestation;
+    nixl_status_t status =
+        req_hndl->engine->queryXferAttestation(req_hndl->backendHandle, attestation);
+    if (status != NIXL_SUCCESS) {
+        return status;
+    }
+    if (attestation.handleIdentity == 0 ||
+        attestation.generation == std::numeric_limits<std::uint64_t>::max()) {
+        return NIXL_ERR_NOT_ALLOWED;
+    }
+    status = validateXferAttestationLocked(req_hndl, attestation);
+    if (status != NIXL_SUCCESS) {
+        return status;
+    }
+
+    const nixlBackendTransferEventBinding transfer_binding{
+        .handleIdentity = attestation.handleIdentity,
+        .generation = attestation.generation + 1,
+    };
+    for (const auto &[identity, candidate] : data->terminalSubscriptions_) {
+        static_cast<void>(identity);
+        const nixl_terminal_subscription_info_t candidate_info = candidate->snapshot();
+        if (candidate_info.active &&
+            candidate_info.kind == nixl_terminal_event_kind_t::TRANSFER &&
+            candidate->backend_ == req_hndl->engine &&
+            candidate_info.identity == transfer_binding.handleIdentity &&
+            candidate_info.generation == transfer_binding.generation) {
+            return NIXL_ERR_NOT_ALLOWED;
+        }
+    }
+
+    status = producer->beginSubscription(binding_digest);
+    if (status != NIXL_SUCCESS) {
+        return status;
+    }
+    const auto adapter = std::make_shared<nixlTerminalOwnerTransferAdapter>(
+        transfer_binding, binding_digest, producer->state_);
+    std::unique_ptr<nixlBackendEventSubscription> backend_subscription;
+    status = req_hndl->engine->subscribeXferTerminal(
+        req_hndl->backendHandle, transfer_binding, adapter, backend_subscription);
+    if (status != NIXL_SUCCESS || backend_subscription == nullptr) {
+        const nixl_status_t terminal_status =
+            status == NIXL_SUCCESS ? NIXL_ERR_BACKEND : status;
+        adapter->abortRegistration(terminal_status);
+        return terminal_status;
+    }
+    producer->subscriptionRegistrationSucceeded(binding_digest);
+
+    const std::uint64_t subscription_identity =
+        allocateIdentity(next_terminal_subscription_identity);
+    nixl_terminal_subscription_info_t info{
+        .kind = nixl_terminal_event_kind_t::TRANSFER,
+        .ownerCookie = 0,
+        .identity = transfer_binding.handleIdentity,
+        .generation = transfer_binding.generation,
         .active = true,
     };
     auto handle = std::shared_ptr<nixlTerminalEventSubscriptionH>(

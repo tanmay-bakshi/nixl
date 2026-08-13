@@ -239,7 +239,7 @@ nixlTerminalEventSubscriptionH::nixlTerminalEventSubscriptionH(
     nixlBackendEngine *backend,
     const nixlXferReqH *request,
     std::unique_ptr<nixlBackendEventSubscription> backend_subscription,
-    std::shared_ptr<nixlTerminalTransferAdapter> transfer_adapter)
+    std::shared_ptr<nixlTerminalTransferAdapterBase> transfer_adapter)
     : ownerIdentity_(owner_identity),
       subscriptionIdentity_(subscription_identity),
       info_(info),
