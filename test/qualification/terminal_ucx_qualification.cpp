@@ -4,6 +4,7 @@
  */
 #include "terminal_ucx_api_adapter.h"
 #include "terminal_ucx_peer_fixture.h"
+#include "terminal_owner_producer.h"
 
 #include <poll.h>
 #include <time.h>
@@ -13,16 +14,20 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -46,6 +51,87 @@ constexpr std::string_view self_na_reason =
 class qualification_error final : public std::runtime_error {
 public:
     using std::runtime_error::runtime_error;
+};
+
+void
+require(bool condition, std::string_view message);
+
+class direct_owner_capture_t final {
+public:
+    direct_owner_capture_t() {
+        api_ = {
+            .abi_version = SGLANG_TERMINAL_OWNER_PRODUCER_ABI_VERSION,
+            .struct_size = sizeof(sglang_terminal_owner_producer_api_v1),
+            .event_struct_size = sizeof(sglang_terminal_owner_producer_event_v1),
+            .flags = SGLANG_TERMINAL_OWNER_PRODUCER_REQUIRED_FLAGS,
+            .submit = submit,
+            .retire = retire,
+            .join = join,
+        };
+    }
+
+    [[nodiscard]] const sglang_terminal_owner_producer_api_v1 *
+    api() const noexcept {
+        return &api_;
+    }
+
+    [[nodiscard]] sglang_terminal_owner_producer_event_v1
+    wait() {
+        std::unique_lock lock(mutex_);
+        const bool ready = condition_.wait_for(lock,
+                                               std::chrono::milliseconds(event_timeout_ms),
+                                               [this]() { return events_.size() == 1; });
+        require(ready, "direct owner did not receive one terminal event");
+        return events_.front();
+    }
+
+private:
+    static int
+    submit(void *context, const sglang_terminal_owner_producer_event_v1 *event) noexcept {
+        if (context == nullptr || event == nullptr) {
+            return EINVAL;
+        }
+        auto &owner = *static_cast<direct_owner_capture_t *>(context);
+        {
+            const std::lock_guard lock(owner.mutex_);
+            if (!owner.events_.empty()) {
+                return EALREADY;
+            }
+            owner.events_.push_back(*event);
+        }
+        owner.condition_.notify_all();
+        return 0;
+    }
+
+    static int
+    retire(void *context) noexcept {
+        if (context == nullptr) {
+            return EINVAL;
+        }
+        auto &owner = *static_cast<direct_owner_capture_t *>(context);
+        const std::lock_guard lock(owner.mutex_);
+        if (owner.retired_) {
+            return EALREADY;
+        }
+        owner.retired_ = true;
+        return 0;
+    }
+
+    static int
+    join(void *context, std::uint64_t timeout_ns) noexcept {
+        if (context == nullptr || timeout_ns == 0) {
+            return EINVAL;
+        }
+        auto &owner = *static_cast<direct_owner_capture_t *>(context);
+        const std::lock_guard lock(owner.mutex_);
+        return owner.retired_ ? 0 : EPROTO;
+    }
+
+    sglang_terminal_owner_producer_api_v1 api_{};
+    std::mutex mutex_;
+    std::condition_variable condition_;
+    std::vector<sglang_terminal_owner_producer_event_v1> events_;
+    bool retired_ = false;
 };
 
 struct options_t {
@@ -554,6 +640,105 @@ runPopulation(nixlAgent &source_agent,
             "destination bytes differ from source");
     requireStatus(adapter.release(subscription), NIXL_SUCCESS, "release transfer subscription");
     requireStatus(source_agent.releaseXferReq(request), NIXL_SUCCESS, "release transfer request");
+    return result;
+}
+
+[[nodiscard]] population_result_t
+runDirectOwnerPopulation(nixlAgent &source_agent,
+                         nixlBackendH *source_backend,
+                         const std::string &remote_name,
+                         const nixlRemoteAgentH *remote_handle,
+                         registered_arena_t &source,
+                         registered_arena_t &destination,
+                         const population_spec_t &spec,
+                         std::string_view notification) {
+    source.fill(spec);
+    destination.clear(spec);
+    nixlXferReqH *request = createRequest(source_agent,
+                                          source_backend,
+                                          source,
+                                          destination,
+                                          spec,
+                                          remote_name,
+                                          remote_handle,
+                                          notification);
+    direct_owner_capture_t owner;
+    nixlTerminalOwnerProducerH producer(owner.api(), &owner);
+    nixl_terminal_owner_binding_digest_t owner_binding{};
+    for (std::size_t index = 0; index < owner_binding.size(); ++index) {
+        owner_binding[index] = static_cast<std::uint8_t>(spec.seed + index + 1);
+    }
+    nixlTerminalEventSubscriptionH *subscription = nullptr;
+    requireStatus(
+        source_agent.subscribeXferTerminalOwner(&producer, request, owner_binding, subscription),
+        NIXL_SUCCESS,
+        "subscribe direct owner transfer");
+    require(subscription != nullptr, "direct owner transfer subscription is null");
+    nixl_terminal_subscription_info_t subscription_info;
+    requireStatus(source_agent.queryTerminalEventSubscription(subscription, subscription_info),
+                  NIXL_SUCCESS,
+                  "query direct owner subscription before post");
+    require(subscription_info.active, "direct owner subscription was not active before post");
+
+    const nixl_status_t post_status = source_agent.postXferReq(request);
+    require(post_status == NIXL_SUCCESS || post_status == NIXL_IN_PROG,
+            "post direct owner transfer failed");
+    const sglang_terminal_owner_producer_event_v1 event = owner.wait();
+    const std::uint64_t observed_timestamp = monotonicRawNs();
+    require(event.abi_version == SGLANG_TERMINAL_OWNER_PRODUCER_ABI_VERSION &&
+                event.struct_size == sizeof(event) && event.event_kind == 13 &&
+                event.enqueued_ns > 0 && event.backend_status == NIXL_SUCCESS &&
+                event.reason_code == 0 && event.has_receipt == 0,
+            "direct owner received an invalid successful terminal event");
+    require(std::memcmp(event.binding_digest, owner_binding.data(), owner_binding.size()) == 0,
+            "direct owner terminal event changed the lifecycle binding");
+    requireStatus(source_agent.queryTerminalEventSubscription(subscription, subscription_info),
+                  NIXL_SUCCESS,
+                  "query direct owner subscription after terminal delivery");
+    require(!subscription_info.active, "direct owner subscription remained active");
+
+    population_result_t result;
+    result.spec = spec;
+    result.byteCount = spec.descriptorCount * spec.bytesPerDescriptor;
+    result.destinationByteCount = result.byteCount;
+    result.sourceSha256 = source.sha256(spec);
+    result.destinationSha256 = destination.sha256(spec);
+    result.terminalStatus = static_cast<nixl_status_t>(event.backend_status);
+    result.eventNativeTimestampNs = event.enqueued_ns;
+    result.drainTimestampNs = observed_timestamp;
+    result.terminalEventCount = 1;
+    result.subscriptionBeforePost = true;
+    result.attestationStatus =
+        source_agent.takeXferCompletionAttestation(request, result.attestation);
+    nixl_xfer_attestation_t duplicate;
+    result.secondTakeStatus = source_agent.takeXferCompletionAttestation(request, duplicate);
+
+    requireStatus(result.attestationStatus, NIXL_SUCCESS, "take direct owner attestation");
+    requireStatus(
+        result.secondTakeStatus, NIXL_ERR_NOT_ALLOWED, "take direct owner completion twice");
+    require(result.sourceSha256 == result.destinationSha256,
+            "direct owner destination bytes differ from source");
+    requireStatus(source_agent.releaseTerminalEventSubscription(subscription),
+                  NIXL_SUCCESS,
+                  "release direct owner subscription");
+    requireStatus(source_agent.releaseXferReq(request),
+                  NIXL_SUCCESS,
+                  "release direct owner transfer request");
+
+    nixl_terminal_owner_producer_inventory_t inventory = producer.inventory();
+    require(inventory.activeCallbacks == 0 && inventory.activeRegistrations == 0 &&
+                inventory.registeringBindings == 0 && inventory.submittedBindings == 0 &&
+                inventory.totalSubscriptions == 1 && inventory.totalDelivered == 1 &&
+                inventory.successfulTerminalEvents == 1 && inventory.failureTerminalEvents == 0 &&
+                inventory.fatal == nixl_terminal_owner_producer_fatal_t::NONE,
+            "direct owner producer retained callback authority after terminal delivery");
+    producer.stopAdmission();
+    requireStatus(
+        producer.join(30'000'000'000ULL), NIXL_SUCCESS, "join direct owner producer retirement");
+    requireStatus(producer.close(), NIXL_SUCCESS, "close direct owner producer");
+    inventory = producer.inventory();
+    require(inventory.joined && inventory.closed && inventory.retirementRequested,
+            "direct owner producer did not commit ordered retirement");
     return result;
 }
 
@@ -1282,6 +1467,7 @@ writeCoordinate(const options_t &options,
                 const registration_result_t &source_registration,
                 const registration_result_t &destination_registration,
                 const std::vector<population_result_t> &populations,
+                const population_result_t &direct_owner_population,
                 const capability_result_t &capability,
                 std::size_t notification_success_count,
                 const terminal_fault_result_t &cancellation,
@@ -1314,7 +1500,9 @@ writeCoordinate(const options_t &options,
         }
         writePopulation(output, populations[index]);
     }
-    output << "],\"remote_route_capability\":";
+    output << "],\"direct_owner_delivery\":";
+    writePopulation(output, direct_owner_population);
+    output << ",\"remote_route_capability\":";
     writeCapability(output, self_transport, capability);
     output << ",\"attached_authenticated_notification\":";
     if (self_transport) {
@@ -1461,6 +1649,29 @@ run(int argc, char **argv) {
         populations.insert(populations.end(), repost.begin(), repost.end());
     }
 
+    const population_spec_t direct_owner_spec{
+        .name = "direct_owner",
+        .descriptorCount = large_descriptor_count,
+        .bytesPerDescriptor = descriptor_bytes,
+        .seed = 157,
+    };
+    const std::string direct_owner_notification =
+        options.transport == "tcp" ? "terminal-qualification:direct-owner" : std::string{};
+    const population_result_t direct_owner_population =
+        runDirectOwnerPopulation(*source.agent,
+                                 source.backend,
+                                 source_name,
+                                 destination_handle,
+                                 source_arena,
+                                 destination_arena,
+                                 direct_owner_spec,
+                                 direct_owner_notification);
+    if (options.transport == "tcp") {
+        require(takeAttachedNotification(
+                    destination_agent, source_handle, direct_owner_notification) == 1,
+                "direct owner attached notification was not admitted exactly once");
+    }
+
     if (options.transport == "tcp") {
         requireStatus(source.agent->invalidateRemoteMD(destination_handle),
                       NIXL_SUCCESS,
@@ -1550,6 +1761,7 @@ run(int argc, char **argv) {
                     source_arena.registration(),
                     destination_arena.registration(),
                     populations,
+                    direct_owner_population,
                     capability,
                     notification_success_count,
                     cancellation,
