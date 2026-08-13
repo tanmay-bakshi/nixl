@@ -48,7 +48,7 @@ def _inventory(capacity: int = 64) -> dict[str, object]:
         "queued_owner_continuations": 0,
         "accepting_subscriptions": False,
         "closed": True,
-        "fatal": "NONE",
+        "fatal": "none",
         "eventfd_error": 0,
     }
 

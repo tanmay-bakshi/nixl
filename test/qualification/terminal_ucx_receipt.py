@@ -595,7 +595,7 @@ def _validate_direct_owner_inventory(
         and inventory.get("failure_terminal_events") == failure_events,
         "direct-owner terminal outcome counts changed",
     )
-    _require(inventory.get("fatal") == "NONE", "direct-owner producer became fatal")
+    _require(inventory.get("fatal") == "none", "direct-owner producer became fatal")
     _require(
         inventory.get("admission_open") is (not after_close),
         "direct-owner admission lifecycle changed",
