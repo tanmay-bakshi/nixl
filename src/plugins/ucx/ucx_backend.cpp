@@ -4076,6 +4076,33 @@ nixlUcxEngine::scheduleAdmissionReceipt(const nixl::ucx::notif_ingress_key_t &ke
 }
 
 nixl_status_t
+nixlUcxEngine::scheduleOfferControlReply(
+    const nixl::ucx::notif_wire_envelope_t &acknowledgement,
+    const std::optional<nixl::ucx::notif_wire_envelope_t> &local_offer,
+    size_t worker_id,
+    uint64_t connection_identity) const {
+    if (worker_id >= getWorkers().size()) {
+        return NIXL_ERR_INVALID_PARAM;
+    }
+    return getWorker(worker_id)->getContinuationQueue()->enqueueProducer(
+        [this, acknowledgement, local_offer, worker_id, connection_identity]() noexcept {
+            const nixl_status_t acknowledgement_status =
+                sendControlFrame(acknowledgement, connection_identity, worker_id);
+            if (acknowledgement_status != NIXL_SUCCESS) {
+                NIXL_WARN << "Failed to send UCX notification ACK: " << acknowledgement_status;
+            }
+            if (local_offer.has_value()) {
+                const nixl_status_t offer_status =
+                    sendControlFrame(*local_offer, connection_identity, worker_id);
+                if (offer_status != NIXL_SUCCESS) {
+                    NIXL_WARN << "Failed to re-emit UCX notification OFFER: " << offer_status;
+                }
+            }
+            return NIXL_SUCCESS;
+        });
+}
+
+nixl_status_t
 nixlUcxEngine::installAdmissionReceiptBarrier(
     nixlBackendAdmissionReceiptBarrier *barrier) noexcept {
     nixlBackendAdmissionReceiptBarrier *expected = nullptr;
@@ -4163,17 +4190,18 @@ nixlUcxEngine::notifAmCb(void *arg,
                 NIXL_ERROR << "Rejected UCX notification OFFER for an unknown exact route";
                 return UCS_OK;
             }
-            const nixl_status_t ack_status = engine->sendControlFrame(
-                acceptance.acknowledgement, route->connectionIdentity, context->workerId);
-            if (ack_status != NIXL_SUCCESS) {
-                NIXL_WARN << "Failed to send UCX notification ACK: " << ack_status;
-            }
-            if (acceptance.reemitLocalOffer) {
-                const nixl_status_t offer_status = engine->sendControlFrame(
-                    acceptance.localOffer, route->connectionIdentity, context->workerId);
-                if (offer_status != NIXL_SUCCESS) {
-                    NIXL_WARN << "Failed to re-emit UCX notification OFFER: " << offer_status;
-                }
+            const std::optional<nixl::ucx::notif_wire_envelope_t> local_offer =
+                acceptance.reemitLocalOffer ?
+                std::optional<nixl::ucx::notif_wire_envelope_t>(acceptance.localOffer) :
+                std::nullopt;
+            const nixl_status_t schedule_status =
+                engine->scheduleOfferControlReply(acceptance.acknowledgement,
+                                                  local_offer,
+                                                  context->workerId,
+                                                  route->connectionIdentity);
+            if (schedule_status != NIXL_SUCCESS) {
+                NIXL_FATAL << "UCX could not schedule its notification OFFER reply: "
+                           << schedule_status;
             }
             return UCS_OK;
         }

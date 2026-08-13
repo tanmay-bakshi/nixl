@@ -363,6 +363,11 @@ protected:
                              const nixl::ucx::notif_wire_envelope_t &receipt,
                              size_t worker_id,
                              uint64_t connection_identity) const;
+    [[nodiscard]] nixl_status_t
+    scheduleOfferControlReply(const nixl::ucx::notif_wire_envelope_t &acknowledgement,
+                              const std::optional<nixl::ucx::notif_wire_envelope_t> &local_offer,
+                              size_t worker_id,
+                              uint64_t connection_identity) const;
     void
     drainTerminalDeadlines() noexcept;
     void
