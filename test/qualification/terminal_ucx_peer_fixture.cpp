@@ -4,6 +4,8 @@
  */
 #include "terminal_ucx_peer_fixture.h"
 
+#include "terminal_owner_capture.h"
+#include "terminal_owner_producer.h"
 #include "terminal_ucx_api_adapter.h"
 
 #include "backend/backend_aux.h"
@@ -1251,6 +1253,190 @@ runTcpEndpointFailureFixture(const std::string &engine) {
         .dataBoundaryRemoteFlushed = data_boundary_remote_flushed,
         .peerExitedBySignal = peer_exited_by_signal,
     };
+}
+
+tcp_direct_owner_failure_observation_t
+runTcpDirectOwnerEndpointFailureFixture(const std::string &engine) {
+    peer_process_t peer(engine);
+    source_fixture_t source(engine, endpoint_failure_capacity);
+    nixlRemoteAgentH *remote = loadPeer(source, peer);
+    terminal_ucx_api_adapter_t capability_adapter(source.agent, 8);
+    terminal_inbox_t capability_inbox(capability_adapter);
+    nixlTerminalEventSubscriptionH *capability_subscription = nullptr;
+    const tcp_peer_capability_observation_t capability = makeCapabilityReady(
+        source, peer, capability_adapter, capability_inbox, remote, capability_subscription);
+
+    nixlXferReqH *boundary_request = createTransfer(source,
+                                                    peer.hello(),
+                                                    remote,
+                                                    endpoint_boundary_bytes,
+                                                    false,
+                                                    1,
+                                                    0,
+                                                    {},
+                                                    endpoint_boundary_offset);
+    nixlTerminalEventSubscriptionH *boundary_subscription = nullptr;
+    requireStatus(capability_adapter.subscribeTransfer(
+                      boundary_request, endpoint_boundary_cookie, boundary_subscription),
+                  NIXL_SUCCESS,
+                  "subscribe direct-owner remote-flush boundary");
+    require(boundary_subscription != nullptr,
+            "direct-owner remote-flush boundary subscription is null");
+    const nixl_status_t boundary_post_status = source.agent.postXferReq(boundary_request);
+    require(boundary_post_status == NIXL_SUCCESS || boundary_post_status == NIXL_IN_PROG,
+            "direct-owner remote-flush boundary failed during post");
+    const observed_event_t boundary =
+        capability_inbox.take(nixl_terminal_event_kind_t::TRANSFER, endpoint_boundary_cookie);
+    requireStatus(
+        boundary.event.transferStatus, NIXL_SUCCESS, "direct-owner remote-flush boundary status");
+    nixl_xfer_attestation_t boundary_attestation;
+    requireStatus(source.agent.queryXferAttestation(boundary_request, boundary_attestation),
+                  NIXL_SUCCESS,
+                  "query direct-owner remote-flush boundary attestation");
+    require(attestationIsRemoteFlushed(boundary_attestation),
+            "direct-owner failure lacked an established remote-flush boundary");
+    requireStatus(capability_adapter.release(boundary_subscription),
+                  NIXL_SUCCESS,
+                  "release direct-owner remote-flush boundary subscription");
+    requireStatus(source.agent.releaseXferReq(boundary_request),
+                  NIXL_SUCCESS,
+                  "release direct-owner remote-flush boundary request");
+
+    const std::optional<std::size_t> victim_worker =
+        engine == "shared" ? std::optional<std::size_t>(1) : std::nullopt;
+    nixlXferReqH *request = createTransfer(
+        source, peer.hello(), remote, endpoint_failure_bytes, false, 2, victim_worker);
+    nixl_xfer_attestation_t prepared_attestation;
+    requireStatus(source.agent.queryXferAttestation(request, prepared_attestation),
+                  NIXL_SUCCESS,
+                  "query prepared direct-owner endpoint failure");
+
+    terminal_owner_capture_t owner;
+    nixlTerminalOwnerProducerH producer(owner.api(), &owner);
+    nixl_terminal_owner_binding_digest_t binding{};
+    for (std::size_t index = 0; index < binding.size(); ++index) {
+        binding[index] = static_cast<std::uint8_t>(0x40U + index);
+    }
+    nixlTerminalEventSubscriptionH *transfer_subscription = nullptr;
+    requireStatus(
+        source.agent.subscribeXferTerminalOwner(&producer, request, binding, transfer_subscription),
+        NIXL_SUCCESS,
+        "subscribe direct-owner endpoint failure");
+    require(transfer_subscription != nullptr, "direct-owner endpoint-failure subscription is null");
+    nixl_terminal_subscription_info_t transfer_info;
+    requireStatus(source.agent.queryTerminalEventSubscription(transfer_subscription, transfer_info),
+                  NIXL_SUCCESS,
+                  "query direct-owner endpoint-failure subscription");
+    require(transfer_info.active && transfer_info.identity == prepared_attestation.handleIdentity &&
+                transfer_info.generation == prepared_attestation.generation + 1,
+            "direct-owner endpoint-failure subscription changed transfer generation");
+
+    peer.stopAndWait();
+    const nixl_status_t post_status = source.agent.postXferReq(request);
+    require(post_status == NIXL_IN_PROG,
+            "direct-owner endpoint-failure transfer completed before peer death");
+    nixl_xfer_attestation_t live_attestation;
+    requireStatus(source.agent.queryXferAttestation(request, live_attestation),
+                  NIXL_SUCCESS,
+                  "query live direct-owner endpoint failure");
+    require(live_attestation.state == nixl_xfer_attestation_state_t::IN_PROGRESS,
+            "direct-owner endpoint failure became terminal before peer death");
+
+    const bool peer_exited_by_signal = peer.killAndWait();
+    require(peer_exited_by_signal, "direct-owner endpoint peer did not exit by SIGKILL");
+    const sglang_terminal_owner_producer_event_v1 event =
+        owner.wait(std::chrono::milliseconds(event_timeout_ms));
+    require(event.abi_version == SGLANG_TERMINAL_OWNER_PRODUCER_ABI_VERSION &&
+                event.struct_size == sizeof(event) && event.event_kind == 21 &&
+                event.reason_code == NIXL_TERMINAL_OWNER_REASON_TRANSFER_FAILED &&
+                event.backend_status == NIXL_ERR_REMOTE_DISCONNECT && event.enqueued_ns > 0 &&
+                event.has_receipt == 0,
+            "direct owner did not distinguish terminal transport failure");
+    require(std::memcmp(event.binding_digest, binding.data(), binding.size()) == 0,
+            "direct-owner failure changed the lifecycle binding");
+
+    const observed_event_t failed_capability =
+        capability_inbox.take(nixl_terminal_event_kind_t::CAPABILITY, capability_cookie);
+    require(failed_capability.event.identity == capability.handleIdentity &&
+                failed_capability.event.generation == capability.handleGeneration &&
+                failed_capability.event.capabilityState == nixl_terminal_capability_state_t::FAILED,
+            "direct-owner endpoint failure changed capability route semantics");
+    nixl_xfer_attestation_t failed_attestation;
+    requireStatus(source.agent.queryXferAttestation(request, failed_attestation),
+                  NIXL_SUCCESS,
+                  "query failed direct-owner transfer");
+    require(failed_attestation.state == nixl_xfer_attestation_state_t::FAILED &&
+                failed_attestation.status == NIXL_ERR_REMOTE_DISCONNECT,
+            "direct owner received failure before the transfer attestation sealed");
+    requireStatus(source.agent.queryTerminalEventSubscription(transfer_subscription, transfer_info),
+                  NIXL_SUCCESS,
+                  "query terminal direct-owner endpoint-failure subscription");
+    const bool subscription_terminal = !transfer_info.active;
+    require(subscription_terminal, "direct-owner endpoint-failure subscription remained active");
+
+    const nixl_status_t transfer_release_status =
+        source.agent.releaseTerminalEventSubscription(transfer_subscription);
+    requireStatus(transfer_release_status,
+                  NIXL_SUCCESS,
+                  "release direct-owner endpoint-failure subscription");
+    requireStatus(source.agent.releaseXferReq(request),
+                  NIXL_SUCCESS,
+                  "release direct-owner endpoint-failure request");
+    requireStatus(capability_adapter.release(capability_subscription),
+                  NIXL_SUCCESS,
+                  "release direct-owner failed capability");
+    requireStatus(source.agent.invalidateRemoteMD(remote),
+                  NIXL_SUCCESS,
+                  "invalidate direct-owner failed TCP peer route");
+    require(capability_inbox.empty(),
+            "direct-owner endpoint-failure fixture retained a drained event");
+    static_cast<void>(closeAndObserveChannel(capability_adapter));
+
+    const nixl_terminal_owner_producer_inventory_t before_retirement = producer.inventory();
+    require(before_retirement.activeCallbacks == 0 && before_retirement.activeRegistrations == 0 &&
+                before_retirement.registeringBindings == 0 &&
+                before_retirement.submittedBindings == 0 &&
+                before_retirement.totalSubscriptions == 1 &&
+                before_retirement.totalDelivered == 1 &&
+                before_retirement.successfulTerminalEvents == 0 &&
+                before_retirement.failureTerminalEvents == 1 &&
+                before_retirement.fatal == nixl_terminal_owner_producer_fatal_t::NONE,
+            "direct-owner failure retained callback authority");
+    producer.stopAdmission();
+    const nixl_status_t retirement_join_status = producer.join(30'000'000'000ULL);
+    requireStatus(
+        retirement_join_status, NIXL_SUCCESS, "join direct-owner failure producer retirement");
+    const nixl_status_t close_status = producer.close();
+    requireStatus(close_status, NIXL_SUCCESS, "close direct-owner failure producer");
+    const nixl_terminal_owner_producer_inventory_t after_close = producer.inventory();
+    require(after_close.retirementRequested && after_close.joined && after_close.closed,
+            "direct-owner failure producer did not commit ordered retirement");
+
+    tcp_direct_owner_failure_observation_t result;
+    result.expectedBinding = binding;
+    std::copy_n(
+        event.binding_digest, result.deliveredBinding.size(), result.deliveredBinding.begin());
+    result.nativeTimestampNs = event.enqueued_ns;
+    result.eventKind = event.event_kind;
+    result.reasonCode = event.reason_code;
+    result.backendStatus = event.backend_status;
+    result.terminalEventCount = 1;
+    result.activeCallbacksAfterTerminal = before_retirement.activeCallbacks;
+    result.activeRegistrationsAfterTerminal = before_retirement.activeRegistrations;
+    result.retainedBindingsAfterTerminal =
+        before_retirement.registeringBindings + before_retirement.submittedBindings;
+    result.successfulTerminalEvents = before_retirement.successfulTerminalEvents;
+    result.failureTerminalEvents = before_retirement.failureTerminalEvents;
+    result.subscriptionReleaseStatus = transfer_release_status;
+    result.retirementJoinStatus = retirement_join_status;
+    result.closeStatus = close_status;
+    result.subscriptionTerminal = subscription_terminal;
+    result.bindingExact = result.expectedBinding == result.deliveredBinding;
+    result.retirementRequested = after_close.retirementRequested;
+    result.joined = after_close.joined;
+    result.closed = after_close.closed;
+    result.peerExitedBySignal = peer_exited_by_signal;
+    return result;
 }
 
 tcp_notification_failure_observation_t

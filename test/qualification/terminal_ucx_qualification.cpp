@@ -4,6 +4,7 @@
  */
 #include "terminal_ucx_api_adapter.h"
 #include "terminal_ucx_peer_fixture.h"
+#include "terminal_owner_capture.h"
 #include "terminal_owner_producer.h"
 
 #include <poll.h>
@@ -16,7 +17,6 @@
 #include <array>
 #include <cerrno>
 #include <chrono>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -27,7 +27,6 @@
 #include <iostream>
 #include <limits>
 #include <memory>
-#include <mutex>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -56,84 +55,6 @@ public:
 void
 require(bool condition, std::string_view message);
 
-class direct_owner_capture_t final {
-public:
-    direct_owner_capture_t() {
-        api_ = {
-            .abi_version = SGLANG_TERMINAL_OWNER_PRODUCER_ABI_VERSION,
-            .struct_size = sizeof(sglang_terminal_owner_producer_api_v1),
-            .event_struct_size = sizeof(sglang_terminal_owner_producer_event_v1),
-            .flags = SGLANG_TERMINAL_OWNER_PRODUCER_REQUIRED_FLAGS,
-            .submit = submit,
-            .retire = retire,
-            .join = join,
-        };
-    }
-
-    [[nodiscard]] const sglang_terminal_owner_producer_api_v1 *
-    api() const noexcept {
-        return &api_;
-    }
-
-    [[nodiscard]] sglang_terminal_owner_producer_event_v1
-    wait() {
-        std::unique_lock lock(mutex_);
-        const bool ready = condition_.wait_for(lock,
-                                               std::chrono::milliseconds(event_timeout_ms),
-                                               [this]() { return events_.size() == 1; });
-        require(ready, "direct owner did not receive one terminal event");
-        return events_.front();
-    }
-
-private:
-    static int
-    submit(void *context, const sglang_terminal_owner_producer_event_v1 *event) noexcept {
-        if (context == nullptr || event == nullptr) {
-            return EINVAL;
-        }
-        auto &owner = *static_cast<direct_owner_capture_t *>(context);
-        {
-            const std::lock_guard lock(owner.mutex_);
-            if (!owner.events_.empty()) {
-                return EALREADY;
-            }
-            owner.events_.push_back(*event);
-        }
-        owner.condition_.notify_all();
-        return 0;
-    }
-
-    static int
-    retire(void *context) noexcept {
-        if (context == nullptr) {
-            return EINVAL;
-        }
-        auto &owner = *static_cast<direct_owner_capture_t *>(context);
-        const std::lock_guard lock(owner.mutex_);
-        if (owner.retired_) {
-            return EALREADY;
-        }
-        owner.retired_ = true;
-        return 0;
-    }
-
-    static int
-    join(void *context, std::uint64_t timeout_ns) noexcept {
-        if (context == nullptr || timeout_ns == 0) {
-            return EINVAL;
-        }
-        auto &owner = *static_cast<direct_owner_capture_t *>(context);
-        const std::lock_guard lock(owner.mutex_);
-        return owner.retired_ ? 0 : EPROTO;
-    }
-
-    sglang_terminal_owner_producer_api_v1 api_{};
-    std::mutex mutex_;
-    std::condition_variable condition_;
-    std::vector<sglang_terminal_owner_producer_event_v1> events_;
-    bool retired_ = false;
-};
-
 struct options_t {
     std::string transport;
     std::string engine;
@@ -161,6 +82,22 @@ struct population_result_t {
     std::uint64_t drainTimestampNs = 0;
     std::size_t terminalEventCount = 0;
     bool subscriptionBeforePost = false;
+};
+
+struct direct_owner_result_t {
+    population_result_t population;
+    nixl_terminal_owner_binding_digest_t ownerBinding{};
+    nixl_terminal_owner_binding_digest_t deliveredBinding{};
+    nixl_terminal_owner_producer_inventory_t beforeRetirement;
+    nixl_terminal_owner_producer_inventory_t afterClose;
+    std::uint16_t eventKind = 0;
+    std::int32_t reasonCode = 0;
+    std::int64_t backendStatus = 0;
+    std::uint8_t hasReceipt = 0;
+    bool subscriptionTerminal = false;
+    nixl_status_t subscriptionReleaseStatus = NIXL_ERR_BACKEND;
+    nixl_status_t retirementJoinStatus = NIXL_ERR_BACKEND;
+    nixl_status_t closeStatus = NIXL_ERR_BACKEND;
 };
 
 struct registration_result_t {
@@ -209,6 +146,7 @@ struct capability_result_t {
 
 struct tcp_fixture_result_t {
     nixl::qualification::tcp_endpoint_failure_observation_t endpointFailure;
+    nixl::qualification::tcp_direct_owner_failure_observation_t directOwnerFailure;
     nixl::qualification::tcp_notification_failure_observation_t notificationFailure;
     nixl::qualification::tcp_shutdown_cancellation_observation_t shutdownCancellation;
 };
@@ -216,6 +154,7 @@ struct tcp_fixture_result_t {
 struct tcp_fault_results_t {
     terminal_fault_result_t remoteFailure;
     terminal_fault_result_t notificationFailure;
+    nixl::qualification::tcp_direct_owner_failure_observation_t directOwnerFailure;
     bool dataRemoteFlushedBeforeNotificationFailure = false;
     bool notificationFailureAfterRemoteFlush = false;
     std::string faultPeerEngine;
@@ -643,7 +582,7 @@ runPopulation(nixlAgent &source_agent,
     return result;
 }
 
-[[nodiscard]] population_result_t
+[[nodiscard]] direct_owner_result_t
 runDirectOwnerPopulation(nixlAgent &source_agent,
                          nixlBackendH *source_backend,
                          const std::string &remote_name,
@@ -662,7 +601,7 @@ runDirectOwnerPopulation(nixlAgent &source_agent,
                                           remote_name,
                                           remote_handle,
                                           notification);
-    direct_owner_capture_t owner;
+    nixl::qualification::terminal_owner_capture_t owner;
     nixlTerminalOwnerProducerH producer(owner.api(), &owner);
     nixl_terminal_owner_binding_digest_t owner_binding{};
     for (std::size_t index = 0; index < owner_binding.size(); ++index) {
@@ -683,7 +622,8 @@ runDirectOwnerPopulation(nixlAgent &source_agent,
     const nixl_status_t post_status = source_agent.postXferReq(request);
     require(post_status == NIXL_SUCCESS || post_status == NIXL_IN_PROG,
             "post direct owner transfer failed");
-    const sglang_terminal_owner_producer_event_v1 event = owner.wait();
+    const sglang_terminal_owner_producer_event_v1 event =
+        owner.wait(std::chrono::milliseconds(event_timeout_ms));
     const std::uint64_t observed_timestamp = monotonicRawNs();
     require(event.abi_version == SGLANG_TERMINAL_OWNER_PRODUCER_ABI_VERSION &&
                 event.struct_size == sizeof(event) && event.event_kind == 13 &&
@@ -697,47 +637,65 @@ runDirectOwnerPopulation(nixlAgent &source_agent,
                   "query direct owner subscription after terminal delivery");
     require(!subscription_info.active, "direct owner subscription remained active");
 
-    population_result_t result;
-    result.spec = spec;
-    result.byteCount = spec.descriptorCount * spec.bytesPerDescriptor;
-    result.destinationByteCount = result.byteCount;
-    result.sourceSha256 = source.sha256(spec);
-    result.destinationSha256 = destination.sha256(spec);
-    result.terminalStatus = static_cast<nixl_status_t>(event.backend_status);
-    result.eventNativeTimestampNs = event.enqueued_ns;
-    result.drainTimestampNs = observed_timestamp;
-    result.terminalEventCount = 1;
-    result.subscriptionBeforePost = true;
-    result.attestationStatus =
-        source_agent.takeXferCompletionAttestation(request, result.attestation);
+    direct_owner_result_t result;
+    result.population.spec = spec;
+    result.population.byteCount = spec.descriptorCount * spec.bytesPerDescriptor;
+    result.population.destinationByteCount = result.population.byteCount;
+    result.population.sourceSha256 = source.sha256(spec);
+    result.population.destinationSha256 = destination.sha256(spec);
+    result.population.terminalStatus = static_cast<nixl_status_t>(event.backend_status);
+    result.population.eventNativeTimestampNs = event.enqueued_ns;
+    result.population.drainTimestampNs = observed_timestamp;
+    result.population.terminalEventCount = 1;
+    result.population.subscriptionBeforePost = true;
+    result.population.attestationStatus =
+        source_agent.takeXferCompletionAttestation(request, result.population.attestation);
     nixl_xfer_attestation_t duplicate;
-    result.secondTakeStatus = source_agent.takeXferCompletionAttestation(request, duplicate);
+    result.population.secondTakeStatus =
+        source_agent.takeXferCompletionAttestation(request, duplicate);
+    result.ownerBinding = owner_binding;
+    std::copy_n(
+        event.binding_digest, result.deliveredBinding.size(), result.deliveredBinding.begin());
+    result.eventKind = event.event_kind;
+    result.reasonCode = event.reason_code;
+    result.backendStatus = event.backend_status;
+    result.hasReceipt = event.has_receipt;
+    result.subscriptionTerminal = !subscription_info.active;
 
-    requireStatus(result.attestationStatus, NIXL_SUCCESS, "take direct owner attestation");
     requireStatus(
-        result.secondTakeStatus, NIXL_ERR_NOT_ALLOWED, "take direct owner completion twice");
-    require(result.sourceSha256 == result.destinationSha256,
+        result.population.attestationStatus, NIXL_SUCCESS, "take direct owner attestation");
+    requireStatus(result.population.secondTakeStatus,
+                  NIXL_ERR_NOT_ALLOWED,
+                  "take direct owner completion twice");
+    require(result.population.sourceSha256 == result.population.destinationSha256,
             "direct owner destination bytes differ from source");
-    requireStatus(source_agent.releaseTerminalEventSubscription(subscription),
-                  NIXL_SUCCESS,
-                  "release direct owner subscription");
+    result.subscriptionReleaseStatus = source_agent.releaseTerminalEventSubscription(subscription);
+    requireStatus(
+        result.subscriptionReleaseStatus, NIXL_SUCCESS, "release direct owner subscription");
     requireStatus(source_agent.releaseXferReq(request),
                   NIXL_SUCCESS,
                   "release direct owner transfer request");
 
-    nixl_terminal_owner_producer_inventory_t inventory = producer.inventory();
-    require(inventory.activeCallbacks == 0 && inventory.activeRegistrations == 0 &&
-                inventory.registeringBindings == 0 && inventory.submittedBindings == 0 &&
-                inventory.totalSubscriptions == 1 && inventory.totalDelivered == 1 &&
-                inventory.successfulTerminalEvents == 1 && inventory.failureTerminalEvents == 0 &&
-                inventory.fatal == nixl_terminal_owner_producer_fatal_t::NONE,
+    result.beforeRetirement = producer.inventory();
+    require(result.beforeRetirement.activeCallbacks == 0 &&
+                result.beforeRetirement.activeRegistrations == 0 &&
+                result.beforeRetirement.registeringBindings == 0 &&
+                result.beforeRetirement.submittedBindings == 0 &&
+                result.beforeRetirement.totalSubscriptions == 1 &&
+                result.beforeRetirement.totalDelivered == 1 &&
+                result.beforeRetirement.successfulTerminalEvents == 1 &&
+                result.beforeRetirement.failureTerminalEvents == 0 &&
+                result.beforeRetirement.fatal == nixl_terminal_owner_producer_fatal_t::NONE,
             "direct owner producer retained callback authority after terminal delivery");
     producer.stopAdmission();
+    result.retirementJoinStatus = producer.join(30'000'000'000ULL);
     requireStatus(
-        producer.join(30'000'000'000ULL), NIXL_SUCCESS, "join direct owner producer retirement");
-    requireStatus(producer.close(), NIXL_SUCCESS, "close direct owner producer");
-    inventory = producer.inventory();
-    require(inventory.joined && inventory.closed && inventory.retirementRequested,
+        result.retirementJoinStatus, NIXL_SUCCESS, "join direct owner producer retirement");
+    result.closeStatus = producer.close();
+    requireStatus(result.closeStatus, NIXL_SUCCESS, "close direct owner producer");
+    result.afterClose = producer.inventory();
+    require(result.afterClose.joined && result.afterClose.closed &&
+                result.afterClose.retirementRequested,
             "direct owner producer did not commit ordered retirement");
     return result;
 }
@@ -1380,6 +1338,97 @@ writePopulation(std::ostream &output, const population_result_t &result) {
 }
 
 void
+writeBinding(std::ostream &output, const nixl_terminal_owner_binding_digest_t &binding) {
+    std::ostringstream encoded;
+    encoded << std::hex << std::setfill('0');
+    for (const std::uint8_t byte : binding) {
+        encoded << std::setw(2) << static_cast<unsigned int>(byte);
+    }
+    writeString(output, encoded.str());
+}
+
+void
+writeProducerInventory(std::ostream &output,
+                       const nixl_terminal_owner_producer_inventory_t &inventory) {
+    output << "{\"registering_bindings\":" << inventory.registeringBindings
+           << ",\"submitted_bindings\":" << inventory.submittedBindings
+           << ",\"active_callbacks\":" << inventory.activeCallbacks
+           << ",\"active_registrations\":" << inventory.activeRegistrations
+           << ",\"total_subscriptions\":" << inventory.totalSubscriptions
+           << ",\"total_delivered\":" << inventory.totalDelivered
+           << ",\"successful_terminal_events\":" << inventory.successfulTerminalEvents
+           << ",\"failure_terminal_events\":" << inventory.failureTerminalEvents
+           << ",\"owner_submission_failures\":" << inventory.ownerSubmissionFailures
+           << ",\"admission_open\":" << (inventory.admissionOpen ? "true" : "false")
+           << ",\"retirement_requested\":" << (inventory.retirementRequested ? "true" : "false")
+           << ",\"joined\":" << (inventory.joined ? "true" : "false")
+           << ",\"closed\":" << (inventory.closed ? "true" : "false") << ",\"fatal\":";
+    writeString(output, nixlTerminalOwnerProducerFatalName(inventory.fatal));
+    output << ",\"fatal_status\":" << inventory.fatalStatus << '}';
+}
+
+void
+writeDirectOwner(std::ostream &output, const direct_owner_result_t &result) {
+    output << "{\"transfer\":";
+    writePopulation(output, result.population);
+    output << ",\"event_kind\":" << result.eventKind << ",\"reason_code\":" << result.reasonCode
+           << ",\"backend_status\":" << result.backendStatus
+           << ",\"has_receipt\":" << static_cast<unsigned int>(result.hasReceipt)
+           << ",\"owner_binding_sha256\":";
+    writeBinding(output, result.ownerBinding);
+    output << ",\"delivered_binding_sha256\":";
+    writeBinding(output, result.deliveredBinding);
+    output << ",\"binding_exact\":"
+           << (result.ownerBinding == result.deliveredBinding ? "true" : "false")
+           << ",\"subscription_terminal\":" << (result.subscriptionTerminal ? "true" : "false")
+           << ",\"subscription_release_status\":";
+    writeString(output, nixlEnumStrings::statusStr(result.subscriptionReleaseStatus));
+    output << ",\"retirement_join_status\":";
+    writeString(output, nixlEnumStrings::statusStr(result.retirementJoinStatus));
+    output << ",\"close_status\":";
+    writeString(output, nixlEnumStrings::statusStr(result.closeStatus));
+    output << ",\"inventory_before_retirement\":";
+    writeProducerInventory(output, result.beforeRetirement);
+    output << ",\"inventory_after_close\":";
+    writeProducerInventory(output, result.afterClose);
+    output << '}';
+}
+
+void
+writeDirectOwnerFailure(std::ostream &output,
+                        const nixl::qualification::tcp_direct_owner_failure_observation_t &result) {
+    output << "{\"applicability\":\"applicable\",\"event_kind\":" << result.eventKind
+           << ",\"reason_code\":" << result.reasonCode
+           << ",\"backend_status\":" << result.backendStatus << ",\"backend_status_name\":";
+    writeString(output,
+                nixlEnumStrings::statusStr(static_cast<nixl_status_t>(result.backendStatus)));
+    output << ",\"terminal_event_count\":" << result.terminalEventCount
+           << ",\"native_timestamp_ns\":" << result.nativeTimestampNs
+           << ",\"expected_binding_sha256\":";
+    writeBinding(output, result.expectedBinding);
+    output << ",\"delivered_binding_sha256\":";
+    writeBinding(output, result.deliveredBinding);
+    output << ",\"binding_exact\":" << (result.bindingExact ? "true" : "false")
+           << ",\"subscription_terminal\":" << (result.subscriptionTerminal ? "true" : "false")
+           << ",\"active_callbacks_after_terminal\":" << result.activeCallbacksAfterTerminal
+           << ",\"active_registrations_after_terminal\":" << result.activeRegistrationsAfterTerminal
+           << ",\"retained_bindings_after_terminal\":" << result.retainedBindingsAfterTerminal
+           << ",\"successful_terminal_events\":" << result.successfulTerminalEvents
+           << ",\"failure_terminal_events\":" << result.failureTerminalEvents
+           << ",\"subscription_release_status\":";
+    writeString(output, nixlEnumStrings::statusStr(result.subscriptionReleaseStatus));
+    output << ",\"retirement_join_status\":";
+    writeString(output, nixlEnumStrings::statusStr(result.retirementJoinStatus));
+    output << ",\"close_status\":";
+    writeString(output, nixlEnumStrings::statusStr(result.closeStatus));
+    output << ",\"retirement_requested\":" << (result.retirementRequested ? "true" : "false")
+           << ",\"joined\":" << (result.joined ? "true" : "false")
+           << ",\"closed\":" << (result.closed ? "true" : "false")
+           << ",\"peer_exited_by_signal\":" << (result.peerExitedBySignal ? "true" : "false")
+           << '}';
+}
+
+void
 writeNotApplicable(std::ostream &output) {
     output << "{\"applicability\":\"not_applicable\",\"reason\":";
     writeString(output, self_na_reason);
@@ -1467,7 +1516,7 @@ writeCoordinate(const options_t &options,
                 const registration_result_t &source_registration,
                 const registration_result_t &destination_registration,
                 const std::vector<population_result_t> &populations,
-                const population_result_t &direct_owner_population,
+                const direct_owner_result_t &direct_owner_population,
                 const capability_result_t &capability,
                 std::size_t notification_success_count,
                 const terminal_fault_result_t &cancellation,
@@ -1501,7 +1550,7 @@ writeCoordinate(const options_t &options,
         writePopulation(output, populations[index]);
     }
     output << "],\"direct_owner_delivery\":";
-    writePopulation(output, direct_owner_population);
+    writeDirectOwner(output, direct_owner_population);
     output << ",\"remote_route_capability\":";
     writeCapability(output, self_transport, capability);
     output << ",\"attached_authenticated_notification\":";
@@ -1537,6 +1586,12 @@ writeCoordinate(const options_t &options,
         writeNotApplicable(output);
     } else {
         writeFault(output, tcp_faults.remoteFailure);
+    }
+    output << ",\"direct_owner_remote_failure\":";
+    if (self_transport) {
+        writeNotApplicable(output);
+    } else {
+        writeDirectOwnerFailure(output, tcp_faults.directOwnerFailure);
     }
     output << ",\"notification_failure\":";
     if (self_transport) {
@@ -1657,7 +1712,7 @@ run(int argc, char **argv) {
     };
     const std::string direct_owner_notification =
         options.transport == "tcp" ? "terminal-qualification:direct-owner" : std::string{};
-    const population_result_t direct_owner_population =
+    const direct_owner_result_t direct_owner_population =
         runDirectOwnerPopulation(*source.agent,
                                  source.backend,
                                  source_name,
@@ -1678,6 +1733,8 @@ run(int argc, char **argv) {
                       "retire population route");
         const tcp_fixture_result_t fixtures{
             .endpointFailure = nixl::qualification::runTcpEndpointFailureFixture(options.engine),
+            .directOwnerFailure =
+                nixl::qualification::runTcpDirectOwnerEndpointFailureFixture(options.engine),
             .notificationFailure =
                 nixl::qualification::runTcpNotificationFailureFixture(options.engine),
             .shutdownCancellation =
@@ -1686,6 +1743,10 @@ run(int argc, char **argv) {
         require(fixtures.endpointFailure.dataBoundaryRemoteFlushed &&
                     fixtures.endpointFailure.peerExitedBySignal,
                 "endpoint-failure peer did not die after a remote-flushed data boundary");
+        require(fixtures.directOwnerFailure.peerExitedBySignal &&
+                    fixtures.directOwnerFailure.eventKind == 21 &&
+                    fixtures.directOwnerFailure.backendStatus == NIXL_ERR_REMOTE_DISCONNECT,
+                "direct owner did not preserve terminal transport failure semantics");
         require(fixtures.notificationFailure.peerExitedBySignal,
                 "notification-failure peer did not die independently");
         require(fixtures.shutdownCancellation.peerExitedBySignal,
@@ -1707,6 +1768,7 @@ run(int argc, char **argv) {
             .terminalEventCount = fixtures.notificationFailure.transfer.terminalEventCount,
             .ownerWoken = fixtures.notificationFailure.transfer.ownerWoken,
         };
+        tcp_faults.directOwnerFailure = fixtures.directOwnerFailure;
         tcp_faults.dataRemoteFlushedBeforeNotificationFailure =
             fixtures.notificationFailure.dataRemoteFlushedBeforeFailure;
         tcp_faults.notificationFailureAfterRemoteFlush =

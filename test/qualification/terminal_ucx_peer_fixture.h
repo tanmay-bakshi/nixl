@@ -5,6 +5,7 @@
 #ifndef NIXL_TEST_QUALIFICATION_TERMINAL_UCX_PEER_FIXTURE_H
 #define NIXL_TEST_QUALIFICATION_TERMINAL_UCX_PEER_FIXTURE_H
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -48,6 +49,30 @@ struct tcp_endpoint_failure_observation_t {
     tcp_peer_capability_observation_t capability;
     tcp_peer_channel_observation_t channel;
     bool dataBoundaryRemoteFlushed = false;
+    bool peerExitedBySignal = false;
+};
+
+struct tcp_direct_owner_failure_observation_t {
+    std::array<std::uint8_t, 32> expectedBinding{};
+    std::array<std::uint8_t, 32> deliveredBinding{};
+    std::uint64_t nativeTimestampNs = 0;
+    std::uint16_t eventKind = 0;
+    std::int32_t reasonCode = 0;
+    std::int64_t backendStatus = 0;
+    std::size_t terminalEventCount = 0;
+    std::size_t activeCallbacksAfterTerminal = 0;
+    std::size_t activeRegistrationsAfterTerminal = 0;
+    std::size_t retainedBindingsAfterTerminal = 0;
+    std::size_t successfulTerminalEvents = 0;
+    std::size_t failureTerminalEvents = 0;
+    nixl_status_t subscriptionReleaseStatus = NIXL_ERR_BACKEND;
+    nixl_status_t retirementJoinStatus = NIXL_ERR_BACKEND;
+    nixl_status_t closeStatus = NIXL_ERR_BACKEND;
+    bool subscriptionTerminal = false;
+    bool bindingExact = false;
+    bool retirementRequested = false;
+    bool joined = false;
+    bool closed = false;
     bool peerExitedBySignal = false;
 };
 
@@ -103,6 +128,9 @@ runTerminalUcxPeerWorker(int argc, char **argv);
 
 [[nodiscard]] tcp_endpoint_failure_observation_t
 runTcpEndpointFailureFixture(const std::string &engine);
+
+[[nodiscard]] tcp_direct_owner_failure_observation_t
+runTcpDirectOwnerEndpointFailureFixture(const std::string &engine);
 
 [[nodiscard]] tcp_notification_failure_observation_t
 runTcpNotificationFailureFixture(const std::string &engine);

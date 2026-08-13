@@ -14,7 +14,10 @@ _THREAD_POOL_REPOST_POPULATIONS = (
     "thread_pool_repost_generation_1",
     "thread_pool_repost_generation_2",
 )
-_POPULATIONS = set(_BASE_POPULATIONS + _THREAD_POOL_REPOST_POPULATIONS)
+_DIRECT_OWNER_POPULATION = "direct_owner"
+_POPULATIONS = set(
+    _BASE_POPULATIONS + _THREAD_POOL_REPOST_POPULATIONS + (_DIRECT_OWNER_POPULATION,)
+)
 _RUNTIME_COMPONENTS = {"libnixl", "libucp", "ucx-plugin"}
 _ARENA_BYTES = 64 * 1024 * 1024
 _POPULATION_GEOMETRY = {
@@ -22,6 +25,7 @@ _POPULATION_GEOMETRY = {
     "large": (8, _ARENA_BYTES),
     "thread_pool_repost_generation_1": (8, _ARENA_BYTES),
     "thread_pool_repost_generation_2": (8, _ARENA_BYTES),
+    _DIRECT_OWNER_POPULATION: (8, _ARENA_BYTES),
 }
 _NOTIFICATION_CALLBACK_CONTRACT = {
     ("self", "small"): 0,
@@ -32,6 +36,8 @@ _NOTIFICATION_CALLBACK_CONTRACT = {
     ("tcp", "large"): 1,
     ("tcp", "thread_pool_repost_generation_1"): 0,
     ("tcp", "thread_pool_repost_generation_2"): 0,
+    ("self", _DIRECT_OWNER_POPULATION): 0,
+    ("tcp", _DIRECT_OWNER_POPULATION): 1,
 }
 _COMMON_ENVIRONMENT = {
     "CUDA_VISIBLE_DEVICES": "",
@@ -62,6 +68,23 @@ _INVENTORY_FIELDS = _INVENTORY_ZERO_FIELDS | {
     "closed",
     "fatal",
     "eventfd_error",
+}
+_DIRECT_OWNER_INVENTORY_FIELDS = {
+    "registering_bindings",
+    "submitted_bindings",
+    "active_callbacks",
+    "active_registrations",
+    "total_subscriptions",
+    "total_delivered",
+    "successful_terminal_events",
+    "failure_terminal_events",
+    "owner_submission_failures",
+    "admission_open",
+    "retirement_requested",
+    "joined",
+    "closed",
+    "fatal",
+    "fatal_status",
 }
 
 
@@ -533,6 +556,169 @@ def _validate_population(
     return str(name), before, after, int(handle_identity), int(generation)
 
 
+def _validate_direct_owner_inventory(
+    inventory: object,
+    *,
+    after_close: bool,
+    successful_events: int,
+    failure_events: int,
+) -> None:
+    """Validate callback authority and ordered native-producer retirement.
+
+    :param inventory: Native direct-owner producer inventory.
+    :param after_close: Whether ordered retirement and close must be committed.
+    :param successful_events: Expected successful terminal-event count.
+    :param failure_events: Expected failed terminal-event count.
+    :raises ValueError: If callbacks, bindings, or lifecycle authority remain.
+    """
+    _require(isinstance(inventory, dict), "direct-owner inventory is missing")
+    _require(
+        set(inventory) == _DIRECT_OWNER_INVENTORY_FIELDS,
+        "direct-owner inventory fields differ from the sealed schema",
+    )
+    for field in (
+        "registering_bindings",
+        "submitted_bindings",
+        "active_callbacks",
+        "active_registrations",
+        "owner_submission_failures",
+        "fatal_status",
+    ):
+        _require(inventory.get(field) == 0, f"direct-owner {field} is not zero")
+    _require(
+        inventory.get("total_subscriptions") == 1
+        and inventory.get("total_delivered") == 1,
+        "direct-owner delivery was not exactly once",
+    )
+    _require(
+        inventory.get("successful_terminal_events") == successful_events
+        and inventory.get("failure_terminal_events") == failure_events,
+        "direct-owner terminal outcome counts changed",
+    )
+    _require(inventory.get("fatal") == "NONE", "direct-owner producer became fatal")
+    _require(
+        inventory.get("admission_open") is (not after_close),
+        "direct-owner admission lifecycle changed",
+    )
+    for field in ("retirement_requested", "joined", "closed"):
+        _require(
+            inventory.get(field) is after_close,
+            f"direct-owner {field} differs from ordered retirement",
+        )
+
+
+def _validate_direct_owner_delivery(delivery: object, transport: str) -> None:
+    """Validate one successful real-UCX callback into the owner ABI.
+
+    :param delivery: Direct-owner success receipt.
+    :param transport: Observed UCX transport.
+    :raises ValueError: If owner binding, terminality, or retirement is incomplete.
+    """
+    _require(isinstance(delivery, dict), "direct-owner delivery is missing")
+    transfer = delivery.get("transfer")
+    name, _, _, _, _ = _validate_population(transfer, transport)
+    _require(name == _DIRECT_OWNER_POPULATION, "direct-owner population name changed")
+    _require(delivery.get("event_kind") == 13, "success did not emit event 13")
+    _require(delivery.get("reason_code") == 0, "success acquired a failure reason")
+    _require(delivery.get("backend_status") == 0, "success backend status changed")
+    _require(delivery.get("has_receipt") == 0, "NIXL fabricated an owner receipt")
+    expected_binding = delivery.get("owner_binding_sha256")
+    delivered_binding = delivery.get("delivered_binding_sha256")
+    _require(_is_sha256(expected_binding), "direct-owner binding is malformed")
+    _require(
+        delivered_binding == expected_binding and delivery.get("binding_exact") is True,
+        "direct-owner delivery changed the lifecycle binding",
+    )
+    _require(
+        delivery.get("subscription_terminal") is True,
+        "direct-owner subscription remained active",
+    )
+    for field in (
+        "subscription_release_status",
+        "retirement_join_status",
+        "close_status",
+    ):
+        _require(delivery.get(field) == "NIXL_SUCCESS", f"direct-owner {field} failed")
+    _validate_direct_owner_inventory(
+        delivery.get("inventory_before_retirement"),
+        after_close=False,
+        successful_events=1,
+        failure_events=0,
+    )
+    _validate_direct_owner_inventory(
+        delivery.get("inventory_after_close"),
+        after_close=True,
+        successful_events=1,
+        failure_events=0,
+    )
+
+
+def _validate_direct_owner_failure(failure: object, transport: str) -> None:
+    """Validate real TCP terminal error delivery through the owner ABI.
+
+    :param failure: Direct-owner failure receipt or self non-applicability.
+    :param transport: Observed UCX transport.
+    :raises ValueError: If failure is misclassified or retains native authority.
+    """
+    if transport == "self":
+        _validate_not_applicable(failure, "self direct-owner remote failure")
+        return
+    _require(isinstance(failure, dict), "direct-owner remote failure is missing")
+    _require(
+        failure.get("applicability") == "applicable",
+        "direct-owner remote failure was not exercised",
+    )
+    _require(failure.get("event_kind") == 21, "remote error did not emit event 21")
+    _require(failure.get("reason_code") == 1, "remote error reason code changed")
+    _require(
+        failure.get("backend_status_name") == "NIXL_ERR_REMOTE_DISCONNECT",
+        "direct-owner remote status changed",
+    )
+    _require(
+        isinstance(failure.get("backend_status"), int)
+        and not isinstance(failure.get("backend_status"), bool)
+        and int(failure["backend_status"]) < 0,
+        "direct-owner remote status is not terminal failure",
+    )
+    _require(
+        failure.get("terminal_event_count") == 1
+        and _is_int(failure.get("native_timestamp_ns"), 1),
+        "direct-owner remote failure was not native and exactly once",
+    )
+    expected_binding = failure.get("expected_binding_sha256")
+    _require(_is_sha256(expected_binding), "direct-owner failure binding is malformed")
+    _require(
+        failure.get("delivered_binding_sha256") == expected_binding
+        and failure.get("binding_exact") is True,
+        "direct-owner failure changed the lifecycle binding",
+    )
+    for field in (
+        "active_callbacks_after_terminal",
+        "active_registrations_after_terminal",
+        "retained_bindings_after_terminal",
+        "successful_terminal_events",
+    ):
+        _require(failure.get(field) == 0, f"direct-owner failure retained {field}")
+    _require(
+        failure.get("failure_terminal_events") == 1,
+        "direct-owner failed terminal event was not counted",
+    )
+    for field in (
+        "subscription_release_status",
+        "retirement_join_status",
+        "close_status",
+    ):
+        _require(failure.get(field) == "NIXL_SUCCESS", f"direct-owner failure {field} failed")
+    for field in (
+        "subscription_terminal",
+        "retirement_requested",
+        "joined",
+        "closed",
+        "peer_exited_by_signal",
+    ):
+        _require(failure.get(field) is True, f"direct-owner failure {field} is false")
+
+
 def _validate_capability_route(
     route: object,
     expected_name: str,
@@ -691,6 +877,9 @@ def _validate_faults(faults: object, transport: str, engine: str) -> None:
     _require(shutdown.get("drained") is True, "shutdown left native work undrained")
     if transport == "self":
         _validate_not_applicable(faults.get("remote_failure"), "self remote failure")
+        _validate_direct_owner_failure(
+            faults.get("direct_owner_remote_failure"), transport
+        )
         _validate_not_applicable(
             faults.get("notification_failure"), "self notification failure"
         )
@@ -698,6 +887,7 @@ def _validate_faults(faults: object, transport: str, engine: str) -> None:
     _validate_terminal_fault(
         faults.get("remote_failure"), "NIXL_ERR_REMOTE_DISCONNECT", "remote failure"
     )
+    _validate_direct_owner_failure(faults.get("direct_owner_remote_failure"), transport)
     notification_failure = faults.get("notification_failure")
     _validate_terminal_fault(
         notification_failure,
@@ -804,6 +994,7 @@ def _validate_case(case: object) -> tuple[str, str]:
             second_repost[2] > first_repost[2],
             "thread-pool repost did not advance transfer generation",
         )
+    _validate_direct_owner_delivery(case.get("direct_owner_delivery"), str(transport))
     if transport == "self":
         _require(before_return > 0, "self did not prove callback-before-poster-return")
     else:

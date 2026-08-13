@@ -17,7 +17,7 @@ _SELF_ANCHORS = [
     "ucx/src/ucp/core/ucp_ep.c:1098",
     "nixl/src/core/nixl_agent.cpp:2449",
 ]
-_TCP_NOTIFICATION_POPULATIONS = {"small", "large"}
+_TCP_NOTIFICATION_POPULATIONS = {"small", "large", "direct_owner"}
 
 
 def _not_applicable() -> dict[str, object]:
@@ -206,6 +206,101 @@ def _terminal_fault(status: str) -> dict[str, object]:
     }
 
 
+def _direct_owner_inventory(*, after_close: bool, success: bool) -> dict[str, object]:
+    """Build one exact direct-owner producer inventory.
+
+    :param after_close: Whether ordered retirement has committed.
+    :param success: Whether the delivered terminal event succeeded.
+    :returns: Valid native-producer inventory.
+    """
+    return {
+        "registering_bindings": 0,
+        "submitted_bindings": 0,
+        "active_callbacks": 0,
+        "active_registrations": 0,
+        "total_subscriptions": 1,
+        "total_delivered": 1,
+        "successful_terminal_events": int(success),
+        "failure_terminal_events": int(not success),
+        "owner_submission_failures": 0,
+        "admission_open": not after_close,
+        "retirement_requested": after_close,
+        "joined": after_close,
+        "closed": after_close,
+        "fatal": "NONE",
+        "fatal_status": 0,
+    }
+
+
+def _direct_owner_delivery(
+    transport: str, engine: str, handle_identity: int
+) -> dict[str, object]:
+    """Build one successful NIXL-to-owner delivery receipt.
+
+    :param transport: Self or TCP coordinate.
+    :param engine: Shared or thread-pool progress engine.
+    :param handle_identity: Transfer identity in the attestation.
+    :returns: Valid direct-owner success evidence.
+    """
+    binding = hashlib.sha256(f"binding:{transport}:{engine}".encode()).hexdigest()
+    return {
+        "transfer": _population(
+            transport, engine, "direct_owner", handle_identity, 1
+        ),
+        "event_kind": 13,
+        "reason_code": 0,
+        "backend_status": 0,
+        "has_receipt": 0,
+        "owner_binding_sha256": binding,
+        "delivered_binding_sha256": binding,
+        "binding_exact": True,
+        "subscription_terminal": True,
+        "subscription_release_status": "NIXL_SUCCESS",
+        "retirement_join_status": "NIXL_SUCCESS",
+        "close_status": "NIXL_SUCCESS",
+        "inventory_before_retirement": _direct_owner_inventory(
+            after_close=False, success=True
+        ),
+        "inventory_after_close": _direct_owner_inventory(
+            after_close=True, success=True
+        ),
+    }
+
+
+def _direct_owner_failure(engine: str) -> dict[str, object]:
+    """Build one real-TCP direct-owner failure receipt.
+
+    :param engine: Shared or thread-pool progress engine.
+    :returns: Valid event-21 transport-failure evidence.
+    """
+    binding = hashlib.sha256(f"failure-binding:{engine}".encode()).hexdigest()
+    return {
+        "applicability": "applicable",
+        "event_kind": 21,
+        "reason_code": 1,
+        "backend_status": -13,
+        "backend_status_name": "NIXL_ERR_REMOTE_DISCONNECT",
+        "terminal_event_count": 1,
+        "native_timestamp_ns": 19,
+        "expected_binding_sha256": binding,
+        "delivered_binding_sha256": binding,
+        "binding_exact": True,
+        "subscription_terminal": True,
+        "active_callbacks_after_terminal": 0,
+        "active_registrations_after_terminal": 0,
+        "retained_bindings_after_terminal": 0,
+        "successful_terminal_events": 0,
+        "failure_terminal_events": 1,
+        "subscription_release_status": "NIXL_SUCCESS",
+        "retirement_join_status": "NIXL_SUCCESS",
+        "close_status": "NIXL_SUCCESS",
+        "retirement_requested": True,
+        "joined": True,
+        "closed": True,
+        "peer_exited_by_signal": True,
+    }
+
+
 def _faults(transport: str, engine: str) -> dict[str, object]:
     """Build transport-aware failure-path evidence.
 
@@ -237,9 +332,11 @@ def _faults(transport: str, engine: str) -> dict[str, object]:
     }
     if transport == "self":
         faults["remote_failure"] = _not_applicable()
+        faults["direct_owner_remote_failure"] = _not_applicable()
         faults["notification_failure"] = _not_applicable()
         return faults
     faults["remote_failure"] = _terminal_fault("NIXL_ERR_REMOTE_DISCONNECT")
+    faults["direct_owner_remote_failure"] = _direct_owner_failure(engine)
     notification_failure = _terminal_fault("NIXL_ERR_REMOTE_DISCONNECT")
     notification_failure["data_remote_flushed_before_failure"] = True
     notification_failure["notification_failed_after_remote_flush"] = True
@@ -308,6 +405,9 @@ def _case(transport: str, engine: str, address_seed: int) -> dict[str, object]:
             },
         },
         "completion_populations": populations,
+        "direct_owner_delivery": _direct_owner_delivery(
+            transport, engine, address_seed + 4
+        ),
         "remote_route_capability": (
             _not_applicable() if self_transport else _capability()
         ),
@@ -741,6 +841,38 @@ def test_validate_receipt_requires_tcp_repost_terminal_after_flush(
         (("cases", 2, "remote_route_capability", "routes", 1, "states"), ["READY"]),
         (("cases", 2, "remote_route_capability", "routes", 2, "handle_identity"), 502),
         (("cases", 2, "faults", "remote_failure", "owner_woken"), False),
+        (("cases", 0, "direct_owner_delivery", "event_kind"), 21),
+        (("cases", 0, "direct_owner_delivery", "binding_exact"), False),
+        (
+            (
+                "cases",
+                0,
+                "direct_owner_delivery",
+                "inventory_after_close",
+                "active_callbacks",
+            ),
+            1,
+        ),
+        (
+            (
+                "cases",
+                2,
+                "faults",
+                "direct_owner_remote_failure",
+                "event_kind",
+            ),
+            13,
+        ),
+        (
+            (
+                "cases",
+                2,
+                "faults",
+                "direct_owner_remote_failure",
+                "failure_terminal_events",
+            ),
+            0,
+        ),
         (
             (
                 "cases",
